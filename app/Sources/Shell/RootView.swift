@@ -9,12 +9,11 @@ struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l10n
-    @State private var inspectorOpen = true
     @Environment(\.colorScheme) private var systemScheme
 
     var body: some View {
         @Bindable var model = model
-        Workspace(inspectorOpen: $inspectorOpen)
+        Workspace()
             .preferredColorScheme(theme.appearance == .system ? nil : theme.scheme)
             .onAppear {
                 theme.systemScheme = systemScheme
@@ -31,7 +30,6 @@ struct RootView: View {
 }
 
 private struct Workspace: View {
-    @Binding var inspectorOpen: Bool
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
@@ -47,7 +45,7 @@ private struct Workspace: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if inspectorOpen {
+            if model.inspectorOpen {
                 Rectangle().fill(theme.p.hairline).frame(width: 1)
                 SectorInspector().frame(width: 300)
             }
@@ -84,7 +82,7 @@ private struct Workspace: View {
             } label: { Image(systemName: "globe") }
             .help(l.t("language"))
             Button { theme.toggle() } label: { Image(systemName: theme.toggleSymbol) }.help(l.t("light_dark"))
-            Button { inspectorOpen.toggle() } label: { Image(systemName: "sidebar.right") }.help(l.t("inspector"))
+            Button { model.inspectorOpen.toggle() } label: { Image(systemName: "sidebar.right") }.help(l.t("inspector"))
         }
     }
 }

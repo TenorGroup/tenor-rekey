@@ -16,9 +16,27 @@ struct SectorGrid: View {
                         .onTapGesture {
                             withAnimation(.easeOut(duration: 0.16)) { model.selected = s.index }
                         }
+                        .contextMenu { TileMenu(s: s) }
                 }
             }
             .padding(24)
+        }
+        // ⌘C when the grid is first responder; text fields keep their own copy.
+        .onCopyCommand {
+            guard let t = model.copySelectionText() else { return [] }
+            return [NSItemProvider(object: t as NSString)]
+        }
+    }
+}
+
+private struct TileMenu: View {
+    let s: SectorVM
+    @Environment(AppModel.self) private var model
+    @Environment(L10n.self) private var l
+    var body: some View {
+        Button(l.t("copy_sector")) { model.copy(model.sectorText(s)) }
+        if let kh = s.keyHex {
+            Button(l.t("copy_key")) { model.copy(kh) }
         }
     }
 }

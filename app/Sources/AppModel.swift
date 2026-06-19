@@ -15,6 +15,7 @@ final class AppModel {
     var selected: Int?
     var decoding = false
     var lastError: String?
+    var inspectorOpen = true
 
     /// The most recent live decode, kept so File > Save can write it out.
     var liveDump: CardDump?
@@ -124,6 +125,33 @@ final class AppModel {
             let blocks = blockNumbers(ofSector: s).map { b in (r.blocks[String(b)] ?? nil) ?? "?" }
             return SectorVM(index: s, keyType: kt, keyHex: kh, provenance: prov, blocks: blocks)
         }
+    }
+
+    // ---- copy (plain text) -------------------------------------------------
+
+    /// Plain-text rendering of a sector: a header line with the key, then one
+    /// line per block (absolute block number + hex). Used by ⌘C and the tile
+    /// context menu so the grid is a real, copyable instrument.
+    func sectorText(_ s: SectorVM) -> String {
+        var head = "sector \(s.index)"
+        if let kh = s.keyHex { head += "  (key \(s.keyType?.lowercased() ?? "a") \(kh))" }
+        let base = firstBlock(s.index)
+        let body = s.blocks.enumerated().map { i, hex in String(format: "%3d  %@", base + i, hex) }
+        return ([head] + body).joined(separator: "\n")
+    }
+
+    /// Plain text for ⌘C: the selected sector, or the whole NTAG page dump.
+    func copySelectionText() -> String? {
+        if let s = selectedSector { return sectorText(s) }
+        if !pages.isEmpty {
+            return pages.map { String(format: "%3d  %@  |%@|", $0.index, $0.hex, $0.ascii) }.joined(separator: "\n")
+        }
+        return nil
+    }
+
+    func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     // ---- clone / write -----------------------------------------------------

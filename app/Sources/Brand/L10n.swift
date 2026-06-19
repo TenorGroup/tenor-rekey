@@ -109,6 +109,8 @@ final class L10n {
         "export_folder": ["vi": "thư mục lưu", "en": "export folder", "zh": "导出文件夹", "ja": "保存先フォルダ"],
         "export_default":["vi": "hỏi mỗi lần", "en": "ask each time", "zh": "每次询问", "ja": "毎回確認"],
         "choose":        ["vi": "chọn…", "en": "choose…", "zh": "选择…", "ja": "選択…"],
+        "copy_sector":   ["vi": "sao chép sector", "en": "copy sector", "zh": "复制扇区", "ja": "セクターをコピー"],
+        "copy_key":      ["vi": "sao chép khóa", "en": "copy key", "zh": "复制密钥", "ja": "鍵をコピー"],
         "prov_nondefault": ["vi": "khóa riêng", "en": "non-default", "zh": "非默认", "ja": "非標準"],
         "prov_dictionary": ["vi": "từ điển", "en": "dictionary", "zh": "字典", "ja": "辞書"],
         "prov_nested":     ["vi": "bẻ nested", "en": "nested-cracked", "zh": "嵌套破解", "ja": "ネスト解読"],
