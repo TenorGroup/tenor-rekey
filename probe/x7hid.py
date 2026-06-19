@@ -7,23 +7,37 @@ import ctypes
 import ctypes.util
 import os
 
-# Resolve libhidapi.dylib. Prefer brew's known location, fall back to search.
-_CANDIDATES = [
-    "/opt/homebrew/lib/libhidapi.dylib",
-    "/usr/local/lib/libhidapi.dylib",
-]
+# Resolve libhidapi.dylib. Inside the packaged .app it is found by the bundle-
+# relative candidate (probe sits in Contents/Resources/probe, the dylib in
+# Contents/Frameworks). X7_HIDAPI is an optional manual override if you ever need
+# to point at a specific dylib. Outside the bundle we fall back to brew, then the
+# system search - so dev keeps working with no env at all.
+def _candidates():
+    out = []
+    env = os.environ.get("X7_HIDAPI")
+    if env:
+        out.append(env)
+    here = os.path.dirname(os.path.abspath(__file__))
+    # ...Contents/Resources/probe/x7hid.py -> ...Contents/Frameworks/libhidapi.dylib
+    out.append(os.path.normpath(os.path.join(here, "..", "..", "Frameworks", "libhidapi.dylib")))
+    out += ["/opt/homebrew/lib/libhidapi.dylib", "/usr/local/lib/libhidapi.dylib"]
+    return out
 
 
 def _load():
-    for p in _CANDIDATES:
-        if os.path.exists(p):
-            return ctypes.CDLL(p)
+    cands = _candidates()
+    for p in cands:
+        if p and os.path.exists(p):
+            try:
+                return ctypes.CDLL(p)
+            except OSError:
+                continue   # exists but won't load (arch / signature) - try the next
     found = ctypes.util.find_library("hidapi")
     if found:
         return ctypes.CDLL(found)
     raise OSError(
         "libhidapi.dylib not found. Run: brew install hidapi  (checked %s)"
-        % ", ".join(_CANDIDATES)
+        % ", ".join(c for c in cands if c)
     )
 
 

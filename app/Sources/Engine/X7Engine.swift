@@ -19,7 +19,7 @@ actor X7Engine {
         }
     }
 
-    private let python = URL(fileURLWithPath: "/usr/bin/python3")
+    private let python: URL
     private let workDir: URL
     private let script: URL
     private var process: Process?
@@ -31,16 +31,43 @@ actor X7Engine {
     /// disables other actions); id-less progress events are routed here.
     private var eventSink: (@Sendable (EngineEvent) -> Void)?
 
-    init(probeDir: String = "/Users/tuan/Claude/Tenor/tenor-rekey/probe") {
-        self.workDir = URL(fileURLWithPath: probeDir)
-        self.script = workDir.appendingPathComponent("x7d.py")
+    init() {
+        let p = Self.resolvePaths()
+        self.python = p.python
+        self.workDir = p.probeDir
+        self.script = p.probeDir.appendingPathComponent("x7d.py")
+    }
+
+    /// Resolve the python interpreter + probe engine, preferring the copies
+    /// vendored inside the packaged .app (Contents/Resources/python + /probe),
+    /// then environment overrides (X7_PYTHON / X7_PROBE_DIR), then the dev
+    /// checkout. Both a shipped app and a dev build work with no configuration.
+    /// libhidapi is found by x7hid itself (a bundle-relative candidate inside the
+    /// .app, brew outside), so we never touch the child's environment here.
+    static func resolvePaths() -> (python: URL, probeDir: URL) {
+        let fm = FileManager.default
+        let res = Bundle.main.resourceURL ?? Bundle.main.bundleURL
+        let bundledPython = res.appendingPathComponent("python/bin/python3")
+        let bundledProbe = res.appendingPathComponent("probe")
+        if fm.fileExists(atPath: bundledPython.path),
+           fm.fileExists(atPath: bundledProbe.appendingPathComponent("x7d.py").path) {
+            return (bundledPython, bundledProbe)
+        }
+        let env = ProcessInfo.processInfo.environment
+        let python = URL(fileURLWithPath: env["X7_PYTHON"] ?? "/usr/bin/python3")
+        let probe = URL(fileURLWithPath: env["X7_PROBE_DIR"] ?? "/Users/tuan/Claude/Tenor/tenor-rekey/probe")
+        return (python, probe)
     }
 
     private func startIfNeeded() throws {
         guard process == nil else { return }
         let p = Process()
         p.executableURL = python
-        p.arguments = [script.path]
+        // -B: never write .pyc into the bundle (a code-signed .app that mutates
+        // itself breaks its own seal). Passed as a flag, not an env var, so we
+        // leave the inherited launchd environment untouched - replacing it broke
+        // the spawn under the GUI session.
+        p.arguments = ["-B", script.path]
         p.currentDirectoryURL = workDir
         let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
         p.standardInput = inPipe
