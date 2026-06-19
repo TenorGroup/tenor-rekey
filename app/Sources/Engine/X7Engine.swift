@@ -28,7 +28,7 @@ actor X7Engine {
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
     private var buffer = Data()
 
-    init(probeDir: String = "/Users/tuan/Claude/x7-mac/probe") {
+    init(probeDir: String = "/Users/tuan/Claude/Tenor/tenor-rekey/probe") {
         self.workDir = URL(fileURLWithPath: probeDir)
         self.script = workDir.appendingPathComponent("x7d.py")
     }
