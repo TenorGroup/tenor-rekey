@@ -14,7 +14,7 @@ struct CloneSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text(l.t("clone")).font(.system(size: 14, weight: .medium))
+            Text(l.t("clone")).font(l.sans(14, .medium))
                 .foregroundStyle(theme.p.textPrimary)
 
             HStack(spacing: 12) {
@@ -35,7 +35,7 @@ struct CloneSheet: View {
                 if uid { guardedZone }
             }
             .toggleStyle(.checkbox)
-            .font(.system(size: 12))
+            .font(l.sans(12))
             .tint(theme.p.accent)
 
             HStack {
@@ -59,12 +59,12 @@ struct CloneSheet: View {
     /// summary, or a placeholder when empty. Both sides render the same way.
     private func slot(title: String, uid: String?, subtitle: String, placeholder: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(.system(size: 9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
+            Text(title).font(l.sans(9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
             if let uid {
-                Text(uid).font(.system(size: 13, design: .monospaced)).foregroundStyle(theme.p.textPrimary)
-                Text(subtitle).font(.system(size: 10)).foregroundStyle(theme.p.textSecondary)
+                Text(uid).font(Typeface.mono(13)).foregroundStyle(theme.p.textPrimary)
+                Text(subtitle).font(l.sans(10)).foregroundStyle(theme.p.textSecondary)
             } else {
-                Text(placeholder).font(.system(size: 12)).foregroundStyle(theme.p.textTertiary)
+                Text(placeholder).font(l.sans(12)).foregroundStyle(theme.p.textTertiary)
             }
         }
         .padding(12)
@@ -79,7 +79,7 @@ struct CloneSheet: View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle").font(.system(size: 11))
                 .foregroundStyle(theme.p.textPrimary)
-            Text(l.t("uid_warning")).font(.system(size: 10)).foregroundStyle(theme.p.textSecondary)
+            Text(l.t("uid_warning")).font(l.sans(10)).foregroundStyle(theme.p.textSecondary)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)

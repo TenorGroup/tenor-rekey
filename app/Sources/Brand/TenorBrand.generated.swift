@@ -25,3 +25,16 @@ enum TenorRadius {
     static let md: CGFloat = 8
     static let lg: CGFloat = 12
 }
+
+/// Bundled font faces (PostScript names) + the file list to register.
+enum TenorFontFace {
+    static let sansRegular = "Geist-Regular"
+    static let sansMedium = "Geist-Medium"
+    static let sansSemibold = "Geist-SemiBold"
+    static let sansBold = "Geist-Bold"
+    static let monoRegular = "GeistMono-Regular"
+    static let monoMedium = "GeistMono-Medium"
+    static let vietRegular = "BeVietnamPro-Regular"
+    static let vietMedium = "BeVietnamPro-Medium"
+    static let bundledFiles = ["Geist-Regular", "Geist-Medium", "Geist-SemiBold", "Geist-Bold", "GeistMono-Regular", "GeistMono-Medium", "BeVietnamPro-Regular", "BeVietnamPro-Medium"]
+}

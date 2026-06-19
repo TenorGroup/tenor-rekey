@@ -24,10 +24,10 @@ struct ApduConsole: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text("apdu").font(.system(size: 11, weight: .medium, design: .monospaced))
+            Text("apdu").font(Typeface.mono(11, .medium))
                 .foregroundStyle(theme.p.textPrimary)
             Spacer()
-            Text(context).font(.system(size: 10, design: .monospaced)).foregroundStyle(theme.p.textTertiary)
+            Text(context).font(Typeface.mono(10)).foregroundStyle(theme.p.textTertiary)
             Button { model.apduOpen = false } label: { Image(systemName: "xmark").font(.system(size: 9)) }
                 .buttonStyle(.plain).foregroundStyle(theme.p.textTertiary)
         }
@@ -44,7 +44,7 @@ struct ApduConsole: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     if model.apduLog.isEmpty {
-                        Text(l.t("apdu_empty")).font(.system(size: 10, design: .monospaced))
+                        Text(l.t("apdu_empty")).font(Typeface.mono(10))
                             .foregroundStyle(theme.p.textTertiary)
                     }
                     ForEach(model.apduLog) { ApduRow(entry: $0).id($0.id) }
@@ -62,10 +62,10 @@ struct ApduConsole: View {
 
     private var inputLine: some View {
         HStack(spacing: 8) {
-            Text("›").font(.system(size: 12, design: .monospaced)).foregroundStyle(theme.p.accent)
+            Text("›").font(Typeface.mono(12)).foregroundStyle(theme.p.accent)
             TextField(l.t("apdu_hint"), text: $input)
                 .textFieldStyle(.plain)
-                .font(.system(size: 11, design: .monospaced))
+                .font(Typeface.mono(11))
                 .foregroundStyle(theme.p.textPrimary)
                 .onSubmit(send)
                 .onKeyPress(.upArrow) { recall(-1); return .handled }
@@ -106,13 +106,13 @@ private struct ApduRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 6) {
-                Text("→").font(.system(size: 10, design: .monospaced)).foregroundStyle(theme.p.accent)
-                Text(entry.tx).font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textSecondary)
+                Text("→").font(Typeface.mono(10)).foregroundStyle(theme.p.accent)
+                Text(entry.tx).font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
             }
             HStack(spacing: 6) {
-                Text("←").font(.system(size: 10, design: .monospaced)).foregroundStyle(theme.p.textTertiary)
+                Text("←").font(Typeface.mono(10)).foregroundStyle(theme.p.textTertiary)
                 if let rx = entry.rx { response(rx) }
-                else { Text(l.t(entry.info ?? "")).font(.system(size: 11, design: .monospaced))
+                else { Text(l.t(entry.info ?? "")).font(l.sans(11))
                         .foregroundStyle(theme.p.textTertiary) }
             }
         }
@@ -128,13 +128,13 @@ private struct ApduRow: View {
             let ok = sw == ["90", "00"]
             HStack(spacing: 6) {
                 if !data.isEmpty {
-                    Text(data).font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textSecondary)
+                    Text(data).font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
                 }
-                Text(sw.joined(separator: " ")).font(.system(size: 11, weight: .medium, design: .monospaced))
+                Text(sw.joined(separator: " ")).font(Typeface.mono(11, .medium))
                     .foregroundStyle(ok ? theme.p.accent : theme.p.textPrimary)
             }
         } else {
-            Text(rx).font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textSecondary)
+            Text(rx).font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
         }
     }
 }

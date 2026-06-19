@@ -47,6 +47,16 @@ final class L10n {
 
     func systemDisplay() -> String { t("lang_system") }
 
+    /// True when chrome text should render in Be Vietnam Pro (brand VN body).
+    var isVietnamese: Bool { active == "vi" }
+
+    /// Language-aware chrome font (Be Vietnam Pro for vi, Geist Sans otherwise).
+    /// Reads `active`, so a view body that calls this re-renders on language
+    /// change and picks up the right face.
+    func sans(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
+        Typeface.sans(size, weight, vietnamese: isVietnamese)
+    }
+
     // vi = natural Vietnamese, en, zh = Simplified, ja.
     static let table: [String: [String: String]] = [
         "lang_system":   ["vi": "tự động", "en": "system", "zh": "跟随系统", "ja": "システム"],

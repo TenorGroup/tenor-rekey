@@ -62,7 +62,7 @@ private struct SectorTile: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 5) {
                     Text(String(format: "s%02d", s.index))
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(Typeface.mono(10))
                         .foregroundStyle(s.hasKey ? theme.p.textSecondary : theme.p.textTertiary)
                     Spacer()
                     CloneStatusGlyph(status: model.cloneStatus(ofSector: s.index))
@@ -70,7 +70,7 @@ private struct SectorTile: View {
                 }
                 Spacer()
                 if let kh = s.keyHex {
-                    Text(kh).font(.system(size: 8, design: .monospaced))
+                    Text(kh).font(Typeface.mono(8))
                         .foregroundStyle(theme.p.textTertiary).lineLimit(1)
                 }
             }
@@ -89,7 +89,7 @@ struct ProvenanceDot: View {
         case .nonDefault: Circle().fill(theme.p.textSecondary).frame(width: 6, height: 6)
         case .dictionary: Circle().strokeBorder(theme.p.textTertiary, lineWidth: 1).frame(width: 6, height: 6)
         case .nested: Circle().fill(theme.p.accent).frame(width: 6, height: 6)
-        case .unknown: Text("-").font(.system(size: 9)).foregroundStyle(theme.p.textTertiary)
+        case .unknown: Text("-").font(Typeface.mono(9)).foregroundStyle(theme.p.textTertiary)
         }
     }
 }

@@ -16,20 +16,20 @@ struct PageTable: View {
                     Spacer()
                     Text("ascii")
                 }
-                .font(.system(size: 9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
+                .font(l.sans(9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
                 .padding(.horizontal, 24).padding(.bottom, 6)
 
                 ForEach(model.pages) { page in
                     HStack(spacing: 16) {
                         Text(String(format: "%03d", page.index))
-                            .font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textTertiary)
+                            .font(Typeface.mono(11)).foregroundStyle(theme.p.textTertiary)
                             .frame(width: 40, alignment: .leading)
                         Text(page.hex)
-                            .font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textSecondary)
+                            .font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
                             .textSelection(.enabled)
                         Spacer()
                         Text(page.ascii)
-                            .font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textTertiary)
+                            .font(Typeface.mono(11)).foregroundStyle(theme.p.textTertiary)
                             .textSelection(.enabled)
                     }
                     .padding(.horizontal, 24).padding(.vertical, 3)

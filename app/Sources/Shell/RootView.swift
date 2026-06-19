@@ -98,7 +98,7 @@ private struct HeaderBar: View {
             iconButton("sun.max", symbol: theme.toggleSymbol, help: l.t("light_dark")) { theme.toggle() }
             iconButton("sidebar.right", help: l.t("inspector")) { model.inspectorOpen.toggle() }
         }
-        .font(.system(size: 12))
+        .font(l.sans(12))
         .foregroundStyle(theme.p.textSecondary)
         .padding(.leading, 16)
         .padding(.trailing, 14)
@@ -119,7 +119,7 @@ private struct ReaderStatusInline: View {
     var body: some View {
         HStack(spacing: 6) {
             Circle().fill(model.card != nil ? theme.p.accent : theme.p.textTertiary).frame(width: 6, height: 6)
-            Text(text).font(.system(size: 11, design: model.card?.uid != nil ? .monospaced : .default))
+            Text(text).font(model.card?.uid != nil ? Typeface.mono(11) : l.sans(11))
                 .foregroundStyle(theme.p.textSecondary)
         }
     }
@@ -172,12 +172,13 @@ private struct ActionButton: View {
     let enabled: Bool
     let action: () -> Void
     @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon).font(.system(size: 11))
-                Text(title).font(.system(size: 12, weight: .medium))
+                Text(title).font(l.sans(12, .medium))
             }
             .padding(.horizontal, 11)
             .frame(height: 30)
@@ -208,9 +209,9 @@ private struct SourceTag: View {
     @Environment(L10n.self) private var l
     var body: some View {
         HStack(spacing: 7) {
-            Text(l.t("source")).font(.system(size: 9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
+            Text(l.t("source")).font(l.sans(9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
             Text(src.uid.isEmpty ? src.name : src.uid)
-                .font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textSecondary).lineLimit(1)
+                .font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary).lineLimit(1)
             Button { withAnimation(.easeInOut(duration: 0.3)) { model.source = nil } } label: {
                 Image(systemName: "xmark").font(.system(size: 8))
             }.buttonStyle(.plain).foregroundStyle(theme.p.textTertiary).help(l.t("cancel"))
@@ -262,8 +263,8 @@ private struct CardHeader: View {
     }
     private func metric(_ label: String, _ value: String, mono: Bool = true) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(label).font(.system(size: 9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
-            Text(value).font(.system(size: 14, design: mono ? .monospaced : .default))
+            Text(label).font(l.sans(9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
+            Text(value).font(mono ? Typeface.mono(14) : l.sans(14))
                 .foregroundStyle(theme.p.textPrimary).textSelection(.enabled)
         }
     }
@@ -278,14 +279,14 @@ private struct PreDecode: View {
             Spacer()
             if model.decoding {
                 ProgressView().controlSize(.small)
-                Text(l.t("decoding")).font(.system(size: 12)).foregroundStyle(theme.p.textSecondary)
+                Text(l.t("decoding")).font(l.sans(12)).foregroundStyle(theme.p.textSecondary)
             } else {
                 let ntag = model.card?.sak == 0x00
                 Button { Task { await model.decode() } } label: {
-                    Text(l.t(ntag ? "read_card" : "decode_card")).font(.system(size: 13))
+                    Text(l.t(ntag ? "read_card" : "decode_card")).font(l.sans(13))
                 }
                 .buttonStyle(.borderedProminent).tint(theme.p.accent)
-                Text(l.t(ntag ? "read_pages" : "read_all")).font(.system(size: 10)).foregroundStyle(theme.p.textTertiary)
+                Text(l.t(ntag ? "read_pages" : "read_all")).font(l.sans(10)).foregroundStyle(theme.p.textTertiary)
             }
             Spacer()
         }
@@ -313,9 +314,9 @@ private struct EmptyState: View {
                 }
             }
             VStack(spacing: 4) {
-                Text(l.t("waiting_card")).font(.system(size: 12)).foregroundStyle(theme.p.textSecondary)
+                Text(l.t("waiting_card")).font(l.sans(12)).foregroundStyle(theme.p.textSecondary)
                 Text(model.readerOnline ? (model.info?.model.lowercased() ?? l.t("reader_online")) : l.t("reader_offline"))
-                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(theme.p.textTertiary)
+                    .font(Typeface.mono(10)).foregroundStyle(theme.p.textTertiary)
             }
             Spacer()
         }
@@ -335,7 +336,7 @@ struct Lockup: View {
             Text("/").foregroundStyle(theme.p.textPrimary.opacity(TenorOpacity.syntax))
             Text(focal).foregroundStyle(theme.p.textPrimary.opacity(TenorOpacity.focal))
         }
-        .font(.system(size: size, weight: .medium))
+        .font(Typeface.wordmark(size))
         .tracking(-size * 0.04)
     }
 }

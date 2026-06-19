@@ -6,6 +6,8 @@ struct TenorRekeyApp: App {
     @State private var theme = Theme()
     @State private var l10n = L10n()
 
+    init() { Typeface.registerBundledFonts() }
+
     var body: some Scene {
         WindowGroup {
             RootView()

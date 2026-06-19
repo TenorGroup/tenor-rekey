@@ -13,25 +13,25 @@ struct SectorInspector: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         Text("\(l.t("sector")) \(String(format: "%02d", s.index))")
-                            .font(.system(size: 12, weight: .medium))
+                            .font(l.sans(12, .medium))
                             .foregroundStyle(theme.p.textPrimary)
 
                         if let kh = s.keyHex {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text("\(l.t("key")) \(s.keyType?.lowercased() ?? "a") · \(l.t(s.provenance.locKey))")
-                                    .font(.system(size: 9)).foregroundStyle(theme.p.textTertiary)
-                                Text(kh).font(.system(size: 12, design: .monospaced))
+                                    .font(l.sans(9)).foregroundStyle(theme.p.textTertiary)
+                                Text(kh).font(Typeface.mono(12))
                                     .foregroundStyle(theme.p.accent).textSelection(.enabled)
                             }
                         }
 
                         VStack(alignment: .leading, spacing: 5) {
-                            Text(l.t("blocks")).font(.system(size: 9)).foregroundStyle(theme.p.textTertiary)
+                            Text(l.t("blocks")).font(l.sans(9)).foregroundStyle(theme.p.textTertiary)
                             ForEach(Array(s.blocks.enumerated()), id: \.offset) { i, hex in
                                 let blk = firstBlock(s.index) + i
                                 HStack(spacing: 6) {
                                     Text("\(blk)  \(hex)")
-                                        .font(.system(size: 8.5, design: .monospaced))
+                                        .font(Typeface.mono(8.5))
                                         .foregroundStyle(theme.p.textSecondary)
                                         .textSelection(.enabled).lineLimit(1)
                                     Spacer(minLength: 4)
@@ -50,7 +50,7 @@ struct SectorInspector: View {
             } else {
                 VStack {
                     Spacer()
-                    Text(l.t("select_sector")).font(.system(size: 11)).foregroundStyle(theme.p.textTertiary)
+                    Text(l.t("select_sector")).font(l.sans(11)).foregroundStyle(theme.p.textTertiary)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity)

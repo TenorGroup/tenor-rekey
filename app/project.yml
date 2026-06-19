@@ -16,6 +16,7 @@ targets:
     sources:
       - Sources
       - Assets.xcassets
+      - Resources/Fonts
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: vn.tenor.rekey

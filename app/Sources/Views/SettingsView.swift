@@ -12,6 +12,9 @@ struct SettingsView: View {
             DictionarySettings().tabItem { Label(l.t("dictionaries"), systemImage: "key") }
             GeneralSettings().tabItem { Label(l.t("general"), systemImage: "gearshape") }
         }
+        // Brand chrome font for the native settings form too; explicit mono /
+        // sans sites below still override where data wants it.
+        .font(l.sans(13))
         .frame(width: 470, height: 400)
     }
 }
@@ -35,7 +38,7 @@ private struct DeviceSettings: View {
     }
     private func spec(_ label: String, _ value: String?) -> some View {
         LabeledContent(label) {
-            Text(value ?? "-").font(.system(.body, design: .monospaced)).textSelection(.enabled)
+            Text(value ?? "-").font(Typeface.mono(13)).textSelection(.enabled)
         }
     }
 }
@@ -50,7 +53,7 @@ private struct DictionarySettings: View {
         VStack(spacing: 0) {
             HStack {
                 TextField(l.t("key_hint"), text: $newKey)
-                    .font(.system(.body, design: .monospaced))
+                    .font(Typeface.mono(13))
                     .onSubmit(addKey)
                 Button(l.t("add"), action: addKey)
                     .disabled(KeyStore.normalized(newKey) == nil)
@@ -59,14 +62,14 @@ private struct DictionarySettings: View {
             .padding(12)
             List(selection: $selection) {
                 ForEach(model.keyStore.keys, id: \.self) { key in
-                    Text(key).font(.system(.body, design: .monospaced))
+                    Text(key).font(Typeface.mono(13))
                 }
                 .onDelete { model.keyStore.remove(at: $0) }
                 .onMove { model.keyStore.move(from: $0, to: $1) }
             }
             HStack {
                 Text("\(model.keyStore.keys.count) \(l.t("user_keys"))  ·  +\(model.builtinKeyCount) \(l.t("builtin_keys"))")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(l.sans(11)).foregroundStyle(.secondary)
                 Spacer()
                 Button(l.t("remove")) { removeSelected() }.disabled(selection.isEmpty)
             }
