@@ -9,11 +9,13 @@ MIFARE ops use standard PN532 InDataExchange (verified working on this firmware)
   read  : D4 40 01 30 <block>            -> 16 bytes
   write : D4 40 01 A0 <block> <data16>
 """
+import os
 from x7 import X7, hx
 from x7_init import INIT_SEQ
 
 # Well-known MIFARE Classic keys (proxmark/mfoc dictionary) + ones recovered here.
-# Ordered so the most common (FF, then this deployment's key) hit first.
+# Ordered so the most common (FF, then this deployment's key) hit first. This is
+# the in-binary fast-path fallback; the full curated dictionary is BUILTIN_KEYS.
 DEFAULT_KEYS = [
     "ffffffffffff", "a0b1c2d3e4f5", "000000000000", "a0a1a2a3a4a5",
     "d3f7d3f7d3f7", "a0b0c0d0e0f0", "b0b1b2b3b4b5", "aabbccddeeff",
@@ -29,6 +31,27 @@ DEFAULT_KEYS = [
     "888888888888", "999999999999", "aaaaaaaaaaaa", "bbbbbbbbbbbb",
     "cccccccccccc", "dddddddddddd", "eeeeeeeeeeee", "123456789abc",
 ]
+
+
+def _load_builtin_keys():
+    """The bundled curated dictionary (dict/mfc_keys.dic, ~4.5k keys), or the
+    in-binary DEFAULT_KEYS if the file is missing. Loaded once at import."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dict", "mfc_keys.dic")
+    try:
+        keys, seen = [], set()
+        with open(path) as f:
+            for line in f:
+                s = line.strip().lower()
+                if len(s) == 12 and all(c in "0123456789abcdef" for c in s) and s not in seen:
+                    seen.add(s)
+                    keys.append(s)
+        return keys or list(DEFAULT_KEYS)
+    except OSError:
+        return list(DEFAULT_KEYS)
+
+
+# Full curated dictionary used for decode (DEFAULT_KEYS is the fallback subset).
+BUILTIN_KEYS = _load_builtin_keys()
 
 
 def sector_count(sak):
@@ -111,43 +134,58 @@ class X7Card:
         r = self._pt([0xD4, 0x40, 0x01, 0xA0, block] + list(data16))
         return len(r) >= 3 and r[1] == 0x41 and r[2] == 0x00
 
-    def find_key(self, block, keys=DEFAULT_KEYS):
+    def find_key(self, block, keys=DEFAULT_KEYS, on_try=None):
         """Return (keytype, keyhex) that authenticates `block`, or None.
 
         Deterministic keytype: A is always preferred, so a card whose KeyA ==
         KeyB (or a factory sector, both ffff) reports A and never flips A<->B
         between decodes. Polls are retried until the card couples so a transient
         coupling miss never skips or mislabels a valid key; if a key is found as
-        B, A is re-checked so A wins whenever it also authenticates."""
+        B, A is re-checked so A wins whenever it also authenticates. `on_try(i)`
+        (throttled) lets the caller show progress when walking a large dict."""
         def auth_ok(k, kt):
             for _ in range(4):             # retry until the card couples
                 if not self.poll():        # reselect (failed auth halts the card)
                     continue
                 return self.auth(block, k, kt)   # coupled: this attempt is decisive
             return False
-        for k in keys:
+        for i, k in enumerate(keys):
+            if on_try is not None and i and i % 256 == 0:
+                on_try(i, len(keys))
             if auth_ok(k, "A"):
                 return ("A", k)
             if auth_ok(k, "B"):
                 return ("A", k) if auth_ok(k, "A") else ("B", k)
         return None
 
-    def dump(self, keys=DEFAULT_KEYS, progress=None):
-        """Dump the whole card. Returns dict: blocks{n:16B}, keys{sector:(kt,key)}, sak, uid."""
+    def dump(self, keys=None, progress=None, on_try=None):
+        """Dump the whole card. Returns dict: blocks{n:16B}, keys{sector:(kt,key)}, sak, uid.
+
+        Key REUSE: a key proven on one sector is tried first on the rest (MIFARE
+        deployments reuse keys), so a normal card resolves in a handful of auths
+        regardless of dictionary size; the full dict is only walked on a sector
+        whose key is genuinely unknown."""
+        if keys is None:
+            keys = BUILTIN_KEYS
         info = self.wait_for_card()
         if not info:
             raise RuntimeError("no card on reader")
         nsec = sector_count(info["sak"])
         blocks, skeys = {}, {}
+        found_keys, found_set = [], set()      # proven on THIS card, tried first
         for s in range(nsec):
             tb = trailer_block(s)
-            found = self.find_key(tb, keys)
+            trial = found_keys + [k for k in keys if k not in found_set]
+            found = self.find_key(tb, trial, on_try=(lambda i, n, s=s: on_try(s, i, n)) if on_try else None)
             skeys[s] = found
             if progress:
                 progress(s, nsec, found)
             if not found:
                 continue
             kt, k = found
+            if k not in found_set:             # promote for the remaining sectors
+                found_set.add(k)
+                found_keys.insert(0, k)
             for b in range(first_block(s), tb + 1):
                 data = None
                 for _ in range(6):                  # re-auth per block for reliability

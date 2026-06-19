@@ -113,16 +113,15 @@ actor X7Engine {
 
     func info() async throws -> DeviceInfo { try await request("info", as: DeviceInfo.self) }
     func poll() async throws -> PollResult { try await request("poll", as: PollResult.self) }
-    /// Decode with an optional key dictionary; nil falls back to the daemon's built-in keys.
-    func decode(keys: [String]? = nil) async throws -> DecodeResult {
-        if let keys, !keys.isEmpty {
-            return try await request("decode", params: DecodeParams(keys: keys), as: DecodeResult.self)
-        }
-        return try await request("decode", as: DecodeResult.self)
+    /// Decode. `userKeys` are the user's editable keys, tried FIRST; the daemon
+    /// appends its large built-in curated dictionary. Empty -> built-in only.
+    func decode(userKeys: [String] = []) async throws -> DecodeResult {
+        if userKeys.isEmpty { return try await request("decode", as: DecodeResult.self) }
+        return try await request("decode", params: DecodeParams(user_keys: userKeys), as: DecodeResult.self)
     }
-    /// The built-in key dictionary, used to seed the app's editable list once.
-    func defaultKeys() async throws -> [String] {
-        try await request("keys_default", as: KeyList.self).keys
+    /// Size of the daemon's built-in dictionary (for the Settings "+N built-in" line).
+    func builtinKeyCount() async throws -> Int {
+        try await request("keys_builtin_count", as: CountResult.self).count
     }
     func readNTAG() async throws -> NtagResult { try await request("read_ntag", as: NtagResult.self) }
     /// Factory-reset the card (zero data + factory trailer). keys from a prior decode.
@@ -154,7 +153,7 @@ actor X7Engine {
     }
     private struct ApduParams: Encodable { let hex: String }
     private struct FormatParams: Encodable { let keys: [String: [String]] }
-    private struct DecodeParams: Encodable { let keys: [String] }
-    private struct KeyList: Decodable { let keys: [String] }
+    private struct DecodeParams: Encodable { let user_keys: [String] }
+    private struct CountResult: Decodable { let count: Int }
     private struct Envelope<T: Decodable>: Decodable { let result: T?; let error: String? }
 }

@@ -34,8 +34,11 @@ final class AppModel {
     var apduBusy = false
 
     private let engine = X7Engine()
-    /// The editable key dictionary that feeds decode (Settings > Dictionaries).
+    /// The user's editable keys (Settings > Dictionaries), tried before the
+    /// daemon's large built-in dictionary.
     let keyStore = KeyStore()
+    /// Size of the daemon's built-in curated dictionary (shown in Settings).
+    var builtinKeyCount = 0
 
     var selectedSector: SectorVM? {
         guard let s = selected else { return nil }
@@ -49,9 +52,7 @@ final class AppModel {
             info = try await engine.info()
             readerOnline = true
             lastError = nil
-            if keyStore.keys.isEmpty, let defs = try? await engine.defaultKeys(), !defs.isEmpty {
-                keyStore.seed(defs)
-            }
+            builtinKeyCount = (try? await engine.builtinKeyCount()) ?? 0
             await refreshCard()
         } catch {
             readerOnline = false
@@ -86,7 +87,7 @@ final class AppModel {
                 let pgs = Self.buildPages(r)
                 withAnimation(.easeInOut(duration: 0.3)) { sectors = []; selected = nil; pages = pgs }
             } else {
-                let r = try await engine.decode(keys: keyStore.keys)
+                let r = try await engine.decode(userKeys: keyStore.keys)
                 let vms = Self.buildSectors(r)
                 withAnimation(.easeInOut(duration: 0.3)) {
                     card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)

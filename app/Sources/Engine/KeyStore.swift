@@ -1,10 +1,10 @@
 import SwiftUI
 import Observation
 
-/// The editable MIFARE key dictionary that feeds `decode`. Seeded once from the
-/// daemon's built-in list (single source = x7lib, never hardcoded here), then
-/// the user owns it: add / remove / reorder / import, persisted across launches.
-/// Order matters - decode tries keys in order, so user-added keys go to the front.
+/// The user's editable MIFARE key list (Settings > Dictionaries). These are the
+/// keys tried FIRST, before the daemon's large built-in curated dictionary - so
+/// it holds only the user's own / site-specific keys, persisted across launches.
+/// Order matters - user keys are tried in order, newest at the front.
 @MainActor
 @Observable
 final class KeyStore {
@@ -13,13 +13,6 @@ final class KeyStore {
 
     init() {
         if let arr = UserDefaults.standard.array(forKey: Self.udKey) as? [String] { keys = arr }
-    }
-
-    /// Seed from the daemon defaults only if the user has no dictionary yet.
-    func seed(_ defaults: [String]) {
-        guard keys.isEmpty else { return }
-        keys = defaults
-        save()
     }
 
     /// A valid key is exactly 12 hex chars (6 bytes), case-insensitive. Returns

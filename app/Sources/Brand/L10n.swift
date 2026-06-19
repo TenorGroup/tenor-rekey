@@ -107,6 +107,8 @@ final class L10n {
         "import":        ["vi": "nhập tệp…", "en": "import…", "zh": "导入…", "ja": "インポート…"],
         "remove":        ["vi": "xóa", "en": "remove", "zh": "删除", "ja": "削除"],
         "keys_count":    ["vi": "khóa", "en": "keys", "zh": "个密钥", "ja": "件の鍵"],
+        "user_keys":     ["vi": "khóa của bạn", "en": "user keys", "zh": "用户密钥", "ja": "ユーザー鍵"],
+        "builtin_keys":  ["vi": "khóa tích hợp", "en": "built-in", "zh": "内置", "ja": "内蔵"],
         "appearance":    ["vi": "giao diện", "en": "appearance", "zh": "外观", "ja": "外観"],
         "light":         ["vi": "sáng", "en": "light", "zh": "浅色", "ja": "ライト"],
         "dark":          ["vi": "tối", "en": "dark", "zh": "深色", "ja": "ダーク"],

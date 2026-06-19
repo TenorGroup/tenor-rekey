@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Build the bundled MIFARE Classic key dictionary (probe/dict/mfc_keys.dic).
+
+Merges the curated public dictionaries (Proxmark3 Iceman, MifareClassicTool,
+nbox aggregate, Flipper Unleashed), dedups + validates to 12-hex lowercase, and
+ORDERS them so common + hotel keys are tried first: universal defaults, then the
+hotel/access-control block (incl. the Vietnam BETECH/TESA keys this vendor
+meets), then frequency-ranked keys, then the long tail. Re-run to refresh:
+
+    python3 probe/dict/build_dict.py
+
+There is NO curated 30-40k MIFARE Classic dictionary - the only files that big
+are hex-encoded password wordlists (junk, near-zero real-card hits). The real
+public key universe is ~4.5-5k; this assembles that. See SOURCES.md.
+"""
+import re
+import pathlib
+import urllib.request
+
+HERE = pathlib.Path(__file__).resolve().parent
+OUT = HERE / "mfc_keys.dic"
+HEX12 = re.compile(r"^[0-9a-f]{12}$")
+
+# Curated sources (one key per line, '#' comments, optional trailing comment).
+SOURCES = {
+    "proxmark3":  "https://raw.githubusercontent.com/RfidResearchGroup/proxmark3/master/client/dictionaries/mfc_default_keys.dic",
+    "mct_hotel":  "https://raw.githubusercontent.com/ikarus23/MifareClassicTool/master/Mifare%20Classic%20Tool/app/src/main/assets/key-files/hotel-std.keys",
+    "mct_ext":    "https://raw.githubusercontent.com/ikarus23/MifareClassicTool/master/Mifare%20Classic%20Tool/app/src/main/assets/key-files/extended-std.keys",
+    "nbox":       "https://raw.githubusercontent.com/nbox/Chameleon-Ultra-Flipper-Zero-key-dictionary/main/clean_keys.dic",
+    "unleashed":  "https://raw.githubusercontent.com/DarkFlippers/unleashed-firmware/dev/applications/main/nfc/resources/nfc/assets/mf_classic_dict.nfc",
+}
+# Frequency-ranked lists (used only to ORDER, not to add keys).
+FREQ = [
+    "https://raw.githubusercontent.com/RfidResearchGroup/proxmark3/master/client/dictionaries/mfc_keys_icbmp_sorted.dic",
+    "https://raw.githubusercontent.com/RfidResearchGroup/proxmark3/master/client/dictionaries/mfc_keys_bmp_sorted.dic",
+]
+
+# Hot path: the universal defaults every card-management tool front-loads.
+DEFAULTS = ["ffffffffffff", "000000000000", "a0a1a2a3a4a5", "d3f7d3f7d3f7",
+            "b0b1b2b3b4b5", "a0b0c0d0e0f0", "4d3a99c351dd", "1a982c7e459a",
+            "aabbccddeeff"]
+# Hotel / access-control vendor keys (Proxmark-labelled), incl. the Vietnam
+# brands this vendor actually meets. Tried right after the universal defaults.
+HOTEL = [
+    "aac34d9a4e65",  # BETECH brand, Vietnam (hotel cards)
+    "90c270f690c2",  # facility using TESA locks (Vietnam-relevant)
+    "8a19d40cf2b5", "3961ea82c46d",                      # Onity S1 A/B
+    "afbecd121004", "afbecd120454", "842146108088",      # OMNITEC.ES timecard/maint/emergency
+    "32f093536677",                                       # Saflok hotel
+    "2a2c13cc242a", "b578f38a5c61",                       # common hotel
+    "4d57414c5648", "4d48414c5648",                       # MIWA ALVH 'MWALVH'/'MHALVH'
+]
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "tenor-rekey-dict-build"})
+    return urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+
+
+def keys_in(text):
+    """Extract valid 12-hex keys (first token per non-comment line), lowercased,
+    in first-seen order."""
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        tok = s.split()[0].lower()
+        if HEX12.match(tok):
+            out.append(tok)
+    return out
+
+
+def main():
+    # Full key universe (dedup, first-seen order across sources).
+    universe, seen = [], set()
+    counts = {}
+    for name, url in SOURCES.items():
+        ks = keys_in(fetch(url))
+        counts[name] = len(ks)
+        for k in ks:
+            if k not in seen:
+                seen.add(k); universe.append(k)
+
+    freq_order = []
+    fseen = set()
+    for url in FREQ:
+        for k in keys_in(fetch(url)):
+            if k not in fseen:
+                fseen.add(k); freq_order.append(k)
+
+    # Ordered output: defaults, hotel, freq-ranked (that exist), then the tail.
+    ordered, used = [], set()
+
+    def take(keys):
+        for k in keys:
+            if HEX12.match(k) and k in seen and k not in used:
+                used.add(k); ordered.append(k)
+
+    # DEFAULTS/HOTEL are front-loaded even if a source happens to drop them, so
+    # mark them present BEFORE take() (which gates on `seen`).
+    seen.update(DEFAULTS)
+    seen.update(HOTEL)
+    take(DEFAULTS)                                    # universal defaults, hot path
+    take(HOTEL)                                       # hotel/access (incl. VN BETECH/TESA)
+    take(freq_order)                                  # frequency-ranked common
+    take(universe)                                    # everything else
+
+    header = (
+        "# tenor/rekey bundled MIFARE Classic key dictionary\n"
+        "# Generated by probe/dict/build_dict.py - do NOT hand-edit.\n"
+        "# Order: universal defaults, hotel/access-control (incl. Vietnam BETECH/TESA),\n"
+        "# frequency-ranked common keys, then the long tail. One 12-hex key per line.\n"
+        "# Sources + licenses: see probe/dict/SOURCES.md\n"
+    )
+    OUT.write_text(header + "\n".join(ordered) + "\n")
+    print("source key counts:", counts)
+    print("wrote %s (%d unique keys)" % (OUT, len(ordered)))
+
+
+if __name__ == "__main__":
+    main()

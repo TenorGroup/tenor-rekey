@@ -65,7 +65,7 @@ private struct DictionarySettings: View {
                 .onMove { model.keyStore.move(from: $0, to: $1) }
             }
             HStack {
-                Text("\(model.keyStore.keys.count) \(l.t("keys_count"))")
+                Text("\(model.keyStore.keys.count) \(l.t("user_keys"))  ·  +\(model.builtinKeyCount) \(l.t("builtin_keys"))")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button(l.t("remove")) { removeSelected() }.disabled(selection.isEmpty)

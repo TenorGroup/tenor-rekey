@@ -19,7 +19,7 @@ import sys
 import json
 from x7 import X7, hx
 from x7lib import (X7Card, trailer_block, first_block, sector_count,
-                   DEFAULT_KEYS)
+                   DEFAULT_KEYS, BUILTIN_KEYS)
 
 # Factory transport config for a MIFARE Classic trailer: KeyA all-FF, access
 # bytes FF 07 80 + GPB 69 (the chip's shipped state), KeyB all-FF.
@@ -32,7 +32,7 @@ def _sector_of(b):
 
 class Daemon:
     METHODS = ("info", "poll", "decode", "read_ntag", "apdu", "write_mfd",
-               "format", "nested_recover", "keys_default")
+               "format", "nested_recover", "keys_default", "keys_builtin_count")
 
     def __init__(self):
         self.card = None
@@ -71,19 +71,32 @@ class Daemon:
                 "sak": i["sak"]}
 
     def keys_default(self, p):
-        """The built-in key dictionary, so the app can seed its editable list
-        from a single source (x7lib) instead of duplicating it."""
+        """The small in-binary fast-path key list (legacy; the full dictionary is
+        BUILTIN_KEYS, kept daemon-side and never shipped to the UI)."""
         return {"keys": list(DEFAULT_KEYS)}
+
+    def keys_builtin_count(self, p):
+        """Size of the bundled curated dictionary, so Settings can show '+N
+        built-in' without ever transferring thousands of keys over the pipe."""
+        return {"count": len(BUILTIN_KEYS)}
 
     def decode(self, p):
         c = self._open()
-        keys = p.get("keys") or DEFAULT_KEYS
+        # The app sends only the USER's editable keys; the big curated dictionary
+        # lives here and is appended (user keys tried first).
+        user = p.get("user_keys") or p.get("keys") or []
+        uset = set(user)
+        keys = list(user) + [k for k in BUILTIN_KEYS if k not in uset]
 
         def prog(s, n, f):
             self.emit({"event": "progress", "method": "decode", "sector": s,
                        "total": n, "keytype": (f[0] if f else None),
                        "key": (f[1] if f else None)})
-        d = c.dump(keys=keys, progress=prog)
+
+        def on_try(s, i, n):
+            self.emit({"event": "progress", "method": "decode", "sector": s,
+                       "total": None, "keys_tried": i, "keys_total": n})
+        d = c.dump(keys=keys, progress=prog, on_try=on_try)
         blocks = {str(b): (hx(v) if v else None) for b, v in d["blocks"].items()}
         keys = {str(s): ([k[0], k[1]] if k else None) for s, k in d["keys"].items()}
         return {"uid": hx(d["uid"]), "atqa": hx(d["atqa"]), "sak": d["sak"],
