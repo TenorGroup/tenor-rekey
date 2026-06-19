@@ -114,6 +114,9 @@ actor X7Engine {
     func info() async throws -> DeviceInfo { try await request("info", as: DeviceInfo.self) }
     func poll() async throws -> PollResult { try await request("poll", as: PollResult.self) }
     func decode() async throws -> DecodeResult { try await request("decode", as: DecodeResult.self) }
+    func apdu(_ hex: String) async throws -> ApduResult {
+        try await request("apdu", params: ApduParams(hex: hex), as: ApduResult.self)
+    }
 
     /// Clone a dump onto the card on the reader. Per-block results stream to
     /// `onBlock` as the daemon writes; the final tally is returned.
@@ -134,5 +137,6 @@ actor X7Engine {
         let blocks: [String: String]; let keys: [String: [String]]
         let trailers: Bool; let uid: Bool
     }
+    private struct ApduParams: Encodable { let hex: String }
     private struct Envelope<T: Decodable>: Decodable { let result: T?; let error: String? }
 }

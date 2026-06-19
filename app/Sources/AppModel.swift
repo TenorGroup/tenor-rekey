@@ -24,6 +24,11 @@ final class AppModel {
     /// Per-block write outcome from the last/in-flight clone (block -> ok).
     var cloneResults: [Int: Bool] = [:]
 
+    /// apdu console.
+    var apduOpen = false
+    var apduLog: [ApduEntry] = []
+    var apduBusy = false
+
     private let engine = X7Engine()
 
     var selectedSector: SectorVM? {
@@ -128,6 +133,32 @@ final class AppModel {
         let results = blockNumbers(ofSector: s).compactMap { cloneResults[$0] }
         if results.isEmpty { return .none }
         return results.contains(false) ? .failed : .ok
+    }
+
+    // ---- apdu --------------------------------------------------------------
+
+    /// Send a raw APDU to the card on the reader and append the outcome to the
+    /// console transcript. Distinguishes a real response, a card that gave no
+    /// answer (e.g. a MIFARE Classic, not ISO14443-4), and no card present.
+    func sendAPDU(_ hex: String) async {
+        let clean = hex.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !clean.isEmpty, !apduBusy else { return }
+        apduBusy = true
+        let id = (apduLog.last?.id ?? 0) + 1
+        do {
+            let r = try await engine.apdu(clean)
+            if !r.present {
+                apduLog.append(ApduEntry(id: id, tx: clean, rx: nil, info: "apdu_no_card"))
+            } else if let resp = r.resp {
+                apduLog.append(ApduEntry(id: id, tx: clean, rx: resp, info: nil))
+            } else {
+                apduLog.append(ApduEntry(id: id, tx: clean, rx: nil, info: "apdu_no_response"))
+            }
+        } catch {
+            apduLog.append(ApduEntry(id: id, tx: clean, rx: nil, info: "apdu_error"))
+            lastError = "\(error)"
+        }
+        apduBusy = false
     }
 
     // ---- file dumps --------------------------------------------------------

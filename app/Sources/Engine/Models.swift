@@ -34,6 +34,24 @@ struct WriteResult: Codable, Sendable {
     let failed: [Int]?
 }
 
+/// Result of an apdu passthrough. `present` is false when no card; `resp` is
+/// the response hex (space-separated) or nil when the card gave no answer
+/// (e.g. a MIFARE Classic that is not ISO14443-4).
+struct ApduResult: Codable, Sendable {
+    let present: Bool
+    let uid: String?
+    let sak: Int?
+    let resp: String?
+}
+
+/// One line of the apdu console transcript.
+struct ApduEntry: Identifiable, Equatable {
+    let id: Int
+    let tx: String          // command hex, lowercased
+    let rx: String?         // response hex, or nil for a non-data outcome
+    let info: String?       // l10n key for a non-data outcome (no response / no card)
+}
+
 /// An id-less progress event emitted by the daemon mid-operation. Fields are
 /// optional because each method emits a different subset (write_mfd: block/ok;
 /// decode: sector/total/keytype; nested_recover: phase).

@@ -38,8 +38,15 @@ private struct Workspace: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            CanvasView()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 0) {
+                CanvasView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if model.apduOpen {
+                    Rectangle().fill(theme.p.hairline).frame(height: 1)
+                    ApduConsole()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             if inspectorOpen {
                 Rectangle().fill(theme.p.hairline).frame(width: 1)
                 SectorInspector().frame(width: 300)
@@ -69,7 +76,7 @@ private struct Workspace: View {
             Button { model.cloneSheet = true } label: { Image(systemName: "doc.on.doc") }
                 .help(l.t("clone")).disabled(model.source == nil || model.card == nil || model.cloning)
             Button {} label: { Image(systemName: "key") }.help("\(l.t("recover")) · \(l.t("soon"))").disabled(true)
-            Button {} label: { Image(systemName: "terminal") }.help("apdu · \(l.t("soon"))").disabled(true)
+            Button { model.apduOpen.toggle() } label: { Image(systemName: "terminal") }.help(l.t("apdu"))
             Menu {
                 ForEach(AppLang.allCases) { lang in
                     Button(lang == .system ? l.systemDisplay() : lang.display) { l.lang = lang }
