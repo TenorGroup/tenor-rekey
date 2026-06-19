@@ -9,23 +9,44 @@ struct SectorGrid: View {
     private let cols = Array(repeating: GridItem(.flexible(), spacing: 12), count: 4)
 
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: cols, spacing: 12) {
-                ForEach(model.sectors) { s in
-                    SectorTile(s: s, selected: model.selected == s.index)
-                        .onTapGesture {
-                            withAnimation(.easeOut(duration: 0.16)) { model.selected = s.index }
-                        }
-                        .contextMenu { TileMenu(s: s) }
+        Group {
+            // 1K (<= 16 sectors) fits in four rows: size the tiles to fill the
+            // canvas so the memory map reads as one composed matrix, no dead space
+            // below. Larger cards (4K) stay in a scroll view.
+            if model.sectors.count <= 16 {
+                GeometryReader { geo in
+                    let rows = max(1, Int(ceil(Double(model.sectors.count) / 4.0)))
+                    let pad: CGFloat = 24, gap: CGFloat = 12
+                    let avail = geo.size.height - pad * 2 - CGFloat(rows - 1) * gap
+                    let tileH = min(92, max(56, avail / CGFloat(rows)))
+                    LazyVGrid(columns: cols, spacing: gap) {
+                        ForEach(model.sectors) { s in tile(s, height: tileH) }
+                    }
+                    .padding(pad)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: cols, spacing: 12) {
+                        ForEach(model.sectors) { s in tile(s, height: 56) }
+                    }
+                    .padding(24)
                 }
             }
-            .padding(24)
         }
         // ⌘C when the grid is first responder; text fields keep their own copy.
         .onCopyCommand {
             guard let t = model.copySelectionText() else { return [] }
             return [NSItemProvider(object: t as NSString)]
         }
+    }
+
+    private func tile(_ s: SectorVM, height: CGFloat) -> some View {
+        SectorTile(s: s, selected: model.selected == s.index, height: height)
+            .onTapGesture {
+                withAnimation(.easeOut(duration: 0.16)) { model.selected = s.index }
+            }
+            .contextMenu { TileMenu(s: s) }
     }
 }
 
@@ -44,6 +65,7 @@ private struct TileMenu: View {
 private struct SectorTile: View {
     let s: SectorVM
     let selected: Bool
+    var height: CGFloat = 56
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
 
@@ -76,7 +98,7 @@ private struct SectorTile: View {
             }
             .padding(8)
         }
-        .frame(height: 56)
+        .frame(height: height)
         .contentShape(Rectangle())
     }
 }

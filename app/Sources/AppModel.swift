@@ -12,7 +12,8 @@ final class AppModel {
     var card: PollResult?
     var sectors: [SectorVM] = []
     var pages: [NtagPage] = []          // NTAG / Ultralight page dump (SAK 0x00)
-    var selected: Int?
+    var selected: Int?                  // selected sector index
+    var selectedBlock: Int?             // selected absolute block, for the quick-look
     var decoding = false
     var lastError: String?
     var inspectorOpen = true
@@ -66,7 +67,7 @@ final class AppModel {
             let p = try await engine.poll()
             withAnimation(.easeInOut(duration: 0.3)) {
                 card = p.present ? p : nil
-                if !p.present { sectors = []; pages = []; selected = nil }
+                if !p.present { sectors = []; pages = []; selected = nil; selectedBlock = nil }
             }
             readerOnline = true
             lastError = nil
@@ -141,6 +142,11 @@ final class AppModel {
         let base = firstBlock(s.index)
         let body = s.blocks.enumerated().map { i, hex in String(format: "%3d  %@", base + i, hex) }
         return ([head] + body).joined(separator: "\n")
+    }
+
+    /// Plain-text rendering of a single block: absolute block number + hex.
+    func blockText(_ blk: Int, hex: String) -> String {
+        String(format: "%3d  %@", blk, hex)
     }
 
     /// Plain text for ⌘C: the selected sector, or the whole NTAG page dump.

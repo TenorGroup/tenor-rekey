@@ -299,22 +299,28 @@ private struct EmptyState: View {
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
     var body: some View {
-        VStack(spacing: 22) {
+        VStack(spacing: 24) {
             Spacer()
-            Lockup(focal: "rekey", size: 26)
-            VStack(spacing: 8) {
+            Lockup(focal: "rekey", size: 24)
+            // a quiet ghost of the memory map, echoing the loaded sector grid
+            VStack(spacing: 9) {
                 ForEach(0..<4, id: \.self) { _ in
-                    HStack(spacing: 8) {
+                    HStack(spacing: 9) {
                         ForEach(0..<4, id: \.self) { _ in
                             RoundedRectangle(cornerRadius: 7)
-                                .strokeBorder(theme.p.voidStroke, style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                                .frame(width: 56, height: 38)
+                                .strokeBorder(theme.p.voidStroke.opacity(0.7),
+                                              style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                                .frame(width: 60, height: 40)
                         }
                     }
                 }
             }
-            VStack(spacing: 4) {
-                Text(l.t("waiting_card")).font(l.sans(12)).foregroundStyle(theme.p.textSecondary)
+            VStack(spacing: 5) {
+                HStack(spacing: 6) {
+                    Circle().fill(model.readerOnline ? theme.p.accent : theme.p.textTertiary)
+                        .frame(width: 6, height: 6)
+                    Text(l.t("waiting_card")).font(l.sans(12)).foregroundStyle(theme.p.textSecondary)
+                }
                 Text(model.readerOnline ? (model.info?.model.lowercased() ?? l.t("reader_online")) : l.t("reader_offline"))
                     .font(Typeface.mono(10)).foregroundStyle(theme.p.textTertiary)
             }
