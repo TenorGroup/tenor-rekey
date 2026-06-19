@@ -28,10 +28,19 @@ struct SectorInspector: View {
                         VStack(alignment: .leading, spacing: 5) {
                             Text(l.t("blocks")).font(.system(size: 9)).foregroundStyle(theme.p.textTertiary)
                             ForEach(Array(s.blocks.enumerated()), id: \.offset) { i, hex in
-                                Text("\(i)  \(hex)")
-                                    .font(.system(size: 8.5, design: .monospaced))
-                                    .foregroundStyle(theme.p.textSecondary)
-                                    .textSelection(.enabled).lineLimit(1)
+                                let blk = firstBlock(s.index) + i
+                                HStack(spacing: 6) {
+                                    Text("\(blk)  \(hex)")
+                                        .font(.system(size: 8.5, design: .monospaced))
+                                        .foregroundStyle(theme.p.textSecondary)
+                                        .textSelection(.enabled).lineLimit(1)
+                                    Spacer(minLength: 4)
+                                    if let ok = model.cloneResults[blk] {
+                                        Image(systemName: ok ? "checkmark" : "xmark")
+                                            .font(.system(size: 8, weight: .bold))
+                                            .foregroundStyle(ok ? theme.p.textSecondary : theme.p.textPrimary)
+                                    }
+                                }
                             }
                         }
                     }

@@ -27,6 +27,9 @@ actor X7Engine {
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
     private var buffer = Data()
+    /// Set for the duration of a streaming op (only one runs at a time, the UI
+    /// disables other actions); id-less progress events are routed here.
+    private var eventSink: (@Sendable (EngineEvent) -> Void)?
 
     init(probeDir: String = "/Users/tuan/Claude/Tenor/tenor-rekey/probe") {
         self.workDir = URL(fileURLWithPath: probeDir)
@@ -76,15 +79,15 @@ actor X7Engine {
 
     private func route(_ line: Data) {
         guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return }
-        if obj["event"] != nil { return }   // progress events: wired in a later step
+        if obj["event"] != nil {
+            if let ev = try? JSONDecoder().decode(EngineEvent.self, from: line) { eventSink?(ev) }
+            return
+        }
         guard let id = obj["id"] as? Int, let c = pending.removeValue(forKey: id) else { return }
         c.resume(returning: line)
     }
 
-    private func request<T: Decodable>(_ method: String, as _: T.Type) async throws -> T {
-        try startIfNeeded()
-        let id = nextID; nextID += 1
-        let reqData = try JSONEncoder().encode(Req(id: id, method: method))
+    private func transact<T: Decodable>(id: Int, _ reqData: Data, as _: T.Type) async throws -> T {
         let line: Data = try await withCheckedThrowingContinuation { cont in
             pending[id] = cont
             try? stdin?.write(contentsOf: reqData)
@@ -96,10 +99,40 @@ actor X7Engine {
         return r
     }
 
+    private func request<T: Decodable>(_ method: String, as t: T.Type) async throws -> T {
+        try startIfNeeded()
+        let id = nextID; nextID += 1
+        return try await transact(id: id, JSONEncoder().encode(Req(id: id, method: method)), as: t)
+    }
+
+    private func request<P: Encodable, T: Decodable>(_ method: String, params: P, as t: T.Type) async throws -> T {
+        try startIfNeeded()
+        let id = nextID; nextID += 1
+        return try await transact(id: id, JSONEncoder().encode(ReqP(id: id, method: method, params: params)), as: t)
+    }
+
     func info() async throws -> DeviceInfo { try await request("info", as: DeviceInfo.self) }
     func poll() async throws -> PollResult { try await request("poll", as: PollResult.self) }
     func decode() async throws -> DecodeResult { try await request("decode", as: DecodeResult.self) }
 
+    /// Clone a dump onto the card on the reader. Per-block results stream to
+    /// `onBlock` as the daemon writes; the final tally is returned.
+    func writeMFD(blocks: [String: String], keys: [String: [String]],
+                  trailers: Bool, uid: Bool,
+                  onBlock: @escaping @Sendable (Int, Bool) -> Void) async throws -> WriteResult {
+        eventSink = { ev in
+            if ev.method == "write_mfd", let b = ev.block, let ok = ev.ok { onBlock(b, ok) }
+        }
+        defer { eventSink = nil }
+        let params = CloneParams(blocks: blocks, keys: keys, trailers: trailers, uid: uid)
+        return try await request("write_mfd", params: params, as: WriteResult.self)
+    }
+
     private struct Req: Encodable { let id: Int; let method: String }
+    private struct ReqP<P: Encodable>: Encodable { let id: Int; let method: String; let params: P }
+    private struct CloneParams: Encodable {
+        let blocks: [String: String]; let keys: [String: [String]]
+        let trailers: Bool; let uid: Bool
+    }
     private struct Envelope<T: Decodable>: Decodable { let result: T?; let error: String? }
 }

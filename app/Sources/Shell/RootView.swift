@@ -1,21 +1,20 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// One unified workspace (Codex r5): the CARD is the document; read/decode/clone
 /// /recover/apdu are actions on it, not tabs. Canvas = the card's sector map;
 /// a right inspector carries hex density. Theme + language are token-driven so
 /// switching either is instant (theme = animated crossfade).
 struct RootView: View {
-    @State private var model = AppModel()
-    @State private var theme = Theme()
-    @State private var l10n = L10n()
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l10n
     @State private var inspectorOpen = true
     @Environment(\.colorScheme) private var systemScheme
 
     var body: some View {
+        @Bindable var model = model
         Workspace(inspectorOpen: $inspectorOpen)
-            .environment(model)
-            .environment(theme)
-            .environment(l10n)
             .preferredColorScheme(theme.appearance == .system ? nil : theme.scheme)
             .onAppear {
                 theme.systemScheme = systemScheme
@@ -23,6 +22,9 @@ struct RootView: View {
             }
             .onChange(of: systemScheme) { _, s in
                 withAnimation(.easeInOut(duration: 0.35)) { theme.systemScheme = s }
+            }
+            .sheet(isPresented: $model.cloneSheet) {
+                CloneSheet().environment(model).environment(theme).environment(l10n)
             }
             .task { await model.connect() }
     }
@@ -44,6 +46,16 @@ private struct Workspace: View {
             }
         }
         .background(theme.p.canvas)
+        .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
+            guard let provider = providers.first else { return false }
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                let url = (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                    ?? (item as? URL)
+                guard let url else { return }
+                Task { @MainActor in model.loadDump(from: url) }
+            }
+            return true
+        }
         .toolbar { toolbar }
     }
 
@@ -54,7 +66,8 @@ private struct Workspace: View {
         ToolbarItemGroup(placement: .primaryAction) {
             Button { Task { await model.decode() } } label: { Image(systemName: "square.grid.3x3") }
                 .help(l.t("decode")).disabled(model.card == nil || model.decoding)
-            Button {} label: { Image(systemName: "doc.on.doc") }.help("\(l.t("clone")) · \(l.t("soon"))").disabled(true)
+            Button { model.cloneSheet = true } label: { Image(systemName: "doc.on.doc") }
+                .help(l.t("clone")).disabled(model.source == nil || model.card == nil || model.cloning)
             Button {} label: { Image(systemName: "key") }.help("\(l.t("recover")) · \(l.t("soon"))").disabled(true)
             Button {} label: { Image(systemName: "terminal") }.help("apdu · \(l.t("soon"))").disabled(true)
             Menu {
@@ -75,6 +88,10 @@ private struct CanvasView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let src = model.source {
+                SourceWell(src: src)
+                Rectangle().fill(theme.p.hairline).frame(height: 1)
+            }
             if let c = model.card {
                 CardHeader(card: c)
                 Rectangle().fill(theme.p.hairline).frame(height: 1)
@@ -90,15 +107,39 @@ private struct CanvasView: View {
     }
 }
 
+/// A loaded clone source, shown as a slim well above the canvas.
+private struct SourceWell: View {
+    let src: CardDump
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(l.t("source")).font(.system(size: 9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
+            Text(src.uid.isEmpty ? src.name : "\(src.uid) · \(src.name)")
+                .font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textSecondary)
+            Text("\(src.sectorCount) \(l.t("sectors"))")
+                .font(.system(size: 10)).foregroundStyle(theme.p.textTertiary)
+            Spacer()
+            Button { withAnimation(.easeInOut(duration: 0.3)) { model.source = nil } } label: {
+                Image(systemName: "xmark").font(.system(size: 9))
+            }
+            .buttonStyle(.plain).foregroundStyle(theme.p.textTertiary).help(l.t("cancel"))
+        }
+        .padding(.horizontal, 24).padding(.vertical, 8)
+        .background(theme.p.panel)
+    }
+}
+
 private struct CardHeader: View {
     let card: PollResult
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
     var body: some View {
         HStack(alignment: .top, spacing: 28) {
-            metric("uid", card.uid ?? "—")
-            metric("atqa", card.atqa ?? "—")
-            metric("sak", card.sak.map { String(format: "%02x", $0) } ?? "—")
+            metric("uid", card.uid ?? "-")
+            metric("atqa", card.atqa ?? "-")
+            metric("sak", card.sak.map { String(format: "%02x", $0) } ?? "-")
             metric(l.t("type"), cardType(card.sak), mono: false)
             Spacer()
         }

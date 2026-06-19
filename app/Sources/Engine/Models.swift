@@ -25,6 +25,29 @@ struct DecodeResult: Codable, Equatable {
     let keys: [String: [String]?]      // sector -> [keytype, keyhex], or null
 }
 
+/// Result of a write_mfd / clone. `present` is false when no card was on the
+/// reader; otherwise `wrote` counts blocks written and `failed` lists block
+/// indices that could not be written.
+struct WriteResult: Codable, Sendable {
+    let present: Bool
+    let wrote: Int?
+    let failed: [Int]?
+}
+
+/// An id-less progress event emitted by the daemon mid-operation. Fields are
+/// optional because each method emits a different subset (write_mfd: block/ok;
+/// decode: sector/total/keytype; nested_recover: phase).
+struct EngineEvent: Decodable, Sendable {
+    let event: String
+    let method: String
+    let block: Int?
+    let ok: Bool?
+    let sector: Int?
+    let total: Int?
+    let keytype: String?
+    let phase: String?
+}
+
 /// How a sector's key was obtained - drives the provenance dot.
 enum KeyProvenance: Equatable {
     case nonDefault   // a known, non-factory key (e.g. a0b1c2d3e4f5)

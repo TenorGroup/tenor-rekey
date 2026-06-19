@@ -1,5 +1,6 @@
 import SwiftUI
 import Observation
+import AppKit
 
 /// Observable app state. The CARD is the document; reading / decoding act on it.
 /// Heavy work stays on the X7Engine actor; this holds @MainActor UI state only.
@@ -13,6 +14,15 @@ final class AppModel {
     var selected: Int?
     var decoding = false
     var lastError: String?
+
+    /// The most recent live decode, kept so File > Save can write it out.
+    var liveDump: CardDump?
+    /// A loaded source dump (File > Open / drag-drop) - the thing clone writes.
+    var source: CardDump?
+    var cloneSheet = false
+    var cloning = false
+    /// Per-block write outcome from the last/in-flight clone (block -> ok).
+    var cloneResults: [Int: Bool] = [:]
 
     private let engine = X7Engine()
 
@@ -54,6 +64,7 @@ final class AppModel {
         guard !decoding else { return }
         decoding = true
         lastError = nil
+        cloneResults = [:]
         do {
             let r = try await engine.decode()
             let vms = Self.buildSectors(r)
@@ -62,6 +73,7 @@ final class AppModel {
                 sectors = vms
                 selected = vms.first?.index
             }
+            liveDump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
         } catch {
             lastError = "\(error)"
         }
@@ -76,11 +88,86 @@ final class AppModel {
             let prov: KeyProvenance = kh == nil
                 ? .unknown
                 : (kh == "ffffffffffff" ? .dictionary : .nonDefault)
-            let nums = s < 32
-                ? Array((s * 4)...(s * 4 + 3))
-                : Array((128 + (s - 32) * 16)...(128 + (s - 32) * 16 + 15))
-            let blocks = nums.map { b in (r.blocks[String(b)] ?? nil) ?? "?" }
+            let blocks = blockNumbers(ofSector: s).map { b in (r.blocks[String(b)] ?? nil) ?? "?" }
             return SectorVM(index: s, keyType: kt, keyHex: kh, provenance: prov, blocks: blocks)
         }
     }
+
+    // ---- clone / write -----------------------------------------------------
+
+    /// Write the loaded source dump onto the card on the reader. Data blocks
+    /// only by default; trailers (keys/access) and block 0 (uid) are opt-in.
+    func clone(trailers: Bool, uid: Bool) async {
+        guard let src = source, !cloning else { return }
+        cloning = true
+        cloneResults = [:]
+        lastError = nil
+        do {
+            let r = try await engine.writeMFD(
+                blocks: src.blockParams, keys: src.keyParams, trailers: trailers, uid: uid,
+                onBlock: { [weak self] b, ok in
+                    Task { @MainActor in
+                        withAnimation(.easeOut(duration: 0.16)) { self?.cloneResults[b] = ok }
+                    }
+                })
+            // Per-block glyphs in the grid/inspector are the primary failure
+            // surface; lastError is the summary for when one is shown.
+            if r.present == false {
+                lastError = "no card on reader"
+            } else if let failed = r.failed, !failed.isEmpty {
+                lastError = "\(failed.count) block(s) failed to write: \(failed)"
+            }
+        } catch {
+            lastError = "\(error)"
+        }
+        cloning = false
+    }
+
+    /// Aggregate clone status for one sector tile, from the per-block results.
+    func cloneStatus(ofSector s: Int) -> SectorCloneStatus {
+        let results = blockNumbers(ofSector: s).compactMap { cloneResults[$0] }
+        if results.isEmpty { return .none }
+        return results.contains(false) ? .failed : .ok
+    }
+
+    // ---- file dumps --------------------------------------------------------
+
+    func openDumpDialog() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.data]
+        panel.allowsOtherFileTypes = true
+        panel.canChooseFiles = true
+        if panel.runModal() == .OK, let url = panel.url { loadDump(from: url) }
+    }
+
+    func saveDumpDialog() {
+        guard let dump = liveDump else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(dump.name).mfd"
+        panel.allowsOtherFileTypes = true
+        if panel.runModal() == .OK, let url = panel.url { saveDump(dump, to: url) }
+    }
+
+    func loadDump(from url: URL) {
+        do {
+            let dump = try CardDump.load(mfd: url)
+            withAnimation(.easeInOut(duration: 0.3)) { source = dump }
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
+            lastError = nil
+        } catch {
+            lastError = "\(error)"
+        }
+    }
+
+    private func saveDump(_ dump: CardDump, to url: URL) {
+        do {
+            try dump.mfdData().write(to: url)
+            try dump.keysJSON().write(to: url.appendingPathExtension("keys.json"))
+            lastError = nil
+        } catch {
+            lastError = "\(error)"
+        }
+    }
 }
+
+enum SectorCloneStatus { case none, ok, failed }

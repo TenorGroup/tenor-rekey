@@ -26,6 +26,7 @@ struct SectorGrid: View {
 private struct SectorTile: View {
     let s: SectorVM
     let selected: Bool
+    @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
 
     var body: some View {
@@ -41,11 +42,12 @@ private struct SectorTile: View {
                     )
                 )
             VStack(alignment: .leading, spacing: 0) {
-                HStack {
+                HStack(spacing: 5) {
                     Text(String(format: "s%02d", s.index))
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(s.hasKey ? theme.p.textSecondary : theme.p.textTertiary)
                     Spacer()
+                    CloneStatusGlyph(status: model.cloneStatus(ofSector: s.index))
                     ProvenanceDot(p: s.provenance)
                 }
                 Spacer()
@@ -69,7 +71,22 @@ struct ProvenanceDot: View {
         case .nonDefault: Circle().fill(theme.p.textSecondary).frame(width: 6, height: 6)
         case .dictionary: Circle().strokeBorder(theme.p.textTertiary, lineWidth: 1).frame(width: 6, height: 6)
         case .nested: Circle().fill(theme.p.accent).frame(width: 6, height: 6)
-        case .unknown: Text("—").font(.system(size: 9)).foregroundStyle(theme.p.textTertiary)
+        case .unknown: Text("-").font(.system(size: 9)).foregroundStyle(theme.p.textTertiary)
+        }
+    }
+}
+
+/// Sector-level clone outcome, overlaid on the tile as blocks stream back.
+struct CloneStatusGlyph: View {
+    let status: SectorCloneStatus
+    @Environment(Theme.self) private var theme
+    var body: some View {
+        switch status {
+        case .none: EmptyView()
+        case .ok: Image(systemName: "checkmark").font(.system(size: 8, weight: .bold))
+                .foregroundStyle(theme.p.textSecondary)
+        case .failed: Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 8))
+                .foregroundStyle(theme.p.textPrimary)
         }
     }
 }
