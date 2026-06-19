@@ -1,0 +1,31 @@
+# build output + deps
+app/build/
+app/tenorrekey.xcodeproj/
+**/.venv/
+**/__pycache__/
+*.pyc
+.DS_Store
+
+# card dumps may contain real keys - never commit
+*.mfd
+*.mfd.keys.json
+
+# reverse-engineering artifacts + proprietary third-party material (nfcPro/wCopy) - not redistributable
+re/
+wCopy/
+
+# internal working notes (kept local, not for the public repo)
+SESSION_HANDOFF.md
+ROADMAP.md
+
+# one-off RE / bring-up probe scripts (may embed captured device data)
+probe/enumerate.py
+probe/dump_descriptor.py
+probe/probe_fw.py
+probe/probe_vendor.py
+probe/read_uid.py
+probe/read_uid2.py
+probe/replay_capture.py
+probe/replay_rfinit.py
+probe/sweep_read.py
+probe/test_init.py
