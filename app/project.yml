@@ -15,6 +15,7 @@ targets:
     platform: macOS
     sources:
       - Sources
+      - Assets.xcassets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: vn.tenor.rekey
@@ -23,6 +24,7 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: "tenor/rekey"
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGNING_REQUIRED: "NO"
         ENABLE_HARDENED_RUNTIME: "NO"

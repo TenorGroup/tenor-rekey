@@ -67,7 +67,6 @@ private struct Workspace: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .navigation) { ReaderStatus() }
-        ToolbarItem(placement: .principal) { Lockup(focal: "rekey") }
         ToolbarItemGroup(placement: .primaryAction) {
             Button { Task { await model.decode() } } label: { Image(systemName: "square.grid.3x3") }
                 .help(l.t("decode")).disabled(model.card == nil || model.decoding)
@@ -190,8 +189,9 @@ private struct EmptyState: View {
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 22) {
             Spacer()
+            Lockup(focal: "rekey", size: 26)
             VStack(spacing: 8) {
                 ForEach(0..<4, id: \.self) { _ in
                     HStack(spacing: 8) {
@@ -203,18 +203,22 @@ private struct EmptyState: View {
                     }
                 }
             }
-            Text(l.t("waiting_card")).font(.system(size: 12)).foregroundStyle(theme.p.textSecondary)
-            Text(model.readerOnline ? (model.info?.model.lowercased() ?? l.t("reader_online")) : l.t("reader_offline"))
-                .font(.system(size: 10, design: .monospaced)).foregroundStyle(theme.p.textTertiary)
+            VStack(spacing: 4) {
+                Text(l.t("waiting_card")).font(.system(size: 12)).foregroundStyle(theme.p.textSecondary)
+                Text(model.readerOnline ? (model.info?.model.lowercased() ?? l.t("reader_online")) : l.t("reader_offline"))
+                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(theme.p.textTertiary)
+            }
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
-/// tenor/<focal> lockup, locked opacity hierarchy 50 / 30 / 100.
+/// tenor/<focal> lockup, locked opacity hierarchy 50 / 30 / 100 (namespace /
+/// syntax / focal). Letter-spacing tracks the brand symbol (-0.04em ~ -size*0.04).
 struct Lockup: View {
     let focal: String
+    var size: CGFloat = 15
     @Environment(Theme.self) private var theme
     var body: some View {
         HStack(spacing: 0) {
@@ -222,7 +226,8 @@ struct Lockup: View {
             Text("/").foregroundStyle(theme.p.textPrimary.opacity(TenorOpacity.syntax))
             Text(focal).foregroundStyle(theme.p.textPrimary.opacity(TenorOpacity.focal))
         }
-        .font(.system(size: 13, weight: .medium))
+        .font(.system(size: size, weight: .medium))
+        .tracking(-size * 0.04)
     }
 }
 
