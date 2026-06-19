@@ -34,6 +34,13 @@ struct WriteResult: Codable, Sendable {
     let failed: [Int]?
 }
 
+/// Result of a format (factory reset). `present` is false when no card.
+struct FormatResult: Codable, Sendable {
+    let present: Bool
+    let formatted: Int?
+    let failed: [Int]?
+}
+
 /// Result of an NTAG / Ultralight (SAK 0x00) page dump.
 struct NtagResult: Codable, Sendable {
     let present: Bool

@@ -25,6 +25,8 @@ final class AppModel {
     var cloning = false
     /// Per-block write outcome from the last/in-flight clone (block -> ok).
     var cloneResults: [Int: Bool] = [:]
+    var formatConfirm = false
+    var formatting = false
 
     /// apdu console.
     var apduOpen = false
@@ -182,6 +184,31 @@ final class AppModel {
             lastError = "\(error)"
         }
         cloning = false
+    }
+
+    /// Factory-reset the card on the reader (zero data + factory trailer). Uses
+    /// the keys from the last decode so it can auth; destructive, so the UI gates
+    /// it behind a confirm. After a successful format the decode is cleared - the
+    /// card is blank and should be re-read to confirm.
+    func format() async {
+        guard card != nil, !formatting else { return }
+        formatting = true
+        cloneResults = [:]
+        lastError = nil
+        do {
+            let r = try await engine.formatCard(keys: liveDump?.keyParams ?? [:])
+            if r.present == false {
+                lastError = "no card on reader"
+            } else {
+                if let failed = r.failed, !failed.isEmpty {
+                    lastError = "\(failed.count) block(s) could not be formatted: \(failed)"
+                }
+                withAnimation(.easeInOut(duration: 0.3)) { sectors = []; selected = nil; liveDump = nil }
+            }
+        } catch {
+            lastError = "\(error)"
+        }
+        formatting = false
     }
 
     /// Aggregate clone status for one sector tile, from the per-block results.

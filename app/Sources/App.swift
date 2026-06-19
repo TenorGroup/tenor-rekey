@@ -14,8 +14,7 @@ struct TenorRekeyApp: App {
                 .environment(l10n)
                 .frame(minWidth: 940, minHeight: 600)
         }
-        .windowStyle(.titleBar)
-        .windowToolbarStyle(.unified(showsTitle: false))
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button(l10n.t("open_dump")) { model.openDumpDialog() }

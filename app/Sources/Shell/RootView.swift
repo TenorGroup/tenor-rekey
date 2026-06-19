@@ -1,10 +1,12 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 
-/// One unified workspace (Codex r5): the CARD is the document; read/decode/clone
-/// /recover/apdu are actions on it, not tabs. Canvas = the card's sector map;
-/// a right inspector carries hex density. Theme + language are token-driven so
-/// switching either is instant (theme = animated crossfade).
+/// One unified workspace: the CARD is the document; reading / writing / format /
+/// save / open are LABELLED actions on a always-visible action bar (so the
+/// workflow is discoverable, not hidden behind cryptic toolbar icons). The
+/// titlebar is hidden; a custom header carries the brand wordmark + reader
+/// status cleanly (no system toolbar wells). Theme + language switch instantly.
 struct RootView: View {
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
@@ -14,6 +16,7 @@ struct RootView: View {
     var body: some View {
         @Bindable var model = model
         Workspace()
+            .background(WindowConfigurator())
             .preferredColorScheme(theme.appearance == .system ? nil : theme.scheme)
             .onAppear {
                 theme.systemScheme = systemScheme
@@ -25,6 +28,10 @@ struct RootView: View {
             .sheet(isPresented: $model.cloneSheet) {
                 CloneSheet().environment(model).environment(theme).environment(l10n)
             }
+            .confirmationDialog(l10n.t("format_q"), isPresented: $model.formatConfirm, titleVisibility: .visible) {
+                Button(l10n.t("format"), role: .destructive) { Task { await model.format() } }
+                Button(l10n.t("cancel"), role: .cancel) {}
+            } message: { Text(l10n.t("format_msg")) }
             .task { await model.connect() }
     }
 }
@@ -32,59 +39,185 @@ struct RootView: View {
 private struct Workspace: View {
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
-    @Environment(L10n.self) private var l
 
     var body: some View {
-        HStack(spacing: 0) {
-            VStack(spacing: 0) {
-                CanvasView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                if model.apduOpen {
-                    Rectangle().fill(theme.p.hairline).frame(height: 1)
-                    ApduConsole()
+        VStack(spacing: 0) {
+            HeaderBar()
+            Rectangle().fill(theme.p.hairline).frame(height: 1)
+            ActionBar()
+            Rectangle().fill(theme.p.hairline).frame(height: 1)
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    CanvasView().frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if model.apduOpen {
+                        Rectangle().fill(theme.p.hairline).frame(height: 1)
+                        ApduConsole()
+                    }
                 }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if model.inspectorOpen {
-                Rectangle().fill(theme.p.hairline).frame(width: 1)
-                SectorInspector().frame(width: 300)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if model.inspectorOpen {
+                    Rectangle().fill(theme.p.hairline).frame(width: 1)
+                    SectorInspector().frame(width: 300)
+                }
             }
         }
         .background(theme.p.canvas)
         .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
-                let url = (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
-                    ?? (item as? URL)
+                let url = (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) } ?? (item as? URL)
                 guard let url else { return }
                 Task { @MainActor in model.loadDump(from: url) }
             }
             return true
         }
-        .toolbar { toolbar }
     }
+}
 
-    @ToolbarContentBuilder
-    private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .navigation) { ReaderStatus() }
-        ToolbarItemGroup(placement: .primaryAction) {
-            Button { Task { await model.decode() } } label: { Image(systemName: "square.grid.3x3") }
-                .help(l.t("decode")).disabled(model.card == nil || model.decoding)
-            Button { model.cloneSheet = true } label: { Image(systemName: "doc.on.doc") }
-                .help(l.t("clone")).disabled(model.source == nil || model.card == nil || model.cloning)
-            Button {} label: { Image(systemName: "key") }.help("\(l.t("recover")) · \(l.t("soon"))").disabled(true)
-            Button { model.apduOpen.toggle() } label: { Image(systemName: "terminal") }.help(l.t("apdu"))
+// MARK: - Header (brand + status + utilities), in content so we control the look
+
+private struct HeaderBar: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        HStack(spacing: 12) {
+            Spacer().frame(width: 62)              // inset past the traffic lights
+            Lockup(focal: "rekey", size: 15)
+            Spacer()
+            ReaderStatusInline()
+            Divider().frame(height: 16)
             Menu {
                 ForEach(AppLang.allCases) { lang in
                     Button(lang == .system ? l.systemDisplay() : lang.display) { l.lang = lang }
                 }
             } label: { Image(systemName: "globe") }
-            .help(l.t("language"))
-            Button { theme.toggle() } label: { Image(systemName: theme.toggleSymbol) }.help(l.t("light_dark"))
-            Button { model.inspectorOpen.toggle() } label: { Image(systemName: "sidebar.right") }.help(l.t("inspector"))
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help(l.t("language"))
+            iconButton("sun.max", symbol: theme.toggleSymbol, help: l.t("light_dark")) { theme.toggle() }
+            iconButton("sidebar.right", help: l.t("inspector")) { model.inspectorOpen.toggle() }
         }
+        .font(.system(size: 12))
+        .foregroundStyle(theme.p.textSecondary)
+        .padding(.horizontal, 16)
+        .frame(height: 46)
+        .background(theme.p.panel)
+    }
+    private func iconButton(_ name: String, symbol: String? = nil, help: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: symbol ?? name) }
+            .buttonStyle(.plain).foregroundStyle(theme.p.textSecondary).help(help)
     }
 }
+
+private struct ReaderStatusInline: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(model.card != nil ? theme.p.accent : theme.p.textTertiary).frame(width: 6, height: 6)
+            Text(text).font(.system(size: 11, design: model.card?.uid != nil ? .monospaced : .default))
+                .foregroundStyle(theme.p.textSecondary)
+        }
+    }
+    private var text: String {
+        if !model.readerOnline { return l.t("reader_offline") }
+        if let uid = model.card?.uid { return "\(l.t("card")) · \(uid)" }
+        return l.t("reader_online")
+    }
+}
+
+// MARK: - Action bar (the discoverable, labelled verbs)
+
+private struct ActionBar: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    private var ntag: Bool { model.card?.sak == 0x00 }
+    private var busy: Bool { model.decoding || model.cloning || model.formatting }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ActionButton(title: l.t(ntag ? "read" : "decode"), icon: "square.grid.3x3",
+                         prominent: true, enabled: model.card != nil && !busy) { Task { await model.decode() } }
+            ActionButton(title: l.t("write"), icon: "square.and.arrow.down.on.square",
+                         enabled: model.source != nil && model.card != nil && !busy) { model.cloneSheet = true }
+            // Format requires a prior decode: it auths with the recovered keys,
+            // and gating on liveDump means the user has seen the card before wiping.
+            ActionButton(title: l.t("format"), icon: "eraser",
+                         enabled: model.card != nil && model.liveDump != nil && !busy) { model.formatConfirm = true }
+            Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
+            ActionButton(title: l.t("save_dump"), icon: "arrow.down.doc",
+                         enabled: model.liveDump != nil) { model.saveDumpDialog() }
+            ActionButton(title: l.t("open_dump"), icon: "folder", enabled: true) { model.openDumpDialog() }
+            ActionButton(title: "apdu", icon: "terminal", on: model.apduOpen, enabled: true) { model.apduOpen.toggle() }
+            Spacer()
+            if busy { ProgressView().controlSize(.small).padding(.trailing, 4) }
+            if let src = model.source { SourceTag(src: src) }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 48)
+        .background(theme.p.panel)
+    }
+}
+
+private struct ActionButton: View {
+    let title: String
+    let icon: String
+    var prominent = false
+    var on = false
+    let enabled: Bool
+    let action: () -> Void
+    @Environment(Theme.self) private var theme
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon).font(.system(size: 11))
+                Text(title).font(.system(size: 12, weight: .medium))
+            }
+            .padding(.horizontal, 11)
+            .frame(height: 30)
+            .background(RoundedRectangle(cornerRadius: 7).fill(fill))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(theme.p.tileBorder, lineWidth: prominent ? 0 : 0.5))
+            .foregroundStyle(foreground)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
+    private var fill: Color {
+        if prominent && enabled { return theme.p.accent }
+        if on { return theme.p.tileFill }
+        return enabled ? theme.p.tileFill.opacity(0.6) : .clear
+    }
+    private var foreground: Color {
+        if !enabled { return theme.p.textTertiary }
+        if prominent { return theme.p.accentText }
+        return theme.p.textPrimary
+    }
+}
+
+/// Compact "source loaded" tag with a clear button, in the action bar.
+private struct SourceTag: View {
+    let src: CardDump
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        HStack(spacing: 7) {
+            Text(l.t("source")).font(.system(size: 9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
+            Text(src.uid.isEmpty ? src.name : src.uid)
+                .font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textSecondary).lineLimit(1)
+            Button { withAnimation(.easeInOut(duration: 0.3)) { model.source = nil } } label: {
+                Image(systemName: "xmark").font(.system(size: 8))
+            }.buttonStyle(.plain).foregroundStyle(theme.p.textTertiary).help(l.t("cancel"))
+        }
+        .padding(.horizontal, 10).frame(height: 28)
+        .background(Capsule().fill(theme.p.tileFill))
+        .overlay(Capsule().strokeBorder(theme.p.tileBorder, lineWidth: 0.5))
+    }
+}
+
+// MARK: - Canvas
 
 private struct CanvasView: View {
     @Environment(AppModel.self) private var model
@@ -92,10 +225,6 @@ private struct CanvasView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let src = model.source {
-                SourceWell(src: src)
-                Rectangle().fill(theme.p.hairline).frame(height: 1)
-            }
             if let c = model.card {
                 CardHeader(card: c)
                 Rectangle().fill(theme.p.hairline).frame(height: 1)
@@ -110,30 +239,6 @@ private struct CanvasView: View {
                 EmptyState()
             }
         }
-    }
-}
-
-/// A loaded clone source, shown as a slim well above the canvas.
-private struct SourceWell: View {
-    let src: CardDump
-    @Environment(AppModel.self) private var model
-    @Environment(Theme.self) private var theme
-    @Environment(L10n.self) private var l
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(l.t("source")).font(.system(size: 9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
-            Text(src.uid.isEmpty ? src.name : "\(src.uid) · \(src.name)")
-                .font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.p.textSecondary)
-            Text("\(src.sectorCount) \(l.t("sectors"))")
-                .font(.system(size: 10)).foregroundStyle(theme.p.textTertiary)
-            Spacer()
-            Button { withAnimation(.easeInOut(duration: 0.3)) { model.source = nil } } label: {
-                Image(systemName: "xmark").font(.system(size: 9))
-            }
-            .buttonStyle(.plain).foregroundStyle(theme.p.textTertiary).help(l.t("cancel"))
-        }
-        .padding(.horizontal, 24).padding(.vertical, 8)
-        .background(theme.p.panel)
     }
 }
 
@@ -231,24 +336,6 @@ struct Lockup: View {
     }
 }
 
-struct ReaderStatus: View {
-    @Environment(AppModel.self) private var model
-    @Environment(Theme.self) private var theme
-    @Environment(L10n.self) private var l
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle().fill(model.card != nil ? theme.p.accent : theme.p.textTertiary)
-                .frame(width: 6, height: 6)
-            Text(text).font(.system(size: 11)).foregroundStyle(theme.p.textSecondary)
-        }
-    }
-    private var text: String {
-        if !model.readerOnline { return l.t("reader_offline") }
-        if let uid = model.card?.uid { return "\(l.t("card")) · \(uid)" }
-        return l.t("reader_online")
-    }
-}
-
 func cardType(_ sak: Int?) -> String {
     switch sak {
     case 0x08: "mifare classic 1k"
@@ -257,4 +344,19 @@ func cardType(_ sak: Int?) -> String {
     case 0x20: "desfire / plus"
     default: "unknown"
     }
+}
+
+/// Hidden-titlebar window: make it draggable from the background and keep the
+/// titlebar transparent so the custom header reads as one surface.
+private struct WindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async {
+            guard let w = v.window else { return }
+            w.titlebarAppearsTransparent = true
+            w.isMovableByWindowBackground = true
+        }
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }

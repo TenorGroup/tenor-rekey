@@ -125,6 +125,10 @@ actor X7Engine {
         try await request("keys_default", as: KeyList.self).keys
     }
     func readNTAG() async throws -> NtagResult { try await request("read_ntag", as: NtagResult.self) }
+    /// Factory-reset the card (zero data + factory trailer). keys from a prior decode.
+    func formatCard(keys: [String: [String]]) async throws -> FormatResult {
+        try await request("format", params: FormatParams(keys: keys), as: FormatResult.self)
+    }
     func apdu(_ hex: String) async throws -> ApduResult {
         try await request("apdu", params: ApduParams(hex: hex), as: ApduResult.self)
     }
@@ -149,6 +153,7 @@ actor X7Engine {
         let trailers: Bool; let uid: Bool
     }
     private struct ApduParams: Encodable { let hex: String }
+    private struct FormatParams: Encodable { let keys: [String: [String]] }
     private struct DecodeParams: Encodable { let keys: [String] }
     private struct KeyList: Decodable { let keys: [String] }
     private struct Envelope<T: Decodable>: Decodable { let result: T?; let error: String? }

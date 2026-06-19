@@ -18,7 +18,12 @@ Hex is lowercase space-separated ("01 02 03 04"); keys are 12-char hex.
 import sys
 import json
 from x7 import X7, hx
-from x7lib import X7Card, trailer_block, DEFAULT_KEYS
+from x7lib import (X7Card, trailer_block, first_block, sector_count,
+                   DEFAULT_KEYS)
+
+# Factory transport config for a MIFARE Classic trailer: KeyA all-FF, access
+# bytes FF 07 80 + GPB 69 (the chip's shipped state), KeyB all-FF.
+FACTORY_TRAILER = bytes.fromhex("ffffffffffff" "ff078069" "ffffffffffff")
 
 
 def _sector_of(b):
@@ -27,7 +32,7 @@ def _sector_of(b):
 
 class Daemon:
     METHODS = ("info", "poll", "decode", "read_ntag", "apdu", "write_mfd",
-               "nested_recover", "keys_default")
+               "format", "nested_recover", "keys_default")
 
     def __init__(self):
         self.card = None
@@ -140,6 +145,46 @@ class Daemon:
             self.emit({"event": "progress", "method": "write_mfd",
                        "block": b, "ok": wrote})
         return {"present": True, "wrote": ok, "failed": fail}
+
+    def format(self, p):
+        """Reset a MIFARE Classic to factory: zero every data block and write the
+        factory trailer. params: keys {sector:[kt,key]} from a prior decode (so
+        we can auth); falls back to the default key. Block 0 (uid) is left alone.
+        Trailer is written LAST per sector so the key only flips to FF when the
+        sector's data is already cleared."""
+        c = self._open()
+        i = c.wait_for_card()
+        if not i:
+            return {"present": False}
+        keys = {int(s): v for s, v in (p.get("keys") or {}).items()}
+        zero = bytes(16)
+        ok, fail = 0, []
+        for s in range(sector_count(i["sak"])):
+            tb = trailer_block(s)
+            k = keys.get(s)
+            kk = k[1] if k else "ffffffffffff"
+            kts = [k[0], "A", "B"] if k else ["A", "B"]
+            for b in range(first_block(s), tb + 1):
+                if b == 0:
+                    continue
+                data = FACTORY_TRAILER if b == tb else zero
+                wrote = False
+                for kt in kts:
+                    for _ in range(3):
+                        if not c.poll():
+                            continue
+                        if not c.auth(tb, kk, kt):
+                            break
+                        if c.write_block(b, data):
+                            wrote = True
+                            break
+                    if wrote:
+                        break
+                ok += 1 if wrote else 0
+                if not wrote:
+                    fail.append(b)
+                self.emit({"event": "progress", "method": "format", "block": b, "ok": wrote})
+        return {"present": True, "formatted": ok, "failed": fail}
 
     def nested_recover(self, p):
         """params: known_blk, known_key, target_blk, known_kt, target_kt,
