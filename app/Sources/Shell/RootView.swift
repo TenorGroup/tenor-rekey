@@ -81,8 +81,10 @@ private struct HeaderBar: View {
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
     var body: some View {
+        // The row sits BELOW the traffic-light band (top padding clears the
+        // lights) so the wordmark left-aligns with the action bar margin instead
+        // of being indented beside the lights.
         HStack(spacing: 12) {
-            Spacer().frame(width: 62)              // inset past the traffic lights
             Lockup(focal: "rekey", size: 15)
             Spacer()
             ReaderStatusInline()
@@ -98,8 +100,10 @@ private struct HeaderBar: View {
         }
         .font(.system(size: 12))
         .foregroundStyle(theme.p.textSecondary)
-        .padding(.horizontal, 16)
-        .frame(height: 46)
+        .padding(.leading, 16)
+        .padding(.trailing, 14)
+        .padding(.top, 30)
+        .padding(.bottom, 12)
         .background(theme.p.panel)
     }
     private func iconButton(_ name: String, symbol: String? = nil, help: String, _ action: @escaping () -> Void) -> some View {
