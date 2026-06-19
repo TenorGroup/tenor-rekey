@@ -37,21 +37,37 @@ def BEBIT(x, n):
     return BIT(x, n ^ 24)
 
 
-def evenparity32(x):
-    return bin(x & M32).count("1") & 1
+if hasattr(int, "bit_count"):     # CPython 3.10+ (the bundled runtime is 3.12)
+    def evenparity32(x):
+        return (x & M32).bit_count() & 1
+else:                             # dev fallback (system python 3.9)
+    def evenparity32(x):
+        return bin(x & M32).count("1") & 1
 
 
 # ---------------------------------------------------------------------------
 # filter() - the Crypto1 non-linear filter function f (crapto1.h)
 # ---------------------------------------------------------------------------
 
-def filter(x):
+def _filter_compute(x):
     f = (0xF22C0 >> (x & 0xF)) & 16
     f |= (0x6C9C0 >> ((x >> 4) & 0xF)) & 8
     f |= (0x3C8B0 >> ((x >> 8) & 0xF)) & 4
     f |= (0x1E458 >> ((x >> 12) & 0xF)) & 2
     f |= (0x0D938 >> ((x >> 16) & 0xF)) & 1
     return BIT(0xEC57E80A, f)
+
+
+# filter() reads only the low 20 bits of x, so the whole domain fits a 2^20-byte
+# table. Crypto1 recovery hammers filter() millions of times (the 2^20 seed scan
+# plus extend_table), so the one-time ~1 MB table build pays for itself many
+# times over. crapto1 is imported lazily (only for key recovery), so the normal
+# decode path never pays this cost. Bit-exact with _filter_compute.
+_FILTER_LUT = bytes(_filter_compute(i) for i in range(1 << 20))
+
+
+def filter(x):
+    return _FILTER_LUT[x & 0xFFFFF]
 
 
 # ---------------------------------------------------------------------------
@@ -278,21 +294,15 @@ def lfsr_recovery32(ks2, in_):
     for i in range(30, -1, -2):
         eks = (eks << 1) | BEBIT(ks2, i)
 
-    odd_tail = []
-    even_tail = []
+    # C builds the seed lists with *++tail from i = (1<<20) down to 0, so the
+    # stored order is ascending in i (0,1,2,...). An ascending comprehension over
+    # the filter table reproduces that order directly (no sort needed) and is far
+    # faster than an append loop with per-element filter() calls.
     oks_b1 = oks & 1
     eks_b1 = eks & 1
-    for i in range((1 << 20), -1, -1):
-        tf = filter(i)
-        if tf == oks_b1:
-            odd_tail.append(i)
-        if tf == eks_b1:
-            even_tail.append(i)
-    # C builds the seed lists with *++tail from i = (1<<20) down to 0, so the
-    # stored order is ascending in i (0,1,2,...). Building with range(0, ...)
-    # below reproduces that order; do NOT reverse.
-    odd_tail = sorted(odd_tail)
-    even_tail = sorted(even_tail)
+    lut = _FILTER_LUT
+    odd_tail = [i for i in range((1 << 20) + 1) if lut[i & 0xFFFFF] == oks_b1]
+    even_tail = [i for i in range((1 << 20) + 1) if lut[i & 0xFFFFF] == eks_b1]
 
     oks_s = oks
     eks_s = eks

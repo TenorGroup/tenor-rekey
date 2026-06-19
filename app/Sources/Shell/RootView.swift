@@ -149,6 +149,11 @@ private struct ActionBar: View {
             // and gating on liveDump means the user has seen the card before wiping.
             ActionButton(title: l.t("format"), icon: "eraser",
                          enabled: model.card != nil && model.liveDump != nil && !busy) { model.formatConfirm = true }
+            // Nested / reader key recovery: the crypto + collection are ready and
+            // the engine method exists, but it is not yet verified live, so the
+            // action stays disabled with a "soon" hint until it is.
+            ActionButton(title: l.t("recover"), icon: "key.radiowaves.forward",
+                         enabled: false, help: l.t("soon")) { }
             Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
             ActionButton(title: l.t("save_dump"), icon: "arrow.down.doc",
                          enabled: model.liveDump != nil) { model.saveDumpDialog() }
@@ -170,6 +175,7 @@ private struct ActionButton: View {
     var prominent = false
     var on = false
     let enabled: Bool
+    var help: String? = nil
     let action: () -> Void
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
@@ -188,6 +194,7 @@ private struct ActionButton: View {
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
+        .help(help ?? "")
     }
     private var fill: Color {
         if prominent && enabled { return theme.p.accent }
