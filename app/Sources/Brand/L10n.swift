@@ -23,8 +23,15 @@ enum AppLang: String, CaseIterable, Identifiable {
 @MainActor
 @Observable
 final class L10n {
-    var lang: AppLang = .system
+    var lang: AppLang = .system {
+        didSet { UserDefaults.standard.set(lang.rawValue, forKey: "rekey.language") }
+    }
     var systemCode: String = "en"
+
+    init() {
+        if let s = UserDefaults.standard.string(forKey: "rekey.language"),
+           let a = AppLang(rawValue: s) { lang = a }
+    }
 
     var active: String {
         if lang == .system {
@@ -80,6 +87,24 @@ final class L10n {
         "apdu_no_response": ["vi": "không phản hồi", "en": "no response", "zh": "无响应", "ja": "応答なし"],
         "apdu_no_card":  ["vi": "chưa có thẻ", "en": "no card", "zh": "无卡片", "ja": "カードなし"],
         "apdu_error":    ["vi": "lỗi", "en": "error", "zh": "错误", "ja": "エラー"],
+        "device":        ["vi": "thiết bị", "en": "device", "zh": "设备", "ja": "デバイス"],
+        "dictionaries":  ["vi": "từ điển khóa", "en": "dictionaries", "zh": "密钥字典", "ja": "辞書"],
+        "general":       ["vi": "chung", "en": "general", "zh": "通用", "ja": "一般"],
+        "model":         ["vi": "model", "en": "model", "zh": "型号", "ja": "型番"],
+        "serial":        ["vi": "serial", "en": "serial", "zh": "序列号", "ja": "シリアル"],
+        "status":        ["vi": "trạng thái", "en": "status", "zh": "状态", "ja": "状態"],
+        "reconnect":     ["vi": "kết nối lại", "en": "reconnect", "zh": "重新连接", "ja": "再接続"],
+        "key_hint":      ["vi": "12 ký tự hex", "en": "12 hex chars", "zh": "12 位十六进制", "ja": "16進12文字"],
+        "add":           ["vi": "thêm", "en": "add", "zh": "添加", "ja": "追加"],
+        "import":        ["vi": "nhập tệp…", "en": "import…", "zh": "导入…", "ja": "インポート…"],
+        "remove":        ["vi": "xóa", "en": "remove", "zh": "删除", "ja": "削除"],
+        "keys_count":    ["vi": "khóa", "en": "keys", "zh": "个密钥", "ja": "件の鍵"],
+        "appearance":    ["vi": "giao diện", "en": "appearance", "zh": "外观", "ja": "外観"],
+        "light":         ["vi": "sáng", "en": "light", "zh": "浅色", "ja": "ライト"],
+        "dark":          ["vi": "tối", "en": "dark", "zh": "深色", "ja": "ダーク"],
+        "export_folder": ["vi": "thư mục lưu", "en": "export folder", "zh": "导出文件夹", "ja": "保存先フォルダ"],
+        "export_default":["vi": "hỏi mỗi lần", "en": "ask each time", "zh": "每次询问", "ja": "毎回確認"],
+        "choose":        ["vi": "chọn…", "en": "choose…", "zh": "选择…", "ja": "選択…"],
         "prov_nondefault": ["vi": "khóa riêng", "en": "non-default", "zh": "非默认", "ja": "非標準"],
         "prov_dictionary": ["vi": "từ điển", "en": "dictionary", "zh": "字典", "ja": "辞書"],
         "prov_nested":     ["vi": "bẻ nested", "en": "nested-cracked", "zh": "嵌套破解", "ja": "ネスト解読"],

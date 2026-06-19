@@ -56,9 +56,16 @@ enum Appearance: String, CaseIterable {
 @MainActor
 @Observable
 final class Theme {
-    var appearance: Appearance = .system
+    var appearance: Appearance = .system {
+        didSet { UserDefaults.standard.set(appearance.rawValue, forKey: "rekey.appearance") }
+    }
     /// Mirror of the environment colour scheme, set by the root view.
     var systemScheme: ColorScheme = .dark
+
+    init() {
+        if let s = UserDefaults.standard.string(forKey: "rekey.appearance"),
+           let a = Appearance(rawValue: s) { appearance = a }
+    }
 
     var scheme: ColorScheme {
         switch appearance {

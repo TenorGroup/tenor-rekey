@@ -25,5 +25,12 @@ struct TenorRekeyApp: App {
                     .disabled(model.liveDump == nil)
             }
         }
+
+        Settings {
+            SettingsView()
+                .environment(model)
+                .environment(theme)
+                .environment(l10n)
+        }
     }
 }

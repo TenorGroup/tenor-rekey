@@ -30,6 +30,8 @@ final class AppModel {
     var apduBusy = false
 
     private let engine = X7Engine()
+    /// The editable key dictionary that feeds decode (Settings > Dictionaries).
+    let keyStore = KeyStore()
 
     var selectedSector: SectorVM? {
         guard let s = selected else { return nil }
@@ -43,6 +45,9 @@ final class AppModel {
             info = try await engine.info()
             readerOnline = true
             lastError = nil
+            if keyStore.keys.isEmpty, let defs = try? await engine.defaultKeys(), !defs.isEmpty {
+                keyStore.seed(defs)
+            }
             await refreshCard()
         } catch {
             readerOnline = false
@@ -71,7 +76,7 @@ final class AppModel {
         lastError = nil
         cloneResults = [:]
         do {
-            let r = try await engine.decode()
+            let r = try await engine.decode(keys: keyStore.keys)
             let vms = Self.buildSectors(r)
             withAnimation(.easeInOut(duration: 0.3)) {
                 card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
@@ -176,6 +181,9 @@ final class AppModel {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "\(dump.name).mfd"
         panel.allowsOtherFileTypes = true
+        if let folder = UserDefaults.standard.string(forKey: "rekey.exportFolder") {
+            panel.directoryURL = URL(fileURLWithPath: folder)
+        }
         if panel.runModal() == .OK, let url = panel.url { saveDump(dump, to: url) }
     }
 

@@ -113,7 +113,17 @@ actor X7Engine {
 
     func info() async throws -> DeviceInfo { try await request("info", as: DeviceInfo.self) }
     func poll() async throws -> PollResult { try await request("poll", as: PollResult.self) }
-    func decode() async throws -> DecodeResult { try await request("decode", as: DecodeResult.self) }
+    /// Decode with an optional key dictionary; nil falls back to the daemon's built-in keys.
+    func decode(keys: [String]? = nil) async throws -> DecodeResult {
+        if let keys, !keys.isEmpty {
+            return try await request("decode", params: DecodeParams(keys: keys), as: DecodeResult.self)
+        }
+        return try await request("decode", as: DecodeResult.self)
+    }
+    /// The built-in key dictionary, used to seed the app's editable list once.
+    func defaultKeys() async throws -> [String] {
+        try await request("keys_default", as: KeyList.self).keys
+    }
     func apdu(_ hex: String) async throws -> ApduResult {
         try await request("apdu", params: ApduParams(hex: hex), as: ApduResult.self)
     }
@@ -138,5 +148,7 @@ actor X7Engine {
         let trailers: Bool; let uid: Bool
     }
     private struct ApduParams: Encodable { let hex: String }
+    private struct DecodeParams: Encodable { let keys: [String] }
+    private struct KeyList: Decodable { let keys: [String] }
     private struct Envelope<T: Decodable>: Decodable { let result: T?; let error: String? }
 }

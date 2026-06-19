@@ -18,7 +18,7 @@ Hex is lowercase space-separated ("01 02 03 04"); keys are 12-char hex.
 import sys
 import json
 from x7 import X7, hx
-from x7lib import X7Card, trailer_block
+from x7lib import X7Card, trailer_block, DEFAULT_KEYS
 
 
 def _sector_of(b):
@@ -26,7 +26,8 @@ def _sector_of(b):
 
 
 class Daemon:
-    METHODS = ("info", "poll", "decode", "apdu", "write_mfd", "nested_recover")
+    METHODS = ("info", "poll", "decode", "apdu", "write_mfd", "nested_recover",
+               "keys_default")
 
     def __init__(self):
         self.card = None
@@ -64,14 +65,20 @@ class Daemon:
         return {"present": True, "uid": hx(i["uid"]), "atqa": hx(i["atqa"]),
                 "sak": i["sak"]}
 
+    def keys_default(self, p):
+        """The built-in key dictionary, so the app can seed its editable list
+        from a single source (x7lib) instead of duplicating it."""
+        return {"keys": list(DEFAULT_KEYS)}
+
     def decode(self, p):
         c = self._open()
+        keys = p.get("keys") or DEFAULT_KEYS
 
         def prog(s, n, f):
             self.emit({"event": "progress", "method": "decode", "sector": s,
                        "total": n, "keytype": (f[0] if f else None),
                        "key": (f[1] if f else None)})
-        d = c.dump(progress=prog)
+        d = c.dump(keys=keys, progress=prog)
         blocks = {str(b): (hx(v) if v else None) for b, v in d["blocks"].items()}
         keys = {str(s): ([k[0], k[1]] if k else None) for s, k in d["keys"].items()}
         return {"uid": hx(d["uid"]), "atqa": hx(d["atqa"]), "sak": d["sak"],
