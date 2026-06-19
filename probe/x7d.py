@@ -26,8 +26,8 @@ def _sector_of(b):
 
 
 class Daemon:
-    METHODS = ("info", "poll", "decode", "apdu", "write_mfd", "nested_recover",
-               "keys_default")
+    METHODS = ("info", "poll", "decode", "read_ntag", "apdu", "write_mfd",
+               "nested_recover", "keys_default")
 
     def __init__(self):
         self.card = None
@@ -85,6 +85,16 @@ class Daemon:
                 "sectors": d["sectors"],
                 "recovered": sum(1 for k in d["keys"].values() if k),
                 "blocks": blocks, "keys": keys}
+
+    def read_ntag(self, p):
+        """Dump an NTAG21x / Ultralight (SAK 0x00) as 4-byte pages."""
+        c = self._open()
+        i = c.wait_for_card()
+        if not i:
+            return {"present": False}
+        pages = c.read_ntag()
+        return {"present": True, "uid": hx(i["uid"]), "sak": i["sak"],
+                "pages": {str(k): hx(v) for k, v in pages.items()}}
 
     def apdu(self, p):
         c = self._open()

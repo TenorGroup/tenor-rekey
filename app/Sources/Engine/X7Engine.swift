@@ -124,6 +124,7 @@ actor X7Engine {
     func defaultKeys() async throws -> [String] {
         try await request("keys_default", as: KeyList.self).keys
     }
+    func readNTAG() async throws -> NtagResult { try await request("read_ntag", as: NtagResult.self) }
     func apdu(_ hex: String) async throws -> ApduResult {
         try await request("apdu", params: ApduParams(hex: hex), as: ApduResult.self)
     }

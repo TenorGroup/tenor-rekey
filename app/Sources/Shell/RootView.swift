@@ -102,7 +102,9 @@ private struct CanvasView: View {
             if let c = model.card {
                 CardHeader(card: c)
                 Rectangle().fill(theme.p.hairline).frame(height: 1)
-                if model.sectors.isEmpty {
+                if c.sak == 0x00 {
+                    if model.pages.isEmpty { PreDecode() } else { PageTable() }
+                } else if model.sectors.isEmpty {
                     PreDecode()
                 } else {
                     SectorGrid()
@@ -172,9 +174,12 @@ private struct PreDecode: View {
                 ProgressView().controlSize(.small)
                 Text(l.t("decoding")).font(.system(size: 12)).foregroundStyle(theme.p.textSecondary)
             } else {
-                Button { Task { await model.decode() } } label: { Text(l.t("decode_card")).font(.system(size: 13)) }
-                    .buttonStyle(.borderedProminent).tint(theme.p.accent)
-                Text(l.t("read_all")).font(.system(size: 10)).foregroundStyle(theme.p.textTertiary)
+                let ntag = model.card?.sak == 0x00
+                Button { Task { await model.decode() } } label: {
+                    Text(l.t(ntag ? "read_card" : "decode_card")).font(.system(size: 13))
+                }
+                .buttonStyle(.borderedProminent).tint(theme.p.accent)
+                Text(l.t(ntag ? "read_pages" : "read_all")).font(.system(size: 10)).foregroundStyle(theme.p.textTertiary)
             }
             Spacer()
         }

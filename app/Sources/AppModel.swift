@@ -11,6 +11,7 @@ final class AppModel {
     var info: DeviceInfo?
     var card: PollResult?
     var sectors: [SectorVM] = []
+    var pages: [NtagPage] = []          // NTAG / Ultralight page dump (SAK 0x00)
     var selected: Int?
     var decoding = false
     var lastError: String?
@@ -61,7 +62,7 @@ final class AppModel {
             let p = try await engine.poll()
             withAnimation(.easeInOut(duration: 0.3)) {
                 card = p.present ? p : nil
-                if !p.present { sectors = []; selected = nil }
+                if !p.present { sectors = []; pages = []; selected = nil }
             }
             readerOnline = true
             lastError = nil
@@ -76,18 +77,40 @@ final class AppModel {
         lastError = nil
         cloneResults = [:]
         do {
-            let r = try await engine.decode(keys: keyStore.keys)
-            let vms = Self.buildSectors(r)
-            withAnimation(.easeInOut(duration: 0.3)) {
-                card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
-                sectors = vms
-                selected = vms.first?.index
+            if card?.sak == 0x00 {
+                // NTAG / Ultralight: a page dump, not a sector/key decode.
+                let r = try await engine.readNTAG()
+                let pgs = Self.buildPages(r)
+                withAnimation(.easeInOut(duration: 0.3)) { sectors = []; selected = nil; pages = pgs }
+            } else {
+                let r = try await engine.decode(keys: keyStore.keys)
+                let vms = Self.buildSectors(r)
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
+                    sectors = vms
+                    pages = []
+                    selected = vms.first?.index
+                }
+                liveDump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
             }
-            liveDump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
         } catch {
             lastError = "\(error)"
         }
         decoding = false
+    }
+
+    static func buildPages(_ r: NtagResult) -> [NtagPage] {
+        guard let pages = r.pages else { return [] }
+        return pages.compactMap { k, hex -> NtagPage? in
+            guard let i = Int(k) else { return nil }
+            return NtagPage(index: i, hex: hex, ascii: asciiOf(hex))
+        }.sorted { $0.index < $1.index }
+    }
+
+    /// Printable ASCII rendering of a space-separated hex page (non-printable -> '.').
+    static func asciiOf(_ hex: String) -> String {
+        let bytes = hex.split(separator: " ").compactMap { UInt8($0, radix: 16) }
+        return String(bytes.map { (32...126).contains($0) ? Character(UnicodeScalar($0)) : "." })
     }
 
     static func buildSectors(_ r: DecodeResult) -> [SectorVM] {

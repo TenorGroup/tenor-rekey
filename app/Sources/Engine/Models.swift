@@ -34,6 +34,22 @@ struct WriteResult: Codable, Sendable {
     let failed: [Int]?
 }
 
+/// Result of an NTAG / Ultralight (SAK 0x00) page dump.
+struct NtagResult: Codable, Sendable {
+    let present: Bool
+    let uid: String?
+    let sak: Int?
+    let pages: [String: String]?    // page index -> 4-byte hex
+}
+
+/// One NTAG page row for the page table.
+struct NtagPage: Identifiable, Equatable {
+    let index: Int
+    let hex: String
+    let ascii: String
+    var id: Int { index }
+}
+
 /// Result of an apdu passthrough. `present` is false when no card; `resp` is
 /// the response hex (space-separated) or nil when the card gave no answer
 /// (e.g. a MIFARE Classic that is not ISO14443-4).
