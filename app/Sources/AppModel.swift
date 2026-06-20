@@ -15,6 +15,8 @@ final class AppModel {
     var selected: Int?                  // selected sector index
     var selectedBlock: Int?             // selected absolute block, for the quick-look
     var decoding = false
+    var decodeProgress: DecodeProgress?      // live sector / key-walk progress
+    private var decodeCancelled = false
     var lastError: String?
     var inspectorOpen = true
 
@@ -129,6 +131,8 @@ final class AppModel {
     func decode() async {
         guard !decoding else { return }
         decoding = true
+        decodeCancelled = false
+        decodeProgress = nil
         lastError = nil
         cloneResults = [:]
         do {
@@ -138,7 +142,8 @@ final class AppModel {
                 let pgs = Self.buildPages(r)
                 withAnimation(.easeInOut(duration: 0.3)) { sectors = []; selected = nil; pages = pgs }
             } else {
-                let r = try await engine.decode(userKeys: keyStore.keys)
+                let r = try await engine.decode(userKeys: keyStore.keys,
+                    onProgress: { [weak self] ev in Task { @MainActor in self?.applyDecodeEvent(ev) } })
                 let vms = Self.buildSectors(r)
                 withAnimation(.easeInOut(duration: 0.3)) {
                     card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
@@ -149,9 +154,34 @@ final class AppModel {
                 liveDump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
             }
         } catch {
-            lastError = "\(error)"
+            // a user cancel kills the daemon, which surfaces as a thrown error - not
+            // something to show as a failure.
+            if !decodeCancelled { lastError = "\(error)" }
         }
         decoding = false
+        decodeCancelled = false
+        decodeProgress = nil
+    }
+
+    /// Stop a long decode. Kills the daemon (the only way to interrupt a
+    /// synchronous dictionary walk mid-flight); the monitor / next op respawns it.
+    func cancelDecode() async {
+        guard decoding else { return }
+        decodeCancelled = true
+        await engine.cancel()
+    }
+
+    /// Fold a decode progress event into `decodeProgress`. The daemon emits a
+    /// sector-boundary event (carries `total` = sector count) and a key-walk event
+    /// (carries keys_tried / keys_total) as it searches a sector's key.
+    private func applyDecodeEvent(_ ev: EngineEvent) {
+        guard decoding, let s = ev.sector else { return }
+        let fallbackTotal = card?.sak.map { sectorsForSak($0) } ?? 16
+        var p = decodeProgress ?? DecodeProgress(sector: 0, total: fallbackTotal, keysTried: nil, keysTotal: nil)
+        p.sector = s
+        if let t = ev.total { p.total = t; p.keysTried = nil; p.keysTotal = nil }
+        if let kt = ev.keys_total { p.keysTotal = kt; p.keysTried = ev.keys_tried }
+        decodeProgress = p
     }
 
     static func buildPages(_ r: NtagResult) -> [NtagPage] {

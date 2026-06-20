@@ -285,8 +285,15 @@ private struct PreDecode: View {
         VStack(spacing: 14) {
             Spacer()
             if model.decoding {
-                ProgressView().controlSize(.small)
-                Text(l.t("decoding")).font(l.sans(12)).foregroundStyle(theme.p.textSecondary)
+                if let p = model.decodeProgress {
+                    ProgressView(value: p.fraction).frame(width: 230).tint(theme.p.accent)
+                    Text(progressText(p)).font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
+                } else {
+                    ProgressView().controlSize(.small)
+                    Text(l.t("decoding")).font(l.sans(12)).foregroundStyle(theme.p.textSecondary)
+                }
+                Button(l.t("cancel")) { Task { await model.cancelDecode() } }
+                    .buttonStyle(.plain).font(l.sans(11)).foregroundStyle(theme.p.textTertiary)
             } else {
                 let ntag = model.card?.sak == 0x00
                 Button { Task { await model.decode() } } label: {
@@ -298,6 +305,14 @@ private struct PreDecode: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func progressText(_ p: DecodeProgress) -> String {
+        var s = "\(l.t("sector")) \(min(p.sector + 1, p.total))/\(p.total)"
+        if let kt = p.keysTotal, let tried = p.keysTried {
+            s += "  ·  \(l.t("trying_keys")) \(tried)/\(kt)"
+        }
+        return s
     }
 }
 

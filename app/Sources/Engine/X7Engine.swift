@@ -149,9 +149,20 @@ actor X7Engine {
     }
     /// Decode. `userKeys` are the user's editable keys, tried FIRST; the daemon
     /// appends its large built-in curated dictionary. Empty -> built-in only.
-    func decode(userKeys: [String] = []) async throws -> DecodeResult {
+    /// `onProgress` receives the per-sector / per-key-walk progress events.
+    func decode(userKeys: [String] = [],
+                onProgress: @escaping @Sendable (EngineEvent) -> Void) async throws -> DecodeResult {
+        eventSink = { ev in if ev.method == "decode" { onProgress(ev) } }
+        defer { eventSink = nil }
         if userKeys.isEmpty { return try await request("decode", as: DecodeResult.self) }
         return try await request("decode", params: DecodeParams(user_keys: userKeys), as: DecodeResult.self)
+    }
+
+    /// Abort an in-flight operation by killing the daemon: its termination fails
+    /// the pending request, and the next call respawns it. Used to cancel a long
+    /// decode (a card whose keys are not in the dictionary walks the whole list).
+    func cancel() {
+        process?.terminate()
     }
     /// Size of the daemon's built-in dictionary (for the Settings "+N built-in" line).
     func builtinKeyCount() async throws -> Int {

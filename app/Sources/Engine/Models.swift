@@ -90,6 +90,8 @@ struct EngineEvent: Decodable, Sendable {
     let total: Int?
     let keytype: String?
     let phase: String?
+    let keys_tried: Int?      // decode: keys walked so far on the current sector
+    let keys_total: Int?      // decode: dictionary size for that walk
 }
 
 /// How a sector's key was obtained - drives the provenance dot.
@@ -106,6 +108,22 @@ enum KeyProvenance: Equatable {
         case .nested: "prov_nested"
         case .unknown: "prov_unknown"
         }
+    }
+}
+
+/// Live decode progress for the spinner: which sector, and how far into the key
+/// dictionary that sector's search has walked (nil when a known key hit at once).
+struct DecodeProgress: Equatable {
+    var sector: Int
+    var total: Int
+    var keysTried: Int?
+    var keysTotal: Int?
+
+    /// 0...1 overall: completed sectors plus the current sector's key-walk fraction.
+    var fraction: Double {
+        guard total > 0 else { return 0 }
+        let within = (keysTotal ?? 0) > 0 ? Double(keysTried ?? 0) / Double(keysTotal!) : 0
+        return min(1, (Double(sector) + within) / Double(total))
     }
 }
 
