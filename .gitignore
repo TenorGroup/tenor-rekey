@@ -21,6 +21,7 @@ ROADMAP.md
 # one-off RE / bring-up probe scripts (may embed captured device data)
 probe/speed_probe.py
 probe/drive_daemon.py
+probe/nested_calib.py
 probe/enumerate.py
 probe/dump_descriptor.py
 probe/probe_fw.py
