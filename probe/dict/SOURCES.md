@@ -28,3 +28,6 @@ are ordered near the front. Note the Marriott "diversified" keys are per-card
 (UID-derived), not reusable defaults.
 
 Re-pull periodically (Proxmark is the living upstream): `python3 build_dict.py`.
+
+## device-observed (2026-06-20)
+Merged the key dictionary a XIXEI X7-P reader actually walks during a decode (~13k keys, in its own priority order), captured over USB. Real hotel/access-control vendor keys. Any card-specific key recovered during that capture was scrubbed before publishing.
