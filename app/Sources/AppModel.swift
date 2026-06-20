@@ -51,28 +51,73 @@ final class AppModel {
     func connect() async {
         do {
             info = try await engine.info()
+            builtinKeyCount = (try? await engine.builtinKeyCount()) ?? 0
             readerOnline = true
             lastError = nil
-            builtinKeyCount = (try? await engine.builtinKeyCount()) ?? 0
-            await refreshCard()
+            await refreshStatus()
         } catch {
-            readerOnline = false
-            info = nil
+            applyReaderGone()
             lastError = "\(error)"
         }
     }
 
-    func refreshCard() async {
+    /// Live status: keep the reader / card pill honest when the X7 or a card is
+    /// plugged or removed with no user action. Runs until the view's task is
+    /// cancelled. Skips polling during an operation that already owns the reader.
+    func monitor() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(1.5))
+            if decoding || cloning || formatting || apduBusy { continue }
+            await refreshStatus()
+        }
+    }
+
+    /// Consecutive polls that saw the reader but no card; a seated card that blips
+    /// for one cycle should not drop its decoded grid, so we debounce a removal.
+    private var cardAbsentStreak = 0
+
+    /// One status sample: detects reader unplug (drops to offline + clears), reader
+    /// replug (back online + refetch device info), and card placed / removed.
+    private func refreshStatus() async {
         do {
-            let p = try await engine.poll()
-            withAnimation(.easeInOut(duration: 0.3)) {
-                card = p.present ? p : nil
-                if !p.present { sectors = []; pages = []; selected = nil; selectedBlock = nil }
+            let p = try await engine.poll(tries: 8)
+            if p.reader == false {           // reader unplugged: reflect it at once
+                applyReaderGone()
+                return
             }
             readerOnline = true
+            if info == nil { info = try? await engine.info() }   // refetch until it lands
             lastError = nil
+            if p.present {
+                cardAbsentStreak = 0
+                // only react to a real placement / swap, so an idle poll on the
+                // same card does not churn the decoded sectors
+                if card == nil || p.uid != card?.uid {
+                    withAnimation(.easeInOut(duration: 0.3)) { card = p }
+                }
+            } else {
+                cardAbsentStreak += 1
+                if card != nil && cardAbsentStreak >= 2 {
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        card = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
+                    }
+                }
+            }
         } catch {
-            lastError = "\(error)"
+            applyReaderGone()
+        }
+    }
+
+    /// Reader unplugged or the daemon went away: go offline and clear everything
+    /// tied to a live reader. No-op when already in that state (avoids churn).
+    private func applyReaderGone() {
+        cardAbsentStreak = 0
+        guard readerOnline || card != nil || info != nil else { return }
+        withAnimation(.easeInOut(duration: 0.3)) {
+            readerOnline = false
+            info = nil
+            card = nil
+            sectors = []; pages = []; selected = nil; selectedBlock = nil
         }
     }
 

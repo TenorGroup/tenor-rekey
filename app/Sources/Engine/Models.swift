@@ -13,6 +13,9 @@ struct PollResult: Codable, Equatable {
     let uid: String?
     let atqa: String?
     let sak: Int?
+    /// Whether the reader itself is connected (nil from older daemons -> treat as
+    /// connected). `present` is a card on the reader; `reader` is the reader.
+    var reader: Bool? = nil
 }
 
 struct DecodeResult: Codable, Equatable {

@@ -139,7 +139,14 @@ actor X7Engine {
     }
 
     func info() async throws -> DeviceInfo { try await request("info", as: DeviceInfo.self) }
-    func poll() async throws -> PollResult { try await request("poll", as: PollResult.self) }
+    /// Poll for a card. `tries` bounds the coupling-retry count: the live status
+    /// monitor passes a small value to stay snappy; a decode wants the default.
+    func poll(tries: Int? = nil) async throws -> PollResult {
+        if let tries {
+            return try await request("poll", params: PollParams(tries: tries), as: PollResult.self)
+        }
+        return try await request("poll", as: PollResult.self)
+    }
     /// Decode. `userKeys` are the user's editable keys, tried FIRST; the daemon
     /// appends its large built-in curated dictionary. Empty -> built-in only.
     func decode(userKeys: [String] = []) async throws -> DecodeResult {
@@ -179,6 +186,7 @@ actor X7Engine {
         let trailers: Bool; let uid: Bool
     }
     private struct ApduParams: Encodable { let hex: String }
+    private struct PollParams: Encodable { let tries: Int }
     private struct FormatParams: Encodable { let keys: [String: [String]] }
     private struct DecodeParams: Encodable { let user_keys: [String] }
     private struct CountResult: Decodable { let count: Int }

@@ -32,7 +32,7 @@ struct RootView: View {
                 Button(l10n.t("format"), role: .destructive) { Task { await model.format() } }
                 Button(l10n.t("cancel"), role: .cancel) {}
             } message: { Text(l10n.t("format_msg")) }
-            .task { await model.connect() }
+            .task { await model.connect(); await model.monitor() }
     }
 }
 

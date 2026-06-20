@@ -45,6 +45,17 @@ class Daemon:
             self.card.init_rf()
         return self.card
 
+    def _drop(self):
+        """Forget the reader handle so the next _open() re-opens it. Called when a
+        hardware op fails (reader unplugged): the cached handle is dead, and a
+        fresh X7Card() is the only way to talk to the reader once it is back."""
+        if self.card is not None:
+            try:
+                self.card.close()
+            except Exception:
+                pass
+            self.card = None
+
     def emit(self, obj):
         sys.stdout.write(json.dumps(obj) + "\n")
         sys.stdout.flush()
@@ -63,12 +74,22 @@ class Daemon:
         return out
 
     def poll(self, p):
-        c = self._open()
-        i = c.wait_for_card()
+        # `reader` reports whether the X7 itself is connected (vs `present`, a card
+        # on it). A failing hardware op means the reader was unplugged: drop the
+        # dead handle so a replug re-opens cleanly. `tries` lets the UI status
+        # poll be snappy (few tries) while a decode still uses the full coupling
+        # retry. Errors here are normal (unplug), so we answer instead of raising.
+        tries = int(p.get("tries", 25))
+        try:
+            c = self._open()
+            i = c.wait_for_card(tries=tries)
+        except OSError:
+            self._drop()
+            return {"present": False, "reader": False}
         if not i:
-            return {"present": False}
-        return {"present": True, "uid": hx(i["uid"]), "atqa": hx(i["atqa"]),
-                "sak": i["sak"]}
+            return {"present": False, "reader": True}
+        return {"present": True, "reader": True, "uid": hx(i["uid"]),
+                "atqa": hx(i["atqa"]), "sak": i["sak"]}
 
     def keys_default(self, p):
         """The small in-binary fast-path key list (legacy; the full dictionary is
