@@ -24,6 +24,8 @@ actor X7Engine {
     private let script: URL
     private var process: Process?
     private var stdin: FileHandle?
+    private var outReader: FileHandle?
+    private var errReader: FileHandle?
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
     private var buffer = Data()
@@ -78,6 +80,15 @@ actor X7Engine {
             guard !d.isEmpty, let self else { return }
             Task { await self.ingest(d) }
         }
+        // Drain the daemon's stderr. Without this the OS pipe buffer (~64KB) fills
+        // the first time the engine prints a traceback or a flood of warnings, and
+        // the daemon then BLOCKS on its next stderr write, hanging every request.
+        // We forward it to the app's own stderr so it is visible in Console / a
+        // terminal launch for diagnosis.
+        errPipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            if !d.isEmpty { FileHandle.standardError.write(d) }
+        }
         p.terminationHandler = { [weak self] _ in
             guard let self else { return }
             Task { await self.died() }
@@ -85,9 +96,15 @@ actor X7Engine {
         try p.run()
         process = p
         stdin = inPipe.fileHandleForWriting
+        outReader = outPipe.fileHandleForReading
+        errReader = errPipe.fileHandleForReading
     }
 
     private func died() {
+        outReader?.readabilityHandler = nil
+        errReader?.readabilityHandler = nil
+        outReader = nil
+        errReader = nil
         process = nil
         stdin = nil
         for (_, c) in pending { c.resume(throwing: EngineError.daemon("daemon exited")) }
@@ -110,15 +127,32 @@ actor X7Engine {
             if let ev = try? JSONDecoder().decode(EngineEvent.self, from: line) { eventSink?(ev) }
             return
         }
-        guard let id = obj["id"] as? Int, let c = pending.removeValue(forKey: id) else { return }
+        guard let id = obj["id"] as? Int else {
+            // An id-less line (the daemon's bad-json reply): if exactly one request
+            // is outstanding, fail it rather than orphan its continuation.
+            if let err = obj["error"] as? String, pending.count == 1,
+               let only = pending.keys.first, let c = pending.removeValue(forKey: only) {
+                c.resume(throwing: EngineError.daemon(err))
+            }
+            return
+        }
+        guard let c = pending.removeValue(forKey: id) else { return }
         c.resume(returning: line)
     }
 
-    private func transact<T: Decodable>(id: Int, _ reqData: Data, as _: T.Type) async throws -> T {
+    private func transact<T: Decodable>(id: Int, _ reqData: Data, timeout: Duration, as _: T.Type) async throws -> T {
         let line: Data = try await withCheckedThrowingContinuation { cont in
             pending[id] = cont
             try? stdin?.write(contentsOf: reqData)
             try? stdin?.write(contentsOf: Data([0x0A]))
+            // Arm a deadline: a daemon that is alive but WEDGED (stuck on a hardware
+            // read that never returns) would otherwise orphan this continuation
+            // forever - freezing the live-status poll and every later op. On the
+            // deadline we fail this request and kill the daemon so it respawns.
+            Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                await self?.timeoutRequest(id: id)
+            }
         }
         let env = try JSONDecoder().decode(Envelope<T>.self, from: line)
         if let e = env.error { throw EngineError.daemon(e) }
@@ -126,16 +160,25 @@ actor X7Engine {
         return r
     }
 
-    private func request<T: Decodable>(_ method: String, as t: T.Type) async throws -> T {
-        try startIfNeeded()
-        let id = nextID; nextID += 1
-        return try await transact(id: id, JSONEncoder().encode(Req(id: id, method: method)), as: t)
+    /// Fail a still-pending request whose deadline passed and terminate the wedged
+    /// daemon (the next request respawns it). A no-op if the response already
+    /// arrived - route() removed it from pending first, so there is no double-resume.
+    private func timeoutRequest(id: Int) {
+        guard let c = pending.removeValue(forKey: id) else { return }
+        c.resume(throwing: EngineError.daemon("daemon timed out"))
+        process?.terminate()
     }
 
-    private func request<P: Encodable, T: Decodable>(_ method: String, params: P, as t: T.Type) async throws -> T {
+    private func request<T: Decodable>(_ method: String, timeout: Duration = .seconds(30), as t: T.Type) async throws -> T {
         try startIfNeeded()
         let id = nextID; nextID += 1
-        return try await transact(id: id, JSONEncoder().encode(ReqP(id: id, method: method, params: params)), as: t)
+        return try await transact(id: id, JSONEncoder().encode(Req(id: id, method: method)), timeout: timeout, as: t)
+    }
+
+    private func request<P: Encodable, T: Decodable>(_ method: String, params: P, timeout: Duration = .seconds(30), as t: T.Type) async throws -> T {
+        try startIfNeeded()
+        let id = nextID; nextID += 1
+        return try await transact(id: id, JSONEncoder().encode(ReqP(id: id, method: method, params: params)), timeout: timeout, as: t)
     }
 
     func info() async throws -> DeviceInfo { try await request("info", as: DeviceInfo.self) }
@@ -152,10 +195,17 @@ actor X7Engine {
     /// `onProgress` receives the per-sector / per-key-walk progress events.
     func decode(userKeys: [String] = [],
                 onProgress: @escaping @Sendable (EngineEvent) -> Void) async throws -> DecodeResult {
+        // One streaming op at a time: the event slot is shared, so reject a second
+        // before it can cross-wire this one's progress (callers also serialize, but
+        // the actor is reentrant - this is the real guard).
+        guard eventSink == nil else { throw EngineError.daemon("an operation is already in progress") }
         eventSink = { ev in if ev.method == "decode" { onProgress(ev) } }
         defer { eventSink = nil }
-        if userKeys.isEmpty { return try await request("decode", as: DecodeResult.self) }
-        return try await request("decode", params: DecodeParams(user_keys: userKeys), as: DecodeResult.self)
+        // A decode can legitimately walk the whole dictionary for minutes; the
+        // cancel button is the user's control, so give it a long backstop deadline.
+        let dl = Duration.seconds(1800)
+        if userKeys.isEmpty { return try await request("decode", timeout: dl, as: DecodeResult.self) }
+        return try await request("decode", params: DecodeParams(user_keys: userKeys), timeout: dl, as: DecodeResult.self)
     }
 
     /// Abort an in-flight operation by killing the daemon: its termination fails
@@ -168,10 +218,12 @@ actor X7Engine {
     func builtinKeyCount() async throws -> Int {
         try await request("keys_builtin_count", as: CountResult.self).count
     }
-    func readNTAG() async throws -> NtagResult { try await request("read_ntag", as: NtagResult.self) }
+    func readNTAG() async throws -> NtagResult {
+        try await request("read_ntag", timeout: .seconds(120), as: NtagResult.self)
+    }
     /// Factory-reset the card (zero data + factory trailer). keys from a prior decode.
     func formatCard(keys: [String: [String]]) async throws -> FormatResult {
-        try await request("format", params: FormatParams(keys: keys), as: FormatResult.self)
+        try await request("format", params: FormatParams(keys: keys), timeout: .seconds(300), as: FormatResult.self)
     }
     func apdu(_ hex: String) async throws -> ApduResult {
         try await request("apdu", params: ApduParams(hex: hex), as: ApduResult.self)
@@ -182,12 +234,13 @@ actor X7Engine {
     func writeMFD(blocks: [String: String], keys: [String: [String]],
                   trailers: Bool, uid: Bool,
                   onBlock: @escaping @Sendable (Int, Bool) -> Void) async throws -> WriteResult {
+        guard eventSink == nil else { throw EngineError.daemon("an operation is already in progress") }
         eventSink = { ev in
             if ev.method == "write_mfd", let b = ev.block, let ok = ev.ok { onBlock(b, ok) }
         }
         defer { eventSink = nil }
         let params = CloneParams(blocks: blocks, keys: keys, trailers: trailers, uid: uid)
-        return try await request("write_mfd", params: params, as: WriteResult.self)
+        return try await request("write_mfd", params: params, timeout: .seconds(300), as: WriteResult.self)
     }
 
     private struct Req: Encodable { let id: Int; let method: String }
