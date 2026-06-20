@@ -58,6 +58,12 @@ BUILTIN_KEYS = _load_builtin_keys()
 # is the main lever that brings the walk to nfcPro's ~26 ms/key.
 FAST_TO = 150
 
+# How many of the most common keys (the ordered head of the dictionary) find_key
+# tries as BOTH KeyA and KeyB before the one-auth-per-key A/B sweeps. This catches
+# a card that is only readable with a common KeyB (e.g. KeyB=FF, secret KeyA)
+# immediately, at a cost of at most ~2*FAST_HEAD auths on an unknown card.
+FAST_HEAD = 64
+
 
 def sector_count(sak):
     return 40 if sak == 0x18 else 16            # 4K vs 1K
@@ -73,6 +79,24 @@ def first_block(s):
 
 def trailer_block(s):
     return first_block(s) + blocks_in_sector(s) - 1
+
+
+def access_bits_valid(trailer):
+    """True if a MIFARE Classic trailer's access bytes (6, 7, 8) pass the standard
+    inverted-complement integrity check. A trailer whose access bytes are corrupt
+    must NEVER be written: the wrong condition bits can lock a sector permanently
+    (no key can rewrite the trailer again). Mirrors the app's AccessConditions.decode
+    integrity flag. Layout: byte6 low nibble = ~C1, high = ~C2; byte7 low = ~C3,
+    high = C1; byte8 low = C2, high = C3."""
+    if len(trailer) < 9:
+        return False
+    b6, b7, b8 = trailer[6], trailer[7], trailer[8]
+    bit = lambda v, n: (v >> n) & 1
+    for i in range(4):
+        c1, c2, c3 = bit(b7, 4 + i), bit(b8, i), bit(b8, 4 + i)
+        if bit(b6, i) == c1 or bit(b6, 4 + i) == c2 or bit(b7, i) == c3:
+            return False
+    return True
 
 
 class X7Card:
@@ -123,7 +147,9 @@ class X7Card:
         if isinstance(key, str):
             key = bytes.fromhex(key)
         kt = 0x60 if keytype == "A" else 0x61
-        r = self._pt([0xD4, 0x40, 0x01, kt, block] + list(key) + list(self.uid), reads=4, to=to)
+        # MIFARE crypto1 auth uses the 4-byte (last cascade level) UID; a 7-byte
+        # card (Classic EV1) must send its LAST 4 bytes, not all 7, or auth fails.
+        r = self._pt([0xD4, 0x40, 0x01, kt, block] + list(key) + list(self.uid[-4:]), reads=4, to=to)
         return len(r) >= 3 and r[1] == 0x41 and r[2] == 0x00
 
     def _select(self):
@@ -149,24 +175,37 @@ class X7Card:
         """Return (keytype, keyhex) that authenticates `block`, or None.
 
         Mirrors nfcPro's captured fast cycle so a dictionary walk runs at its
-        speed (~26 ms/key, measured): select the card once, then each attempt is
-        _select() (d4 4e) + auth() (d4 40) on a short timeout; a failed auth halts
-        the card, so a re-poll (d4 4a) re-selects it for the next attempt. A is
-        preferred (a KeyA==KeyB card never flips A<->B). `on_try` (throttled)
-        drives the caller's progress bar."""
+        speed (~26 ms/key, measured): each attempt is _select() (d4 4e) + auth()
+        (d4 40) on a short timeout; a failed auth halts the card, so a re-poll
+        (d4 4a) re-selects it for the next attempt.
+
+        ONE auth per key, structured so the common cases stay at ~26 ms/key while
+        a KeyB-readable card is not lost:
+          1. the common head of the dictionary (FAST_HEAD keys) is tried as BOTH
+             KeyA and KeyB - so a card opened only by a common KeyB (e.g. KeyB=FF,
+             secret KeyA) is caught at once instead of after a full KeyA sweep;
+          2. the rest of the dictionary is swept as KeyA, then as KeyB.
+        KeyA is preferred (tried first within each head pair, and the whole A sweep
+        precedes the B sweep). `on_try` reports progress across the KeyA coverage
+        (head + A sweep) so the bar advances monotonically and never resets."""
         if not self.poll() and not self.wait_for_card():
             return None
         n = len(keys)
-        for i, k in enumerate(keys):
-            if on_try is not None and i and i % 256 == 0:
-                on_try(i, n)
+        head = min(n, FAST_HEAD)
+        for i in range(head):                          # phase 1: common head, A and B
+            k = keys[i]
             for kt in ("A", "B"):
                 self._select()
                 if self.auth(block, k, kt, to=FAST_TO):
-                    if kt == "B":                      # prefer A when it also works
-                        self.poll(); self._select()
-                        if self.auth(block, k, "A", to=FAST_TO):
-                            return ("A", k)
+                    return (kt, k)
+                self.poll()
+        tail = keys[head:]
+        for kt in ("A", "B"):                          # phase 2/3: tail as A, then B
+            for i, k in enumerate(tail):
+                if on_try is not None and kt == "A" and (head + i) % 256 == 0:
+                    on_try(head + i, n)
+                self._select()
+                if self.auth(block, k, kt, to=FAST_TO):
                     return (kt, k)
                 self.poll()                            # re-select after the failed auth
         return None
@@ -177,7 +216,16 @@ class X7Card:
         Key REUSE: a key proven on one sector is tried first on the rest (MIFARE
         deployments reuse keys), so a normal card resolves in a handful of auths
         regardless of dictionary size; the full dict is only walked on a sector
-        whose key is genuinely unknown."""
+        whose key is genuinely unknown.
+
+        Early-exit: once TWO sectors have each swept the whole dictionary without a
+        hit, the card's keys are almost certainly not in the dictionary at all, so
+        the remaining sectors fall back to the small common-key set instead of
+        re-walking ~17k keys apiece (which would take hours). Two misses, not one,
+        so a card with one odd sector but an in-dict key elsewhere is still fully
+        decoded; a mostly-FF card stays fast (FF is a common key); and any key
+        already proven on the card is always retried first. When nothing is
+        recovered the caller can offer nested recovery."""
         if keys is None:
             keys = BUILTIN_KEYS
         info = self.wait_for_card()
@@ -186,67 +234,110 @@ class X7Card:
         nsec = sector_count(info["sak"])
         blocks, skeys = {}, {}
         found_keys, found_set = [], set()      # proven on THIS card, tried first
+        full_misses = 0                        # sectors that exhausted the full dict
+        dict_exhausted = False
         for s in range(nsec):
             tb = trailer_block(s)
-            trial = found_keys + [k for k in keys if k not in found_set]
+            pool = DEFAULT_KEYS if dict_exhausted else keys
+            trial = found_keys + [k for k in pool if k not in found_set]
+            swept_full = not dict_exhausted and len(trial) > len(found_keys) + len(DEFAULT_KEYS)
             found = self.find_key(tb, trial, on_try=(lambda i, n, s=s: on_try(s, i, n)) if on_try else None)
             skeys[s] = found
             if progress:
                 progress(s, nsec, found)
             if not found:
+                if swept_full:
+                    full_misses += 1
+                    if full_misses >= 2:
+                        dict_exhausted = True
                 continue
             kt, k = found
             if k not in found_set:             # promote for the remaining sectors
                 found_set.add(k)
                 found_keys.insert(0, k)
+            other = "B" if kt == "A" else "A"
             for b in range(first_block(s), tb + 1):
                 data = None
-                for _ in range(6):                  # re-auth per block for reliability
-                    if not self.poll():
-                        continue
-                    if not self.auth(tb, k, kt):
-                        continue
-                    data = self.read_block(b)
+                # Some access-bit configs grant a block's READ to only one key
+                # type, so if the found key type cannot read it, retry with the
+                # other type (same key value covers the common KeyA==KeyB card).
+                for try_kt in (kt, other):
+                    for _ in range(6):              # re-auth per block for reliability
+                        if not self.poll():
+                            continue
+                        if not self.auth(tb, k, try_kt):
+                            break                  # this key type can't auth; try the other
+                        data = self.read_block(b)
+                        if data is not None:
+                            break
                     if data is not None:
                         break
                 blocks[b] = data
-            # patch trailer: the key we used is never returned by READ (reads as 0)
+            # Patch the trailer: a READ returns the used key slot as zero, so fill
+            # it with the recovered key. Also mirror that key into the OTHER slot
+            # when it too read back all-zero (unrecovered) - never leave a 000000
+            # key slot, which a trailer clone would write and could brick a sector.
+            # A slot that read back non-zero (a genuinely readable KeyB) is kept.
             if blocks.get(tb) is not None:
                 t = bytearray(blocks[tb])
                 kb = bytes.fromhex(k)
                 if kt == "A":
                     t[0:6] = kb
+                    if t[10:16] == bytes(6):
+                        t[10:16] = kb
                 else:
                     t[10:16] = kb
+                    if t[0:6] == bytes(6):
+                        t[0:6] = kb
                 blocks[tb] = bytes(t)
         return {"uid": info["uid"], "sak": info["sak"], "atqa": info["atqa"],
                 "blocks": blocks, "keys": skeys, "sectors": nsec}
 
-    def read_ntag(self, pages=45):
-        """Dump an NTAG21x / Ultralight (SAK 0x00). READ returns 4 pages (16B)/call.
-        No auth for the data area. Returns dict page->4 bytes."""
+    def read_ntag(self, max_pages=240):
+        """Dump an NTAG21x / Ultralight (SAK 0x00). Returns dict page->4 bytes.
+
+        READ always returns 4 pages and, past the last page, rolls over to page 0,
+        so a fixed 4-page-step loop both mislabels the wrapped tail (storing page 0
+        under a high index) and under-dumps large tags. We read page by page and
+        keep only the first page of each READ, stopping as soon as a READ rolls
+        over (its data equals page 0) or the card NAKs past the end. max_pages caps
+        the largest type (NTAG216 = 231 pages) so an oddly-behaving tag can't spin."""
         out = {}
         if not self.poll():
             raise RuntimeError("no card")
-        for p in range(0, pages, 4):
+        page0 = None
+        for p in range(max_pages):
             r = self._pt([0xD4, 0x40, 0x01, 0x30, p])
-            if len(r) >= 19 and r[1] == 0x41 and r[2] == 0x00:
-                blk = r[3:19]
-                for j in range(4):
-                    out[p + j] = bytes(blk[j * 4:j * 4 + 4])
-            else:
-                if not self.poll():       # rewrap on read past end
+            if not (len(r) >= 7 and r[1] == 0x41 and r[2] == 0x00):
+                if not self.poll():       # NAK past end of memory: stop
                     break
+                continue
+            first = bytes(r[3:7])
+            if p == 0:
+                page0 = first
+            elif first == page0:          # rolled over to page 0: past end of memory
+                break
+            out[p] = first
         return out
 
     def apdu(self, data):
-        """Send a raw APDU to a selected ISO14443-4 / CPU card via InDataExchange."""
+        """Send a raw APDU to a selected ISO14443-4 / CPU card via InDataExchange.
+
+        Returns the card's response bytes only. We read the decoded envelope
+        payload (which the transport bounds with `total`) rather than _pt's raw
+        slice, so the HID envelope checksum + 0xFD trailer + zero padding never
+        leak into the result - the apdu console showed that trailing junk before."""
         if isinstance(data, str):
             data = bytes.fromhex(data)
-        r = self._pt([0xD4, 0x40, 0x01] + list(data))
-        if len(r) >= 3 and r[1] == 0x41:
-            return bytes(r[3:])          # response APDU (status 0x00 prefix stripped by caller)
-        return None
+        cmd = [0xD4, 0x40, 0x01] + list(data)
+        dec, _ = self.x.cmd([0xFF, 0x00, 0x00, 0x00, len(cmd)] + cmd, reads=8, timeout=700)
+        pl = dec.get("payload") if dec else None
+        if not pl:
+            return None
+        j = pl.find(b"\xd5")             # InDataExchange response: d5 41 <status> <data>
+        if j < 0 or len(pl) < j + 3 or pl[j + 1] != 0x41:
+            return None
+        return bytes(pl[j + 3:])         # card response, transport envelope excluded
 
     # -----------------------------------------------------------------------
     # Low-level CIU register + raw-transceive primitives (for nested cracking).
@@ -351,7 +442,7 @@ class X7Card:
         if not self.poll():
             return None, None
         r = self._pt([0xD4, 0x40, 0x01, known_kt_b, known_blk]
-                     + list(kk) + list(self.uid))
+                     + list(kk) + list(self.uid[-4:]))
         if not (len(r) >= 3 and r[1] == 0x41 and r[2] == 0x00):
             return None, None
 
