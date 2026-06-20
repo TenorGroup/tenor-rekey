@@ -160,7 +160,18 @@ private struct ActionBar: View {
             ActionButton(title: l.t("open_dump"), icon: "folder", enabled: true) { model.openDumpDialog() }
             ActionButton(title: "apdu", icon: "terminal", on: model.apduOpen, enabled: true) { model.apduOpen.toggle() }
             Spacer()
-            if busy { ProgressView().controlSize(.small).padding(.trailing, 4) }
+            if model.decoding {
+                if let p = model.decodeProgress {
+                    Text("\(l.t("sector")) \(min(p.sector + 1, p.total))/\(p.total)")
+                        .font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+                Button(l.t("cancel")) { Task { await model.cancelDecode() } }
+                    .buttonStyle(.plain).font(l.sans(11)).foregroundStyle(theme.p.accent).padding(.leading, 2)
+            } else if busy {
+                ProgressView().controlSize(.small).padding(.trailing, 4)
+            }
             if let src = model.source { SourceTag(src: src) }
         }
         .padding(.horizontal, 16)

@@ -142,6 +142,12 @@ final class AppModel {
                 let pgs = Self.buildPages(r)
                 withAnimation(.easeInOut(duration: 0.3)) { sectors = []; selected = nil; pages = pgs }
             } else {
+                // show the whole grid right away (all pending) so sectors fill in
+                // live as each one is searched, instead of a blank wait.
+                let count = card?.sak.map { sectorsForSak($0) } ?? 16
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    sectors = Self.pendingSectors(count: count); pages = []; selected = nil; selectedBlock = nil
+                }
                 let r = try await engine.decode(userKeys: keyStore.keys,
                     onProgress: { [weak self] ev in Task { @MainActor in self?.applyDecodeEvent(ev) } })
                 let vms = Self.buildSectors(r)
@@ -149,7 +155,7 @@ final class AppModel {
                     card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
                     sectors = vms
                     pages = []
-                    selected = vms.first?.index
+                    selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
                 }
                 liveDump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
             }
@@ -182,6 +188,25 @@ final class AppModel {
         if let t = ev.total { p.total = t; p.keysTried = nil; p.keysTotal = nil }
         if let kt = ev.keys_total { p.keysTotal = kt; p.keysTried = ev.keys_tried }
         decodeProgress = p
+
+        // per-sector live tile state
+        guard sectors.indices.contains(s) else { return }
+        if ev.keys_total != nil {                         // key-walk event: this sector is searching
+            sectors[s].status = .searching
+            sectors[s].searchTried = ev.keys_tried
+            sectors[s].searchTotal = ev.keys_total
+        } else if ev.total != nil {                       // sector boundary: this sector is done
+            sectors[s].searchTried = nil
+            sectors[s].searchTotal = nil
+            if let kh = ev.key {
+                sectors[s].status = .found
+                sectors[s].keyType = ev.keytype
+                sectors[s].keyHex = kh
+                sectors[s].provenance = (kh == "ffffffffffff") ? .dictionary : .nonDefault
+            } else {
+                sectors[s].status = .failed
+            }
+        }
     }
 
     static func buildPages(_ r: NtagResult) -> [NtagPage] {
@@ -207,7 +232,16 @@ final class AppModel {
                 ? .unknown
                 : (kh == "ffffffffffff" ? .dictionary : .nonDefault)
             let blocks = blockNumbers(ofSector: s).map { b in (r.blocks[String(b)] ?? nil) ?? "?" }
-            return SectorVM(index: s, keyType: kt, keyHex: kh, provenance: prov, blocks: blocks)
+            return SectorVM(index: s, keyType: kt, keyHex: kh, provenance: prov, blocks: blocks,
+                            status: kh == nil ? .failed : .found)
+        }
+    }
+
+    /// The full sector grid, all pending, shown the instant decode starts so the
+    /// card's memory map is visible and fills in live sector by sector.
+    static func pendingSectors(count: Int) -> [SectorVM] {
+        (0..<count).map {
+            SectorVM(index: $0, keyType: nil, keyHex: nil, provenance: .unknown, blocks: [], status: .pending)
         }
     }
 

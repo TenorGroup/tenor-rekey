@@ -68,15 +68,18 @@ private struct SectorTile: View {
     var height: CGFloat = 56
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+
+    private var live: Bool { s.status == .found || s.status == .searching }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             RoundedRectangle(cornerRadius: 7)
-                .fill(s.hasKey ? theme.p.tileFill : Color.clear)
+                .fill(live ? theme.p.tileFill : Color.clear)
                 .overlay(
                     RoundedRectangle(cornerRadius: 7).strokeBorder(
-                        selected ? theme.p.accent : (s.hasKey ? theme.p.tileBorder : theme.p.voidStroke),
-                        style: s.hasKey
+                        border,
+                        style: live
                             ? StrokeStyle(lineWidth: selected ? 1.2 : 0.5)
                             : StrokeStyle(lineWidth: 1, dash: [3, 3])
                     )
@@ -85,21 +88,61 @@ private struct SectorTile: View {
                 HStack(spacing: 5) {
                     Text(String(format: "s%02d", s.index))
                         .font(Typeface.mono(10))
-                        .foregroundStyle(s.hasKey ? theme.p.textSecondary : theme.p.textTertiary)
+                        .foregroundStyle(live ? theme.p.textSecondary : theme.p.textTertiary)
                     Spacer()
                     CloneStatusGlyph(status: model.cloneStatus(ofSector: s.index))
-                    ProvenanceDot(p: s.provenance)
+                    statusGlyph
                 }
                 Spacer()
-                if let kh = s.keyHex {
-                    Text(kh).font(Typeface.mono(8))
-                        .foregroundStyle(theme.p.textTertiary).lineLimit(1)
-                }
+                bottom
             }
             .padding(8)
         }
         .frame(height: height)
         .contentShape(Rectangle())
+    }
+
+    private var border: Color {
+        if selected { return theme.p.accent }
+        switch s.status {
+        case .found: return theme.p.tileBorder
+        case .searching: return theme.p.accent
+        case .pending, .failed: return theme.p.voidStroke
+        }
+    }
+
+    @ViewBuilder private var statusGlyph: some View {
+        switch s.status {
+        case .found: Image(systemName: "checkmark").font(.system(size: 8, weight: .bold)).foregroundStyle(theme.p.accent)
+        case .searching: ProgressView().controlSize(.mini).scaleEffect(0.55)
+        case .pending, .failed: ProvenanceDot(p: s.provenance)
+        }
+    }
+
+    @ViewBuilder private var bottom: some View {
+        switch s.status {
+        case .found:
+            if let kh = s.keyHex {
+                Text(kh).font(Typeface.mono(8)).foregroundStyle(theme.p.accent).lineLimit(1)
+            }
+        case .searching:
+            VStack(alignment: .leading, spacing: 3) {
+                Text(l.t("decoding")).font(l.sans(8)).foregroundStyle(theme.p.textSecondary).lineLimit(1)
+                GeometryReader { g in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(theme.p.voidStroke).frame(height: 2)
+                        Capsule().fill(theme.p.accent).frame(width: g.size.width * searchFraction, height: 2)
+                    }
+                }.frame(height: 2)
+            }
+        case .pending, .failed:
+            Text(l.t("not_decoded")).font(l.sans(8)).foregroundStyle(theme.p.textTertiary).lineLimit(1)
+        }
+    }
+
+    private var searchFraction: Double {
+        guard let t = s.searchTotal, t > 0 else { return 0 }
+        return min(1, Double(s.searchTried ?? 0) / Double(t))
     }
 }
 

@@ -89,6 +89,7 @@ struct EngineEvent: Decodable, Sendable {
     let sector: Int?
     let total: Int?
     let keytype: String?
+    let key: String?          // decode: the key found for `sector` (nil = not found)
     let phase: String?
     let keys_tried: Int?      // decode: keys walked so far on the current sector
     let keys_total: Int?      // decode: dictionary size for that walk
@@ -127,13 +128,24 @@ struct DecodeProgress: Equatable {
     }
 }
 
+/// Live decode state of a sector tile.
+enum SectorStatus: Equatable {
+    case pending      // not started yet
+    case searching    // walking the key dictionary now
+    case found        // key recovered
+    case failed       // searched, no key in the dictionary
+}
+
 /// One sector, as the grid + inspector need it.
 struct SectorVM: Identifiable, Equatable {
     let index: Int
-    let keyType: String?      // "A" / "B"
-    let keyHex: String?
-    let provenance: KeyProvenance
-    let blocks: [String]      // hex lines for this sector's data blocks ("?" if unreadable)
+    var keyType: String?      // "A" / "B"
+    var keyHex: String?
+    var provenance: KeyProvenance
+    var blocks: [String]      // hex lines for this sector's data blocks ("?" if unreadable)
+    var status: SectorStatus = .found
+    var searchTried: Int? = nil
+    var searchTotal: Int? = nil
 
     var id: Int { index }
     var hasKey: Bool { keyHex != nil }

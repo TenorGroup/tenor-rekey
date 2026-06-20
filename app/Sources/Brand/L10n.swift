@@ -81,6 +81,7 @@ final class L10n {
         "bytes":         ["vi": "byte", "en": "bytes", "zh": "字节", "ja": "バイト"],
         "decoding":      ["vi": "đang giải mã…", "en": "decoding…", "zh": "解码中…", "ja": "デコード中…"],
         "trying_keys":   ["vi": "thử khóa", "en": "trying keys", "zh": "尝试密钥", "ja": "鍵を試行"],
+        "not_decoded":   ["vi": "chưa giải", "en": "not decoded", "zh": "未解码", "ja": "未デコード"],
         "waiting_card":  ["vi": "đang chờ thẻ", "en": "waiting for card", "zh": "等待卡片", "ja": "カードを待機中"],
         "reader_offline":["vi": "chưa có đầu đọc", "en": "reader offline", "zh": "读卡器离线", "ja": "リーダー オフライン"],
         "reader_online": ["vi": "đầu đọc sẵn sàng", "en": "reader online", "zh": "读卡器在线", "ja": "リーダー オンライン"],
