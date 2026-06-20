@@ -53,6 +53,11 @@ def _load_builtin_keys():
 # Full curated dictionary used for decode (DEFAULT_KEYS is the fallback subset).
 BUILTIN_KEYS = _load_builtin_keys()
 
+# Read timeout (ms) for the dictionary-walk auth cycle. An auth answers in a few
+# ms (success or the 0x14 error), so a short bound keeps a failed key fast; this
+# is the main lever that brings the walk to nfcPro's ~26 ms/key.
+FAST_TO = 150
+
 
 def sector_count(sak):
     return 40 if sak == 0x18 else 16            # 4K vs 1K
@@ -114,12 +119,18 @@ class X7Card:
                 return i
         return None
 
-    def auth(self, block, key, keytype="A"):
+    def auth(self, block, key, keytype="A", to=700):
         if isinstance(key, str):
             key = bytes.fromhex(key)
         kt = 0x60 if keytype == "A" else 0x61
-        r = self._pt([0xD4, 0x40, 0x01, kt, block] + list(key) + list(self.uid))
+        r = self._pt([0xD4, 0x40, 0x01, kt, block] + list(key) + list(self.uid), reads=4, to=to)
         return len(r) >= 3 and r[1] == 0x41 and r[2] == 0x00
+
+    def _select(self):
+        """The pre-auth command nfcPro sends before every auth (captured as
+        d4 4e 01 00 00 -> d5 4f 00). It re-activates the listed target so the next
+        InDataExchange auth is immediate; without it our auths needed slow retries."""
+        self._pt([0xD4, 0x4E, 0x01, 0x00, 0x00], reads=2, to=FAST_TO)
 
     def read_block(self, block):
         r = self._pt([0xD4, 0x40, 0x01, 0x30, block])
@@ -137,25 +148,27 @@ class X7Card:
     def find_key(self, block, keys=DEFAULT_KEYS, on_try=None):
         """Return (keytype, keyhex) that authenticates `block`, or None.
 
-        Deterministic keytype: A is always preferred, so a card whose KeyA ==
-        KeyB (or a factory sector, both ffff) reports A and never flips A<->B
-        between decodes. Polls are retried until the card couples so a transient
-        coupling miss never skips or mislabels a valid key; if a key is found as
-        B, A is re-checked so A wins whenever it also authenticates. `on_try(i)`
-        (throttled) lets the caller show progress when walking a large dict."""
-        def auth_ok(k, kt):
-            for _ in range(4):             # retry until the card couples
-                if not self.poll():        # reselect (failed auth halts the card)
-                    continue
-                return self.auth(block, k, kt)   # coupled: this attempt is decisive
-            return False
+        Mirrors nfcPro's captured fast cycle so a dictionary walk runs at its
+        speed (~26 ms/key, measured): select the card once, then each attempt is
+        _select() (d4 4e) + auth() (d4 40) on a short timeout; a failed auth halts
+        the card, so a re-poll (d4 4a) re-selects it for the next attempt. A is
+        preferred (a KeyA==KeyB card never flips A<->B). `on_try` (throttled)
+        drives the caller's progress bar."""
+        if not self.poll() and not self.wait_for_card():
+            return None
+        n = len(keys)
         for i, k in enumerate(keys):
             if on_try is not None and i and i % 256 == 0:
-                on_try(i, len(keys))
-            if auth_ok(k, "A"):
-                return ("A", k)
-            if auth_ok(k, "B"):
-                return ("A", k) if auth_ok(k, "A") else ("B", k)
+                on_try(i, n)
+            for kt in ("A", "B"):
+                self._select()
+                if self.auth(block, k, kt, to=FAST_TO):
+                    if kt == "B":                      # prefer A when it also works
+                        self.poll(); self._select()
+                        if self.auth(block, k, "A", to=FAST_TO):
+                            return ("A", k)
+                    return (kt, k)
+                self.poll()                            # re-select after the failed auth
         return None
 
     def dump(self, keys=None, progress=None, on_try=None):
