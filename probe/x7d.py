@@ -19,7 +19,13 @@ import sys
 import json
 from x7 import X7, hx
 from x7lib import (X7Card, trailer_block, first_block, sector_count,
-                   access_bits_valid, DEFAULT_KEYS, BUILTIN_KEYS)
+                   access_bits_valid, trailer_locks_keys, DEFAULT_KEYS, BUILTIN_KEYS)
+
+
+def _valid_key_hex(k):
+    """A daemon-side key sanity check (the engine is its own trust boundary): a key
+    must be exactly 12 hex chars, else it cannot be used for auth/substitution."""
+    return isinstance(k, str) and len(k) == 12 and all(c in "0123456789abcdefABCDEF" for c in k)
 
 # Factory transport config for a MIFARE Classic trailer: KeyA all-FF, access
 # bytes FF 07 80 + GPB 69 (the chip's shipped state), KeyB all-FF.
@@ -180,15 +186,20 @@ class Daemon:
             k = keys.get(s)
             data = blocks[b]
             if is_trailer:
-                # A trailer with corrupt access bytes can lock the sector forever -
-                # never write it. And never write a 000000 key slot: substitute the
-                # recovered key, or factory FF if it is unknown.
+                # A trailer that is corrupt OR that locks its own keys can brick the
+                # sector forever - never write either. And never write a 000000 key
+                # slot: substitute the recovered key, or factory FF if it is unknown.
                 if not access_bits_valid(data):
                     fail.append(b)
                     self.emit({"event": "progress", "method": "write_mfd",
                                "block": b, "ok": False, "unsafe": "access-bits"})
                     continue
-                sub = bytes.fromhex(k[1]) if k else FACTORY_KEY
+                if trailer_locks_keys(data):
+                    fail.append(b)
+                    self.emit({"event": "progress", "method": "write_mfd",
+                               "block": b, "ok": False, "unsafe": "trailer-lockout"})
+                    continue
+                sub = bytes.fromhex(k[1]) if (k and _valid_key_hex(k[1])) else FACTORY_KEY
                 d = bytearray(data)
                 if d[0:6] == bytes(6):
                     d[0:6] = sub
@@ -201,7 +212,7 @@ class Daemon:
             # (which flips the key to the source key) lands AFTER its data, while
             # the FF auth still holds. Each key is tried as A and B.
             cand = []
-            if k:
+            if k and _valid_key_hex(k[1]):
                 cand += [(k[1], k[0]), (k[1], "A"), (k[1], "B")]
             cand += [("ffffffffffff", "A"), ("ffffffffffff", "B")]
             wrote, seen = False, set()

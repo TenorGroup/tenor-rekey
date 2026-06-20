@@ -58,11 +58,18 @@ struct CardDump: Equatable, Sendable {
     /// Load a `.mfd` image + its `<name>.mfd.keys.json` sidecar (if present).
     static func load(mfd url: URL) throws -> CardDump {
         let data = try Data(contentsOf: url)
+        // A MIFARE image is at most 4 KB (4K card). Refuse anything larger so a
+        // wrong / hostile multi-GB file cannot exhaust memory (one dict entry per
+        // 16 bytes here, then again as JSON to the daemon).
+        guard data.count <= 4096 else {
+            throw NSError(domain: "rekey", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "not a MIFARE image (over 4 KB)"])
+        }
         let sidecar = url.appendingPathExtension("keys.json")
         var uid = ""
         var sak = data.count > 1024 ? 0x18 : 0x08
         var keys: [Int: SectorKey] = [:]
-        if let sjson = try? Data(contentsOf: sidecar),
+        if let sjson = try? Data(contentsOf: sidecar), sjson.count <= 256 * 1024,
            let obj = try? JSONSerialization.jsonObject(with: sjson) as? [String: Any] {
             if let u = obj["uid"] as? String { uid = u }
             if let sk = obj["sak"] as? Int { sak = sk }

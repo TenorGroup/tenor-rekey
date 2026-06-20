@@ -271,6 +271,15 @@ def test_write_safety():
     check("write_mfd refuses a trailer with corrupt access bytes",
           3 in res["failed"] and 3 not in [b for b, _ in c.writes], str(res))
 
+    # a trailer that LOCKS its own keys (valid integrity, group3=111) is refused -
+    # writing it would permanently brick the sector
+    locked_trailer = "ffffffffffff" + "00f0ff" + "ffffffffffff"
+    cl = FakeCard(keymap={0: ("A", "a0b1c2d3e4f5")})
+    dl = daemon_with(cl); dl.emit = lambda o: None
+    rl = dl.write_mfd({"blocks": {"3": locked_trailer}, "keys": keys, "trailers": True, "uid": False})
+    check("write_mfd refuses a self-locking trailer",
+          3 in rl["failed"] and 3 not in [b for b, _ in cl.writes], str(rl))
+
     # a trailer with a 000000 key slot has the recovered key substituted in (never
     # writes 000000, which could brick), access bytes preserved
     zero_b_trailer = "a0b1c2d3e4f5" + "ff078069" + "000000000000"
@@ -339,8 +348,12 @@ def test_dump_trailer_mirror():
 def test_access_bits_valid():
     factory = bytes.fromhex("ffffffffffff" + "ff078069" + "ffffffffffff")
     corrupt = bytes.fromhex("ffffffffffff" + "000000" + "00" + "ffffffffffff")
+    locked = bytes.fromhex("ffffffffffff" + "00f0ff" + "ffffffffffff")   # valid integrity, group3=111
     check("access_bits_valid accepts the factory trailer", x7lib.access_bits_valid(factory))
     check("access_bits_valid rejects an all-zero access triple", not x7lib.access_bits_valid(corrupt))
+    check("trailer_locks_keys: factory trailer is writable", not x7lib.trailer_locks_keys(factory))
+    check("trailer_locks_keys: a fully-locked trailer is flagged",
+          x7lib.access_bits_valid(locked) and x7lib.trailer_locks_keys(locked))
 
 
 def test_read_ntag_wrap():

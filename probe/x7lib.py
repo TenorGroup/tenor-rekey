@@ -99,6 +99,21 @@ def access_bits_valid(trailer):
     return True
 
 
+def trailer_locks_keys(trailer):
+    """True if a trailer's access bits leave the sector in a state where NEITHER
+    key can ever rewrite the trailer again (keys permanently frozen). Writing such
+    a trailer onto a normal card bricks the sector, so the write path refuses it.
+    The trailer group (group 3) C1C2C3 in {010, 110, 101, 111} = "keys locked" /
+    "fully locked" (matches the app's trailerAccessSummary). The factory trailer
+    (ff 07 80) is group-3 001 = "a writes keys+access", so it is not affected."""
+    if len(trailer) < 9:
+        return True                              # can't tell -> treat as unsafe
+    b7, b8 = trailer[7], trailer[8]
+    bit = lambda v, n: (v >> n) & 1
+    c = (bit(b7, 7), bit(b8, 3), bit(b8, 7))     # group 3 = bits index 4+3, 3, 4+3
+    return c in {(0, 1, 0), (1, 1, 0), (1, 0, 1), (1, 1, 1)}
+
+
 class X7Card:
     def __init__(self):
         self.x = X7()
