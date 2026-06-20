@@ -68,8 +68,13 @@ struct CardDump: Equatable, Sendable {
             if let sk = obj["sak"] as? Int { sak = sk }
             if let kd = obj["keys"] as? [String: Any] {
                 for (k, v) in kd {
-                    if let arr = v as? [String], arr.count == 2, let i = Int(k) {
-                        keys[i] = SectorKey(type: arr[0], hex: arr[1])
+                    // Validate a sidecar key the same way the dictionary does (these
+                    // .keys.json files interoperate with external tools, so treat
+                    // them as untrusted): exactly 12 hex chars, type A/B. Drop junk
+                    // rather than feed a malformed key into a clone/format write.
+                    if let arr = v as? [String], arr.count == 2, let i = Int(k),
+                       let hex = KeyStore.normalized(arr[1]) {
+                        keys[i] = SectorKey(type: arr[0].uppercased() == "B" ? "B" : "A", hex: hex)
                     }
                 }
             }

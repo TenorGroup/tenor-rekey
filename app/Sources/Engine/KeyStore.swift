@@ -18,7 +18,8 @@ final class KeyStore {
     /// A valid key is exactly 12 hex chars (6 bytes), case-insensitive. Returns
     /// the lowercased form, or nil - validation, not silent stripping, so junk
     /// with embedded hex is rejected rather than mangled into a wrong key.
-    static func normalized(_ raw: String) -> String? {
+    /// `nonisolated` so the same rule can guard non-UI load paths (CardDump).
+    nonisolated static func normalized(_ raw: String) -> String? {
         let k = raw.trimmingCharacters(in: .whitespaces).lowercased()
         return (k.count == 12 && k.allSatisfy(\.isHexDigit)) ? k : nil
     }
