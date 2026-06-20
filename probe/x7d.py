@@ -19,11 +19,12 @@ import sys
 import json
 from x7 import X7, hx
 from x7lib import (X7Card, trailer_block, first_block, sector_count,
-                   DEFAULT_KEYS, BUILTIN_KEYS)
+                   access_bits_valid, DEFAULT_KEYS, BUILTIN_KEYS)
 
 # Factory transport config for a MIFARE Classic trailer: KeyA all-FF, access
 # bytes FF 07 80 + GPB 69 (the chip's shipped state), KeyB all-FF.
 FACTORY_TRAILER = bytes.fromhex("ffffffffffff" "ff078069" "ffffffffffff")
+FACTORY_KEY = bytes.fromhex("ffffffffffff")
 
 
 def _sector_of(b):
@@ -150,21 +151,55 @@ class Daemon:
         i = c.wait_for_card()
         if not i:
             return {"present": False}
-        blocks = {int(b): bytes.fromhex(v.replace(" ", "")) for b, v in p["blocks"].items() if v}
+        target = i["uid"]                      # the card we committed to writing
+        # Validate block payloads up front: a block that is not exactly 16 bytes is
+        # never sent to the card (write_block would assert mid-card, half-writing
+        # it); record it as failed so the caller still gets full accounting.
+        blocks, fail = {}, []
+        for b, v in p["blocks"].items():
+            if not v:
+                continue
+            try:
+                raw = bytes.fromhex(v.replace(" ", ""))
+            except ValueError:
+                fail.append(int(b))
+                continue
+            if len(raw) == 16:
+                blocks[int(b)] = raw
+            else:
+                fail.append(int(b))
         keys = {int(s): v for s, v in (p.get("keys") or {}).items()}
-        ok, fail = 0, []
+        ok, swapped = 0, False
         for b in sorted(blocks):
             if b == 0 and not p.get("uid"):
                 continue
             s = _sector_of(b)
-            if b == trailer_block(s) and not p.get("trailers"):
+            is_trailer = (b == trailer_block(s))
+            if is_trailer and not p.get("trailers"):
                 continue
+            k = keys.get(s)
+            data = blocks[b]
+            if is_trailer:
+                # A trailer with corrupt access bytes can lock the sector forever -
+                # never write it. And never write a 000000 key slot: substitute the
+                # recovered key, or factory FF if it is unknown.
+                if not access_bits_valid(data):
+                    fail.append(b)
+                    self.emit({"event": "progress", "method": "write_mfd",
+                               "block": b, "ok": False, "unsafe": "access-bits"})
+                    continue
+                sub = bytes.fromhex(k[1]) if k else FACTORY_KEY
+                d = bytearray(data)
+                if d[0:6] == bytes(6):
+                    d[0:6] = sub
+                if d[10:16] == bytes(6):
+                    d[10:16] = sub
+                data = bytes(d)
             # Auth the TARGET. Try the source key first (re-clone, or a card the
             # user pre-keyed), then fall back to factory FF so a blank magic card
             # can be written. Blocks are written low-to-high, so a sector's trailer
             # (which flips the key to the source key) lands AFTER its data, while
             # the FF auth still holds. Each key is tried as A and B.
-            k = keys.get(s)
             cand = []
             if k:
                 cand += [(k[1], k[0]), (k[1], "A"), (k[1], "B")]
@@ -177,18 +212,26 @@ class Daemon:
                 for _ in range(3):
                     if not c.poll():
                         continue
+                    if c.uid != target:        # a different card arrived: never write to it
+                        swapped = True
+                        break
                     if not c.auth(trailer_block(s), kk, kt):
                         break
-                    if c.write_block(b, blocks[b]):
+                    if c.write_block(b, data):
                         wrote = True
                         break
-                if wrote:
+                if wrote or swapped:
                     break
+            if swapped:
+                break
             ok += 1 if wrote else 0
             if not wrote:
                 fail.append(b)
             self.emit({"event": "progress", "method": "write_mfd",
                        "block": b, "ok": wrote})
+        if swapped:
+            return {"present": True, "wrote": ok, "failed": fail,
+                    "error": "card changed during write"}
         return {"present": True, "wrote": ok, "failed": fail}
 
     def format(self, p):
@@ -201,9 +244,10 @@ class Daemon:
         i = c.wait_for_card()
         if not i:
             return {"present": False}
+        target = i["uid"]                      # the card we committed to formatting
         keys = {int(s): v for s, v in (p.get("keys") or {}).items()}
         zero = bytes(16)
-        ok, fail = 0, []
+        ok, fail, swapped = 0, [], False
         for s in range(sector_count(i["sak"])):
             tb = trailer_block(s)
             k = keys.get(s)
@@ -218,25 +262,35 @@ class Daemon:
                     for _ in range(3):
                         if not c.poll():
                             continue
+                        if c.uid != target:    # a different card arrived: never erase it
+                            swapped = True
+                            break
                         if not c.auth(tb, kk, kt):
                             break
                         if c.write_block(b, data):
                             wrote = True
                             break
-                    if wrote:
+                    if wrote or swapped:
                         break
+                if swapped:
+                    break
                 ok += 1 if wrote else 0
                 if not wrote:
                     fail.append(b)
                 self.emit({"event": "progress", "method": "format", "block": b, "ok": wrote})
+            if swapped:
+                break
+        if swapped:
+            return {"present": True, "formatted": ok, "failed": fail,
+                    "error": "card changed during format"}
         return {"present": True, "formatted": ok, "failed": fail}
 
     def nested_recover(self, p):
         """params: known_blk, known_key, target_blk, known_kt, target_kt,
         window, max_samples. Returns the recovered key (proven by on-card auth)."""
         c = self._open()
-        if not c.uid:
-            c.wait_for_card()
+        if not c.uid and not c.wait_for_card():
+            return {"present": False}            # no card: match the other ops' shape
 
         def prog(phase, n, x):
             self.emit({"event": "progress", "method": "nested_recover",
@@ -258,6 +312,12 @@ class Daemon:
             return {"id": rid, "error": "unknown method: %r" % method}
         try:
             return {"id": rid, "result": getattr(self, method)(req.get("params") or {})}
+        except OSError as e:
+            # The reader was unplugged mid-op: drop the dead handle so the NEXT
+            # command re-opens a fresh one instead of reusing the dead one (only
+            # poll() used to do this, leaving every other op wedged until a poll).
+            self._drop()
+            return {"id": rid, "error": "%s: %s" % (type(e).__name__, e)}
         except Exception as e:
             return {"id": rid, "error": "%s: %s" % (type(e).__name__, e)}
 
