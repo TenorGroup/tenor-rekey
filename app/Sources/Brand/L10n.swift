@@ -70,6 +70,8 @@ final class L10n {
         "format":        ["vi": "format", "en": "format", "zh": "格式化", "ja": "初期化"],
         "format_q":      ["vi": "format thẻ này về factory?", "en": "format this card to factory?", "zh": "将此卡格式化为出厂状态？", "ja": "このカードを工場出荷状態に初期化しますか？"],
         "format_msg":    ["vi": "xóa toàn bộ data và đặt khóa về ff. không hoàn tác được. block 0 (uid) giữ nguyên.", "en": "erases all data and resets keys to ff. cannot be undone. block 0 (uid) is left intact.", "zh": "清除所有数据并将密钥重置为 ff，不可撤销。第 0 块（uid）保持不变。", "ja": "全データを消去し鍵を ff に戻します。元に戻せません。ブロック0（uid）はそのまま。"],
+        "clone_q":       ["vi": "ghi đè thẻ trên đầu đọc?", "en": "overwrite the card on the reader?", "zh": "覆盖读卡器上的卡片？", "ja": "リーダー上のカードを上書きしますか？"],
+        "clone_msg":     ["vi": "ghi data lên thẻ đích, không hoàn tác được. khi bật ghi khóa/uid, access-bits hỏng có thể làm hỏng vĩnh viễn một sector.", "en": "writes the source data onto the target card and cannot be undone. with keys/uid enabled, bad access bits can permanently lock a sector.", "zh": "将源数据写入目标卡，不可撤销。启用密钥/uid 写入时，错误的访问位可能永久锁定扇区。", "ja": "ソースのデータを対象カードに書き込みます。元に戻せません。鍵/uid 書き込みが有効な場合、不正なアクセスビットでセクタが永久にロックされることがあります。"],
         "recover":       ["vi": "khôi phục khóa", "en": "recover keys", "zh": "恢复密钥", "ja": "鍵を復元"],
         "apdu":          ["vi": "apdu", "en": "apdu", "zh": "apdu", "ja": "apdu"],
         "soon":          ["vi": "sắp có", "en": "soon", "zh": "即将推出", "ja": "近日対応"],

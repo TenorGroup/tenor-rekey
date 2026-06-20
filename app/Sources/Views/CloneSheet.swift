@@ -14,6 +14,7 @@ struct CloneSheet: View {
     // The uid-write warning still shows, so a non-magic card is not a silent trap.
     @State private var trailers = true
     @State private var uid = true
+    @State private var confirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -42,8 +43,12 @@ struct CloneSheet: View {
                 Spacer()
                 Button(l.t("cancel")) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(l.t("write_to_card")) {
-                    Task { await model.clone(trailers: trailers, uid: uid) }
-                    dismiss()
+                    // Writing keys/access or the uid is irreversible (a bad trailer
+                    // can brick a sector, a uid write can brick a normal card), so
+                    // confirm first - matching format's gate. A data-only clone is
+                    // recoverable, so it writes directly.
+                    if trailers || uid { confirm = true }
+                    else { Task { await model.clone(trailers: trailers, uid: uid) }; dismiss() }
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent).tint(theme.p.accent)
@@ -53,6 +58,13 @@ struct CloneSheet: View {
         .padding(22)
         .frame(width: 460)
         .background(theme.p.panel)
+        .confirmationDialog(l.t("clone_q"), isPresented: $confirm, titleVisibility: .visible) {
+            Button(l.t("write_to_card"), role: .destructive) {
+                Task { await model.clone(trailers: trailers, uid: uid) }
+                dismiss()
+            }
+            Button(l.t("cancel"), role: .cancel) {}
+        } message: { Text(l.t("clone_msg")) }
     }
 
     /// A write option: the checkbox plus a one-line plain-language explanation, so
