@@ -50,8 +50,17 @@ final class AppModel {
 
     /// What "write" clones FROM: an explicitly loaded source dump if there is one,
     /// otherwise the card just decoded - so decode then write needs no Save / Open
-    /// round-trip (the live decode is already a usable source).
-    var cloneSource: CardDump? { source ?? liveDump }
+    /// round-trip (the live decode is already a usable source). The implicit live
+    /// decode counts ONLY when it belongs to the card currently on the reader, so a
+    /// card swap can never silently make card A's image the source for card B.
+    var cloneSource: CardDump? {
+        if let source { return source }
+        if let d = liveDump, let cuid = card?.uid, Self.normUID(d.uid) == Self.normUID(cuid) { return d }
+        return nil
+    }
+    static func normUID(_ s: String) -> String {
+        s.replacingOccurrences(of: " ", with: "").lowercased()
+    }
 
     /// Start the daemon + read device info, then look for a card (Codex r1:
     /// connect at launch, not lazily).
@@ -97,22 +106,31 @@ final class AppModel {
             lastError = nil
             if p.present {
                 cardAbsentStreak = 0
-                // only react to a real placement / swap, so an idle poll on the
-                // same card does not churn the decoded sectors
+                // A different card (or first placement): clear everything bound to
+                // the previous card BEFORE swapping in the new one, so its grid,
+                // live decode and clone results never bleed onto the new card.
                 if card == nil || p.uid != card?.uid {
-                    withAnimation(.easeInOut(duration: 0.3)) { card = p }
+                    withAnimation(.easeInOut(duration: 0.3)) { clearCardState(); card = p }
                 }
             } else {
                 cardAbsentStreak += 1
                 if card != nil && cardAbsentStreak >= 2 {
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        card = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
-                    }
+                    withAnimation(.easeInOut(duration: 0.3)) { card = nil; clearCardState() }
                 }
             }
         } catch {
             applyReaderGone()
         }
+    }
+
+    /// Forget everything tied to the card on the reader: the decode grid, page
+    /// dump, selection, the live decode used as an implicit clone source, and the
+    /// per-block clone results. An explicitly loaded `source` document is kept (it
+    /// is a separate file the user opened, not bound to this card). Shared by the
+    /// swap, removal, and reader-gone paths so they cannot drift.
+    private func clearCardState() {
+        sectors = []; pages = []; selected = nil; selectedBlock = nil
+        liveDump = nil; cloneResults = [:]
     }
 
     /// Reader unplugged or the daemon went away: go offline and clear everything
@@ -124,7 +142,7 @@ final class AppModel {
             readerOnline = false
             info = nil
             card = nil
-            sectors = []; pages = []; selected = nil; selectedBlock = nil
+            clearCardState()
         }
     }
 
