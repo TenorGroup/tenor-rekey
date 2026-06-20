@@ -9,8 +9,11 @@ struct CloneSheet: View {
     @Environment(L10n.self) private var l
     @Environment(\.dismiss) private var dismiss
 
-    @State private var trailers = false
-    @State private var uid = false
+    // Default to a full clone: most targets here are CUID (magic) cards, and a
+    // data-only copy without the keys/access or the uid is not a usable duplicate.
+    // The uid-write warning still shows, so a non-magic card is not a silent trap.
+    @State private var trailers = true
+    @State private var uid = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {

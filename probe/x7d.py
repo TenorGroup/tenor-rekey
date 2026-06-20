@@ -159,10 +159,21 @@ class Daemon:
             s = _sector_of(b)
             if b == trailer_block(s) and not p.get("trailers"):
                 continue
+            # Auth the TARGET. Try the source key first (re-clone, or a card the
+            # user pre-keyed), then fall back to factory FF so a blank magic card
+            # can be written. Blocks are written low-to-high, so a sector's trailer
+            # (which flips the key to the source key) lands AFTER its data, while
+            # the FF auth still holds. Each key is tried as A and B.
             k = keys.get(s)
-            kk = k[1] if k else "ffffffffffff"
-            wrote = False
-            for kt in ([k[0], "A", "B"] if k else ["A", "B"]):
+            cand = []
+            if k:
+                cand += [(k[1], k[0]), (k[1], "A"), (k[1], "B")]
+            cand += [("ffffffffffff", "A"), ("ffffffffffff", "B")]
+            wrote, seen = False, set()
+            for kk, kt in cand:
+                if (kk, kt) in seen:
+                    continue
+                seen.add((kk, kt))
                 for _ in range(3):
                     if not c.poll():
                         continue
