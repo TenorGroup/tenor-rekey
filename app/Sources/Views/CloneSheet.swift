@@ -19,8 +19,8 @@ struct CloneSheet: View {
 
             HStack(spacing: 12) {
                 slot(title: l.t("source"),
-                     uid: model.source.map { $0.uid.isEmpty ? $0.name : $0.uid },
-                     subtitle: model.source.map { "\(cardType($0.sak)) · \($0.sectorCount) \(l.t("sectors"))" } ?? "",
+                     uid: model.cloneSource.map { $0.uid.isEmpty ? $0.name : $0.uid },
+                     subtitle: model.cloneSource.map { "\(cardType($0.sak)) · \($0.sectorCount) \(l.t("sectors"))" } ?? "",
                      placeholder: l.t("no_source"))
                 Image(systemName: "arrow.right").foregroundStyle(theme.p.textTertiary)
                 slot(title: l.t("card_on_reader"),
@@ -29,14 +29,11 @@ struct CloneSheet: View {
                      placeholder: l.t("waiting_card"))
             }
 
-            VStack(alignment: .leading, spacing: 10) {
-                Toggle(l.t("write_trailers"), isOn: $trailers)
-                Toggle(l.t("write_uid"), isOn: $uid)
+            VStack(alignment: .leading, spacing: 12) {
+                option(l.t("write_trailers"), hint: l.t("write_trailers_hint"), isOn: $trailers)
+                option(l.t("write_uid"), hint: l.t("write_uid_hint"), isOn: $uid)
                 if uid { guardedZone }
             }
-            .toggleStyle(.checkbox)
-            .font(l.sans(12))
-            .tint(theme.p.accent)
 
             HStack {
                 Spacer()
@@ -47,12 +44,22 @@ struct CloneSheet: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent).tint(theme.p.accent)
-                .disabled(model.source == nil || model.card == nil)
+                .disabled(model.cloneSource == nil || model.card == nil)
             }
         }
         .padding(22)
         .frame(width: 460)
         .background(theme.p.panel)
+    }
+
+    /// A write option: the checkbox plus a one-line plain-language explanation, so
+    /// "write trailers" / "write block 0" are not opaque jargon.
+    private func option(_ title: String, hint: String, isOn: Binding<Bool>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle(title, isOn: isOn)
+                .toggleStyle(.checkbox).tint(theme.p.accent).font(l.sans(12))
+            Text(hint).font(l.sans(10)).foregroundStyle(theme.p.textTertiary).padding(.leading, 20)
+        }
     }
 
     /// One card slot (source, or the target on the reader): uid + a one-line

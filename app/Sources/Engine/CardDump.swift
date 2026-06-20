@@ -78,6 +78,22 @@ struct CardDump: Equatable, Sendable {
         for b in 0..<(data.count / 16) {
             blocks[b] = data.subdata(in: b * 16 ..< b * 16 + 16).hexCompact
         }
+        // No sidecar (e.g. a Windows nfcPro .dump): recover the uid + keys straight
+        // from the raw image. The uid is the first 4 bytes of block 0; each sector's
+        // KeyA / KeyB sit in its trailer (bytes 0-5 / 10-15). All-zero means the key
+        // was not stored, so skip it.
+        if uid.isEmpty, let b0 = blocks[0], let by = Data(hexString: b0), by.count >= 4 {
+            uid = by.prefix(4).map { String(format: "%02x", $0) }.joined(separator: " ")
+        }
+        if keys.isEmpty {
+            for s in 0..<sectorsForSak(sak) {
+                guard let hex = blocks[trailerBlock(s)], let by = Data(hexString: hex), by.count == 16 else { continue }
+                let keyA = Data(by.prefix(6)).hexCompact
+                let keyB = Data(by.suffix(6)).hexCompact
+                if keyA != "000000000000" { keys[s] = SectorKey(type: "A", hex: keyA) }
+                else if keyB != "000000000000" { keys[s] = SectorKey(type: "B", hex: keyB) }
+            }
+        }
         let stem = url.deletingPathExtension().lastPathComponent
         return CardDump(uid: uid, sak: sak, sectorCount: sectorsForSak(sak),
                         blocks: blocks, keys: keys, name: stem)

@@ -104,6 +104,8 @@ final class L10n {
         "card_on_reader":["vi": "thẻ trên đầu đọc", "en": "card on reader", "zh": "读卡器上的卡", "ja": "リーダー上のカード"],
         "write_trailers":["vi": "ghi cả trailer (khóa / quyền)", "en": "write trailers (keys / access)", "zh": "写入尾块（密钥/权限）", "ja": "トレーラーを書き込む（鍵/アクセス）"],
         "write_uid":     ["vi": "ghi block 0 (uid)", "en": "write block 0 (uid)", "zh": "写入第 0 块（uid）", "ja": "ブロック0を書き込む（uid）"],
+        "write_trailers_hint": ["vi": "chép khóa của nguồn sang thẻ đích. tắt = giữ khóa sẵn có của thẻ đích, chỉ ghi dữ liệu.", "en": "copy the source keys onto the target. off = keep the target's own keys, write data only.", "zh": "把源卡的密钥写入目标卡。关闭 = 保留目标卡原有密钥，仅写数据。", "ja": "ソースの鍵を対象カードに書き込む。オフ = 対象カードの鍵を保持しデータのみ書き込む。"],
+        "write_uid_hint": ["vi": "đổi cả số uid của thẻ. hầu hết thẻ không cho, chỉ thẻ magic (uid ghi được).", "en": "also overwrite the card uid. most cards refuse this; magic (uid-writable) cards only.", "zh": "同时覆盖卡片 uid。多数卡片不允许，仅限魔术卡（uid 可写）。", "ja": "カードの uid も上書き。多くのカードは拒否、magic（uid 書込可）カードのみ。"],
         "uid_warning":   ["vi": "ghi đè uid - chỉ dùng cho thẻ magic; thẻ thường sẽ hỏng block 0", "en": "overwrites the card uid - magic cards only; a normal card will reject or brick block 0", "zh": "覆盖卡片 uid - 仅限魔术卡；普通卡会损坏第 0 块", "ja": "カードの uid を上書き - magic カード専用；通常のカードはブロック0を破損します"],
         "cancel":        ["vi": "hủy", "en": "cancel", "zh": "取消", "ja": "キャンセル"],
         "write_to_card": ["vi": "ghi vào thẻ", "en": "write to card", "zh": "写入卡片", "ja": "カードに書き込む"],

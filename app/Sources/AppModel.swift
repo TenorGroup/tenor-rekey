@@ -46,6 +46,11 @@ final class AppModel {
         return sectors.first { $0.index == s }
     }
 
+    /// What "write" clones FROM: an explicitly loaded source dump if there is one,
+    /// otherwise the card just decoded - so decode then write needs no Save / Open
+    /// round-trip (the live decode is already a usable source).
+    var cloneSource: CardDump? { source ?? liveDump }
+
     /// Start the daemon + read device info, then look for a card (Codex r1:
     /// connect at launch, not lazily).
     func connect() async {
@@ -213,7 +218,7 @@ final class AppModel {
     /// Write the loaded source dump onto the card on the reader. Data blocks
     /// only by default; trailers (keys/access) and block 0 (uid) are opt-in.
     func clone(trailers: Bool, uid: Bool) async {
-        guard let src = source, !cloning else { return }
+        guard let src = cloneSource, !cloning else { return }
         cloning = true
         cloneResults = [:]
         lastError = nil
@@ -306,10 +311,20 @@ final class AppModel {
         if panel.runModal() == .OK, let url = panel.url { loadDump(from: url) }
     }
 
+    /// Default save name `yymmdd_tr_<uid>.dump` - sorts next to the Windows nfcPro
+    /// dumps in the same folder and stays a plain raw image both tools can open.
+    static func defaultDumpFilename(_ dump: CardDump) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyMMdd"
+        let uid = dump.uid.replacingOccurrences(of: " ", with: "").lowercased()
+        let stem = uid.isEmpty ? dump.name : uid
+        return "\(f.string(from: Date()))_tr_\(stem).dump"
+    }
+
     func saveDumpDialog() {
         guard let dump = liveDump else { return }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "\(dump.name).mfd"
+        panel.nameFieldStringValue = Self.defaultDumpFilename(dump)
         panel.allowsOtherFileTypes = true
         if let folder = UserDefaults.standard.string(forKey: "rekey.exportFolder") {
             panel.directoryURL = URL(fileURLWithPath: folder)

@@ -144,7 +144,7 @@ private struct ActionBar: View {
             ActionButton(title: l.t(ntag ? "read" : "decode"), icon: "square.grid.3x3",
                          prominent: true, enabled: model.card != nil && !busy) { Task { await model.decode() } }
             ActionButton(title: l.t("write"), icon: "square.and.arrow.down.on.square",
-                         enabled: model.source != nil && model.card != nil && !busy) { model.cloneSheet = true }
+                         enabled: model.cloneSource != nil && model.card != nil && !busy) { model.cloneSheet = true }
             // Format requires a prior decode: it auths with the recovered keys,
             // and gating on liveDump means the user has seen the card before wiping.
             ActionButton(title: l.t("format"), icon: "eraser",

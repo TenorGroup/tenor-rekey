@@ -30,7 +30,7 @@ struct TenorRekeyApp: App {
                     .keyboardShortcut("r")
                     .disabled(model.card == nil || model.decoding)
                 Button(l10n.t("clone")) { model.cloneSheet = true }
-                    .disabled(model.source == nil || model.card == nil || model.cloning)
+                    .disabled(model.cloneSource == nil || model.card == nil || model.cloning)
                 Divider()
                 Button(l10n.t("apdu")) { model.apduOpen.toggle() }
                     .keyboardShortcut("t")
