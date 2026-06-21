@@ -4,10 +4,16 @@
 # probe engine + key dictionary, and libhidapi - so it runs on a clean macOS
 # account with no Homebrew, no Command Line Tools, nothing on PATH.
 #
-# Signing is ad-hoc (founder's own Macs). Developer-ID + notarization is a later
-# step that needs the founder's Apple certificate.
+# Signing: a Developer ID Application cert (hardened runtime + entitlements) is
+# used automatically if one is installed, else ad-hoc (runs on this Mac, not
+# distributable). With a Developer ID cert + a stored notarytool credential the
+# build also notarizes + staples the app and the dmg.
 #
-#   usage: app/tools/package.sh
+#   usage:  app/tools/package.sh                       # ad-hoc or Developer-ID-signed
+#           NOTARY_PROFILE=tenor-notary app/tools/package.sh   # also notarize + staple
+#   (one-time, by the founder, since it needs the Apple ID app-specific password:
+#    xcrun notarytool store-credentials tenor-notary \
+#        --apple-id <id> --team-id 7554AQN978 --password <app-specific-password>)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +37,7 @@ PY_SHA256="f0a7fa7decc75df2b1a789329a44f657c4a15c0a683f197ce46a5cb621bc6ef4"
 # Runtime engine modules (the daemon + its import graph) and the dictionary.
 PROBE_MODULES=(x7d.py x7lib.py x7.py x7hid.py x7_init.py x7crypto.py crapto1.py)
 
-echo "==> 1/6  build release .app"
+echo "==> 1/7  build release .app"
 cd "$APP_DIR"
 xcodegen generate >/dev/null
 xcodebuild -project tenorrekey.xcodeproj -scheme tenorrekey -configuration Release \
@@ -46,7 +52,7 @@ RES="$STAGE/Contents/Resources"
 FW="$STAGE/Contents/Frameworks"
 mkdir -p "$FW"
 
-echo "==> 2/6  vendor python runtime"
+echo "==> 2/7  vendor python runtime"
 mkdir -p "$CACHE"
 if [ ! -f "$CACHE/$PY_TARBALL" ]; then
     echo "    downloading $PY_TARBALL"
@@ -61,12 +67,12 @@ tar -xzf "$CACHE/$PY_TARBALL" -C "$RES"        # extracts a 'python' dir
 find "$RES/python/lib" -type d -name "test" -prune -exec rm -rf {} + 2>/dev/null || true
 find "$RES/python/lib" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
 
-echo "==> 3/6  vendor probe engine + dictionary"
+echo "==> 3/7  vendor probe engine + dictionary"
 rm -rf "$RES/probe"; mkdir -p "$RES/probe/dict"
 for m in "${PROBE_MODULES[@]}"; do cp "$PROBE/$m" "$RES/probe/"; done
 cp "$PROBE/dict/mfc_keys.dic" "$RES/probe/dict/"
 
-echo "==> 4/6  vendor libhidapi"
+echo "==> 4/7  vendor libhidapi"
 HIDAPI_SRC=""
 for c in /opt/homebrew/lib/libhidapi.dylib /usr/local/lib/libhidapi.dylib; do
     [ -e "$c" ] && { HIDAPI_SRC="$(readlink -f "$c" 2>/dev/null || python3 -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$c")"; break; }
@@ -75,19 +81,56 @@ done
 cp "$HIDAPI_SRC" "$FW/libhidapi.dylib"
 install_name_tool -id "@rpath/libhidapi.dylib" "$FW/libhidapi.dylib" 2>/dev/null || true
 
-echo "==> 5/6  pre-compile + ad-hoc sign"
+echo "==> 5/7  pre-compile + sign"
 # Pre-generate every .pyc now so they are sealed by the signature; the app also
 # launches python with PYTHONDONTWRITEBYTECODE=1 so it never writes one at runtime
 # (a code-signed bundle that mutates itself breaks its own seal).
 "$RES/python/bin/python3" -m compileall -q "$RES/python/lib" "$RES/probe" >/dev/null 2>&1 || true
-# sign inside-out: the dylib + every mach-o the python tree ships, then the app.
-codesign --force -s - "$FW/libhidapi.dylib"
-find "$RES/python" \( -name "*.dylib" -o -name "*.so" \) -exec codesign --force -s - {} + 2>/dev/null || true
-find "$RES/python/bin" -type f -perm -111 -exec codesign --force -s - {} + 2>/dev/null || true
-codesign --force --deep -s - "$STAGE"
-codesign --verify --deep "$STAGE" && echo "    codesign verify OK"
 
-echo "==> 6/6  build dmg"
+# Use a Developer ID Application cert if one is installed (notarizable: hardened
+# runtime + entitlements + secure timestamp); otherwise ad-hoc (runs on this Mac,
+# but cannot be notarized). An "Apple Development" cert is NOT a Developer ID cert.
+SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application[^"]*\)".*/\1/p' | head -1)"
+ENT="$HERE/tenorrekey.entitlements"
+if [ -n "$SIGN_ID" ]; then
+    echo "    Developer ID: $SIGN_ID  (hardened runtime + entitlements)"
+    SIGN=(codesign --force --timestamp --options runtime -s "$SIGN_ID")
+    SIGN_ENT=(codesign --force --timestamp --options runtime --entitlements "$ENT" -s "$SIGN_ID")
+else
+    echo "    no Developer ID Application cert found - ad-hoc signing (NOT notarizable)"
+    SIGN=(codesign --force -s -)
+    SIGN_ENT=(codesign --force -s -)
+fi
+# sign inside-out: the dylib + every mach-o the python tree ships, then the
+# interpreter and the app last (the interpreter + app carry the entitlements; the
+# interpreter is the process that loads the bundled libs via ctypes).
+"${SIGN[@]}" "$FW/libhidapi.dylib"
+find "$RES/python" \( -name "*.dylib" -o -name "*.so" \) -exec "${SIGN[@]}" {} + 2>/dev/null || true
+find "$RES/python/bin" -type f -perm -111 -exec "${SIGN_ENT[@]}" {} + 2>/dev/null || true
+"${SIGN_ENT[@]}" "$STAGE/Contents/MacOS/tenorrekey" 2>/dev/null || true
+"${SIGN_ENT[@]}" "$STAGE"
+codesign --verify --strict --deep "$STAGE" && echo "    codesign verify OK"
+
+# Notarize the .app now (before the dmg) so the dmg ships a stapled app that runs
+# offline. Needs a Developer ID signature AND a stored notarytool credential -
+# create it once (the founder, it needs the Apple ID app-specific password):
+#   xcrun notarytool store-credentials tenor-notary \
+#       --apple-id <id> --team-id 7554AQN978 --password <app-specific-password>
+# then run:  NOTARY_PROFILE=tenor-notary app/tools/package.sh
+NOTARIZE=0
+if [ -n "$SIGN_ID" ] && [ -n "${NOTARY_PROFILE:-}" ]; then
+    NOTARIZE=1
+    echo "==> 6/7  notarize + staple app  (profile: $NOTARY_PROFILE)"
+    APPZIP="$DIST/.notarize-app.zip"
+    ditto -c -k --keepParent "$STAGE" "$APPZIP"
+    xcrun notarytool submit "$APPZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$STAGE"
+    rm -f "$APPZIP"
+else
+    echo "==> 6/7  notarize  SKIPPED (need a Developer ID cert + NOTARY_PROFILE=<profile>)"
+fi
+
+echo "==> 7/7  build dmg"
 DMG="$DIST/tenor-rekey.dmg"
 DMG_STAGE="$DIST/.dmg"
 rm -rf "$DMG_STAGE" "$DMG"; mkdir -p "$DMG_STAGE"
@@ -96,8 +139,13 @@ ln -s /Applications "$DMG_STAGE/Applications"
 [ -f "$APP_DIR/Resources/AppIcon.icns" ] && cp "$APP_DIR/Resources/AppIcon.icns" "$DMG_STAGE/.VolumeIcon.icns"
 hdiutil create -volname "tenor rekey" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$DMG_STAGE"
+if [ "$NOTARIZE" = 1 ]; then
+    echo "    notarize + staple dmg"
+    xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG"
+fi
 
 echo ""
 echo "built:"
-echo "  app  $STAGE"
-echo "  dmg  $DMG  ($(du -h "$DMG" | cut -f1))"
+echo "  app  $STAGE$([ "$NOTARIZE" = 1 ] && echo "  (notarized + stapled)")"
+echo "  dmg  $DMG  ($(du -h "$DMG" | cut -f1))$([ "$NOTARIZE" = 1 ] && echo "  (notarized + stapled)")"
