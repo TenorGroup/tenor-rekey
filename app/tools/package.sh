@@ -13,7 +13,7 @@
 #           NOTARY_PROFILE=tenor-notary app/tools/package.sh   # also notarize + staple
 #   (one-time, by the founder, since it needs the Apple ID app-specific password:
 #    xcrun notarytool store-credentials tenor-notary \
-#        --apple-id <id> --team-id 7554AQN978 --password <app-specific-password>)
+#        --apple-id <id> --team-id 35ZXMV2YHU --password <app-specific-password>)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -115,7 +115,7 @@ codesign --verify --strict --deep "$STAGE" && echo "    codesign verify OK"
 # offline. Needs a Developer ID signature AND a stored notarytool credential -
 # create it once (the founder, it needs the Apple ID app-specific password):
 #   xcrun notarytool store-credentials tenor-notary \
-#       --apple-id <id> --team-id 7554AQN978 --password <app-specific-password>
+#       --apple-id <id> --team-id 35ZXMV2YHU --password <app-specific-password>
 # then run:  NOTARY_PROFILE=tenor-notary app/tools/package.sh
 NOTARIZE=0
 if [ -n "$SIGN_ID" ] && [ -n "${NOTARY_PROFILE:-}" ]; then
@@ -130,15 +130,46 @@ else
     echo "==> 6/7  notarize  SKIPPED (need a Developer ID cert + NOTARY_PROFILE=<profile>)"
 fi
 
-echo "==> 7/7  build dmg"
+echo "==> 7/7  build dmg (styled drag-to-Applications)"
 DMG="$DIST/tenor-rekey.dmg"
-DMG_STAGE="$DIST/.dmg"
-rm -rf "$DMG_STAGE" "$DMG"; mkdir -p "$DMG_STAGE"
-cp -R "$STAGE" "$DMG_STAGE/tenor-rekey.app"
-ln -s /Applications "$DMG_STAGE/Applications"
-[ -f "$APP_DIR/Resources/AppIcon.icns" ] && cp "$APP_DIR/Resources/AppIcon.icns" "$DMG_STAGE/.VolumeIcon.icns"
-hdiutil create -volname "tenor rekey" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG" >/dev/null
-rm -rf "$DMG_STAGE"
+VOL="tenor rekey"
+DSTAGE="$DIST/.dmgstage"; RW="$DIST/.rw.dmg"
+python3 "$HERE/dmg_background.py" >/dev/null     # writes $DIST/.dmgbg/background.tiff
+rm -rf "$DSTAGE" "$RW" "$DMG"; mkdir -p "$DSTAGE/.background"
+cp -R "$STAGE" "$DSTAGE/tenor-rekey.app"
+ln -s /Applications "$DSTAGE/Applications"
+cp "$DIST/.dmgbg/background.tiff" "$DSTAGE/.background/background.tiff"
+ICNS="$STAGE/Contents/Resources/AppIcon.icns"
+[ -f "$ICNS" ] && cp "$ICNS" "$DSTAGE/.VolumeIcon.icns"
+# writable image -> lay it out in Finder (background + icon slots) -> compress.
+hdiutil create -srcfolder "$DSTAGE" -volname "$VOL" -fs HFS+ -format UDRW -ov "$RW" >/dev/null
+DEV="$(hdiutil attach -readwrite -noverify -noautoopen "$RW" | egrep '^/dev/' | head -1 | awk '{print $1}')"
+sleep 1
+osascript <<APPLESCRIPT >/dev/null 2>&1 || echo "    (Finder layout skipped - automation not permitted; dmg still valid)"
+tell application "Finder"
+  tell disk "$VOL"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {200, 120, 860, 562}
+    set vo to the icon view options of container window
+    set arrangement of vo to not arranged
+    set icon size of vo to 128
+    set text size of vo to 12
+    set background picture of vo to file ".background:background.tiff"
+    set position of item "tenor-rekey.app" of container window to {175, 205}
+    set position of item "Applications" of container window to {485, 205}
+    update without registering applications
+    delay 1
+    close
+  end tell
+end tell
+APPLESCRIPT
+[ -f "/Volumes/$VOL/.VolumeIcon.icns" ] && SetFile -a C "/Volumes/$VOL" 2>/dev/null || true
+sync; hdiutil detach "$DEV" >/dev/null 2>&1 || hdiutil detach "$DEV" -force >/dev/null 2>&1
+hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
+rm -rf "$RW" "$DSTAGE"
 if [ "$NOTARIZE" = 1 ]; then
     echo "    notarize + staple dmg"
     xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait

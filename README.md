@@ -48,10 +48,11 @@ and walks the key dictionary at the reader's full speed (~26 ms/key). the macOS
 app is a unified workspace - themes, four languages, live decode, clone with
 brick safety (it refuses to write a self-locking trailer or a zeroed key slot),
 an apdu console, and an editable key dictionary - and ships as a self-contained,
-relocatable `.app` + a drag-to-Applications `.dmg` (ad-hoc signed; Developer-ID
-notarization is the remaining distribution step). nested / MFKey32 live
-key-recovery is the one in-progress R&D area: the offline Crypto1 + recovery is
-ready, but a live attack needs a hardware capture to finish.
+relocatable `.app` inside a styled drag-to-Applications `.dmg`, signed with
+Developer ID and notarized + stapled, so it runs on any Mac with no Gatekeeper
+warning. nested / MFKey32 live key-recovery is the one in-progress R&D area: the
+offline Crypto1 + recovery is ready, but a live attack needs a hardware capture
+to finish.
 
 example keys and UIDs in the code and tests (`a0b1c2d3e4f5`, `01 02 03 04`) are
 placeholders, not real credentials.
