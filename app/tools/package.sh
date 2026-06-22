@@ -48,6 +48,10 @@ APP="$BUILD/Build/Products/Release/tenorrekey.app"
 STAGE="$DIST/tenor-rekey.app"
 rm -rf "$STAGE"; mkdir -p "$DIST"
 cp -R "$APP" "$STAGE"
+# Brand the menu-bar / app-switcher name to "tenor/rekey" (the slash displays
+# fine; the on-disk binary stays PRODUCT_NAME). Done before signing so the
+# signature covers it.
+/usr/libexec/PlistBuddy -c "Set :CFBundleName tenor/rekey" "$STAGE/Contents/Info.plist"
 RES="$STAGE/Contents/Resources"
 FW="$STAGE/Contents/Frameworks"
 mkdir -p "$FW"

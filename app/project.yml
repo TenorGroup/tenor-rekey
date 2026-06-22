@@ -23,6 +23,9 @@ targets:
         PRODUCT_NAME: tenorrekey
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: "tenor/rekey"
+        # CFBundleName (menu bar / app switcher) is derived by Xcode from
+        # PRODUCT_NAME (kept slash-free for the on-disk binary); package.sh patches
+        # it to the brand name "tenor/rekey" before signing.
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.utilities"
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
