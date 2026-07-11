@@ -9,7 +9,7 @@ import re
 import pathlib
 
 HERE = pathlib.Path(__file__).resolve()
-BRAND = pathlib.Path("/Users/tuan/Claude/Tenor/Tenor Branding/packages/brand/src")
+BRAND = pathlib.Path("/Users/tuan/Claude/Tenor/branding/packages/brand/src")
 SRC = BRAND / "tokens.js"
 ASSETS = BRAND / "assets.js"
 OUT = HERE.parent.parent / "Sources" / "Brand" / "TenorBrand.generated.swift"

@@ -7,7 +7,7 @@
 import AppKit
 import CoreText
 
-let brandFonts = "/Users/tuan/Claude/Tenor/Tenor Branding/fonts/geist-sans"
+let brandFonts = "/Users/tuan/Claude/Tenor/branding/fonts/geist-sans"
 let outDir = "/Users/tuan/Claude/Tenor/tenor-rekey/app/Resources"
 let iconset = outDir + "/AppIcon.iconset"
 let focal = "rekey"
