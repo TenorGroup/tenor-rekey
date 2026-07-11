@@ -18,7 +18,7 @@ Hex is lowercase space-separated ("01 02 03 04"); keys are 12-char hex.
 import sys
 import json
 from x7 import X7, hx
-from x7lib import (X7Card, trailer_block, first_block, sector_count,
+from x7lib import (X7Card, trailer_block, first_block, sector_count, card_kind,
                    access_bits_valid, trailer_locks_keys, DEFAULT_KEYS, BUILTIN_KEYS)
 
 
@@ -96,7 +96,8 @@ class Daemon:
         if not i:
             return {"present": False, "reader": True}
         return {"present": True, "reader": True, "uid": hx(i["uid"]),
-                "atqa": hx(i["atqa"]), "sak": i["sak"]}
+                "atqa": hx(i["atqa"]), "sak": i["sak"],
+                "kind": card_kind(i["sak"], i["atqa"])}
 
     def keys_default(self, p):
         """The small in-binary fast-path key list (legacy; the full dictionary is

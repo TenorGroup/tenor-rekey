@@ -154,7 +154,7 @@ final class AppModel {
         lastError = nil
         cloneResults = [:]
         do {
-            if card?.sak == 0x00 {
+            if card?.isNTAG == true {
                 // NTAG / Ultralight: a page dump, not a sector/key decode.
                 let r = try await engine.readNTAG()
                 let pgs = Self.buildPages(r)

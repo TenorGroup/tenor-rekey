@@ -16,6 +16,18 @@ struct PollResult: Codable, Equatable {
     /// Whether the reader itself is connected (nil from older daemons -> treat as
     /// connected). `present` is a card on the reader; `reader` is the reader.
     var reader: Bool? = nil
+    /// Card family from the daemon ("ntag" / "classic"); nil from older daemons,
+    /// in which case `isNTAG` falls back to the ATQA/SAK rule.
+    var kind: String? = nil
+
+    /// True for a genuine NTAG / Ultralight. Prefers the daemon's `kind`; falls
+    /// back to the ATQA/SAK rule (SAK 0x00 AND ATQA 0x0044). A magic/blank Classic
+    /// reports SAK 0x00 with ATQA 0x0004 and must NOT be treated as NTAG.
+    var isNTAG: Bool {
+        if let kind { return kind == "ntag" }
+        let a = (atqa ?? "").replacingOccurrences(of: " ", with: "").lowercased()
+        return sak == 0x00 && a == "0044"
+    }
 }
 
 struct DecodeResult: Codable, Equatable {

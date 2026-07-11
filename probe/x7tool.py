@@ -11,7 +11,7 @@ import json
 import os
 import sys
 from x7 import X7, hx
-from x7lib import X7Card, DEFAULT_KEYS, trailer_block, first_block, sector_count
+from x7lib import X7Card, DEFAULT_KEYS, trailer_block, first_block, sector_count, card_kind
 
 SAK_TYPE = {0x08: "MIFARE Classic 1K", 0x18: "MIFARE Classic 4K", 0x09: "MIFARE Mini",
             0x00: "MIFARE Ultralight / NTAG", 0x20: "MIFARE DESFire / Plus",
@@ -43,10 +43,14 @@ def cmd_read(a):
     if not i:
         c.close(); print("No card on reader."); return
     sak = i["sak"]
+    kind = card_kind(sak, i["atqa"])
     print("UID  : %s" % hx(i["uid"]).upper())
     print("ATQA : %s" % hx(i["atqa"]))
-    print("SAK  : %02x  (%s)" % (sak, SAK_TYPE.get(sak, "unknown")))
-    if sak == 0x00:                       # NTAG / Ultralight - dump pages
+    # A magic/blank Classic reports SAK 0x00 with ATQA 0x0004; do not let the
+    # SAK_TYPE lookup label it "MIFARE Ultralight / NTAG".
+    label = "MIFARE Classic" if (sak == 0x00 and kind != "ntag") else SAK_TYPE.get(sak, "unknown")
+    print("SAK  : %02x  (%s)" % (sak, label))
+    if kind == "ntag":                    # NTAG / Ultralight - dump pages
         pages = c.read_ntag()
         print("Pages:")
         for p in sorted(pages):

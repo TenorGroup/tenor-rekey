@@ -69,6 +69,15 @@ def sector_count(sak):
     return 40 if sak == 0x18 else 16            # 4K vs 1K
 
 
+def card_kind(sak, atqa):
+    """MIFARE family of a polled card. NTAG/Ultralight report SAK 0x00 AND
+    ATQA 0x0044; a magic/blank Classic also reports SAK 0x00 but ATQA 0x0004,
+    so SAK alone mis-detects it. Everything that is not a genuine NTAG is
+    treated as Classic (the decode path auths and reads it). atqa: 2 bytes or int."""
+    a = int.from_bytes(atqa, "big") if isinstance(atqa, (bytes, bytearray)) else int(atqa)
+    return "ntag" if (sak == 0x00 and a == 0x0044) else "classic"
+
+
 def blocks_in_sector(s):
     return 4 if s < 32 else 16                   # 4K big sectors
 

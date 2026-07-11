@@ -356,6 +356,21 @@ def test_access_bits_valid():
           x7lib.access_bits_valid(locked) and x7lib.trailer_locks_keys(locked))
 
 
+def test_card_kind():
+    # NTAG/Ultralight is the ONLY SAK 0x00 + ATQA 0x0044 card; a magic/blank
+    # Classic reports SAK 0x00 too but ATQA 0x0004, so SAK alone mis-detects it.
+    check("card_kind: genuine NTAG (sak 0x00, atqa 0x0044)",
+          x7lib.card_kind(0x00, b"\x00\x44") == "ntag")
+    check("card_kind: magic/blank Classic (sak 0x00, atqa 0x0004)",
+          x7lib.card_kind(0x00, b"\x00\x04") == "classic")
+    check("card_kind: normal Classic 1K (sak 0x08)",
+          x7lib.card_kind(0x08, b"\x00\x04") == "classic")
+    check("card_kind accepts an int atqa", x7lib.card_kind(0x00, 0x0044) == "ntag")
+    # the daemon poll must surface the kind so the UI never re-derives it
+    d = daemon_with(FakeCard(sak=0x00))
+    check("daemon poll surfaces card_kind", d.poll({}).get("kind") == "classic")
+
+
 def test_read_ntag_wrap():
     # A 6-page tag whose READ rolls over to page 0 past the end. read_ntag must
     # stop at the wrap, not store wrapped pages under high indices.
@@ -465,6 +480,7 @@ if __name__ == "__main__":
     test_dump_keyb_read_fallback()
     test_dump_trailer_mirror()
     test_access_bits_valid()
+    test_card_kind()
     test_daemon_format()
     test_daemon_ntag_apdu()
     test_read_ntag_wrap()

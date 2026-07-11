@@ -136,7 +136,7 @@ private struct ActionBar: View {
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
-    private var ntag: Bool { model.card?.sak == 0x00 }
+    private var ntag: Bool { model.card?.isNTAG == true }
     private var busy: Bool { model.decoding || model.cloning || model.formatting }
 
     var body: some View {
@@ -251,7 +251,7 @@ private struct CanvasView: View {
             if let c = model.card {
                 CardHeader(card: c)
                 Rectangle().fill(theme.p.hairline).frame(height: 1)
-                if c.sak == 0x00 {
+                if c.isNTAG {
                     if model.pages.isEmpty { PreDecode() } else { PageTable() }
                 } else if model.sectors.isEmpty {
                     PreDecode()
@@ -274,7 +274,7 @@ private struct CardHeader: View {
             metric("uid", card.uid ?? "-")
             metric("atqa", card.atqa ?? "-")
             metric("sak", card.sak.map { String(format: "%02x", $0) } ?? "-")
-            metric(l.t("type"), cardType(card.sak), mono: false)
+            metric(l.t("type"), cardType(card.sak, isNTAG: card.isNTAG), mono: false)
             Spacer()
         }
         .padding(.horizontal, 24).padding(.vertical, 16)
@@ -306,7 +306,7 @@ private struct PreDecode: View {
                 Button(l.t("cancel")) { Task { await model.cancelDecode() } }
                     .buttonStyle(.plain).font(l.sans(11)).foregroundStyle(theme.p.textTertiary)
             } else {
-                let ntag = model.card?.sak == 0x00
+                let ntag = model.card?.isNTAG == true
                 Button { Task { await model.decode() } } label: {
                     Text(l.t(ntag ? "read_card" : "decode_card")).font(l.sans(13))
                 }
@@ -380,11 +380,13 @@ struct Lockup: View {
     }
 }
 
-func cardType(_ sak: Int?) -> String {
+func cardType(_ sak: Int?, isNTAG: Bool = true) -> String {
     switch sak {
     case 0x08: "mifare classic 1k"
     case 0x18: "mifare classic 4k"
-    case 0x00: "ultralight / ntag"
+    // A magic/blank Classic also reports SAK 0x00 (ATQA 0x0004); only a genuine
+    // NTAG (ATQA 0x0044) is labelled ultralight / ntag.
+    case 0x00: isNTAG ? "ultralight / ntag" : "mifare classic 1k"
     case 0x20: "desfire / plus"
     default: "unknown"
     }
