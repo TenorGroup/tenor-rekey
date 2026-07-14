@@ -222,8 +222,8 @@ actor X7Engine {
         try await request("read_ntag", timeout: .seconds(120), as: NtagResult.self)
     }
     /// Factory-reset the card (zero data + factory trailer). keys from a prior decode.
-    func formatCard(keys: [String: [String]]) async throws -> FormatResult {
-        try await request("format", params: FormatParams(keys: keys), timeout: .seconds(300), as: FormatResult.self)
+    func formatCard(keys: [String: [String]], targetUID: String?) async throws -> FormatResult {
+        try await request("format", params: FormatParams(keys: keys, target_uid: targetUID), timeout: .seconds(300), as: FormatResult.self)
     }
     func apdu(_ hex: String) async throws -> ApduResult {
         try await request("apdu", params: ApduParams(hex: hex), as: ApduResult.self)
@@ -232,14 +232,14 @@ actor X7Engine {
     /// Clone a dump onto the card on the reader. Per-block results stream to
     /// `onBlock` as the daemon writes; the final tally is returned.
     func writeMFD(blocks: [String: String], keys: [String: [String]],
-                  trailers: Bool, uid: Bool,
+                  trailers: Bool, uid: Bool, targetUID: String?,
                   onBlock: @escaping @Sendable (Int, Bool) -> Void) async throws -> WriteResult {
         guard eventSink == nil else { throw EngineError.daemon("an operation is already in progress") }
         eventSink = { ev in
             if ev.method == "write_mfd", let b = ev.block, let ok = ev.ok { onBlock(b, ok) }
         }
         defer { eventSink = nil }
-        let params = CloneParams(blocks: blocks, keys: keys, trailers: trailers, uid: uid)
+        let params = CloneParams(blocks: blocks, keys: keys, trailers: trailers, uid: uid, target_uid: targetUID)
         return try await request("write_mfd", params: params, timeout: .seconds(300), as: WriteResult.self)
     }
 
@@ -247,11 +247,11 @@ actor X7Engine {
     private struct ReqP<P: Encodable>: Encodable { let id: Int; let method: String; let params: P }
     private struct CloneParams: Encodable {
         let blocks: [String: String]; let keys: [String: [String]]
-        let trailers: Bool; let uid: Bool
+        let trailers: Bool; let uid: Bool; let target_uid: String?
     }
     private struct ApduParams: Encodable { let hex: String }
     private struct PollParams: Encodable { let tries: Int }
-    private struct FormatParams: Encodable { let keys: [String: [String]] }
+    private struct FormatParams: Encodable { let keys: [String: [String]]; let target_uid: String? }
     private struct DecodeParams: Encodable { let user_keys: [String] }
     private struct CountResult: Decodable { let count: Int }
     private struct Envelope<T: Decodable>: Decodable { let result: T?; let error: String? }

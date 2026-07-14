@@ -5,7 +5,7 @@ import SwiftUI
 /// chrome greys are app-derived surface tones (not brand palette entries).
 ///
 /// The whole app paints from these tokens so a light/dark switch is an animated
-/// crossfade (Codex r5: preferredColorScheme + dynamic system colors SNAP, so we
+/// crossfade (preferredColorScheme + dynamic system colors SNAP, so we
 /// drive surfaces ourselves and animate the token swap).
 struct Palette {
     let canvas: Color        // window / content background

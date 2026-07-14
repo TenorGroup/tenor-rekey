@@ -1,7 +1,7 @@
 import SwiftUI
 import CoreText
 
-/// Brand typography (master CLAUDE.md §9): Geist Sans for UI chrome, Geist Mono
+/// Brand typography (brand guidelines): Geist Sans for UI chrome, Geist Mono
 /// for every hex / uid / numeric value, Be Vietnam Pro for Vietnamese body. The
 /// face names come from the generated TenorFontFace (single source = @tenor/brand),
 /// never typed here. CJK glyphs (zh / ja) fall back to the system face per-glyph,

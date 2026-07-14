@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// The card's memory map: a grid of sector tiles (Codex r5: calmer + more
+/// The card's memory map: a grid of sector tiles (calmer + more
 /// architectural than a dense hex matrix; hex density lives in the inspector).
 struct SectorGrid: View {
     @Environment(AppModel.self) private var model

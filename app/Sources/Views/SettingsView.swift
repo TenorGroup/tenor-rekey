@@ -1,7 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The Settings scene (⌘,). Native Form/List here (Codex r5: Form only at
+/// The Settings scene (⌘,). Native Form/List here (Form only at
 /// settings) - the instrument canvas styling stays in the main window.
 struct SettingsView: View {
     @Environment(L10n.self) private var l

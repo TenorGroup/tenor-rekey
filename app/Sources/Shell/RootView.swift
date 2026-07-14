@@ -2,7 +2,8 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// One unified workspace: the CARD is the document; reading / writing / format /
+/// One unified workspace: the decoded / loaded image is the DOCUMENT on the canvas,
+/// the card on the reader is a separate live device; reading / writing / format /
 /// save / open are LABELLED actions on a always-visible action bar (so the
 /// workflow is discoverable, not hidden behind cryptic toolbar icons). The
 /// titlebar is hidden; a custom header carries the brand wordmark + reader
@@ -46,6 +47,7 @@ private struct Workspace: View {
             Rectangle().fill(theme.p.hairline).frame(height: 1)
             ActionBar()
             Rectangle().fill(theme.p.hairline).frame(height: 1)
+            ErrorBanner()
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
                     CanvasView().frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -70,6 +72,32 @@ private struct Workspace: View {
                 Task { @MainActor in model.loadDump(from: url) }
             }
             return true
+        }
+    }
+}
+
+/// A dismissible status line for the last operation error (a clone that hit the
+/// wrong card, a write that failed, a decode that was interrupted). Without it those
+/// failures were silent - the model recorded them but nothing was ever shown. Glyph +
+/// typography carry the signal (instrument discipline: no alarm colour).
+private struct ErrorBanner: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        if let err = model.lastError {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle").font(.system(size: 11))
+                    .foregroundStyle(theme.p.textPrimary)
+                Text(err).font(l.sans(11)).foregroundStyle(theme.p.textPrimary).lineLimit(2)
+                Spacer()
+                Button { withAnimation(.easeInOut(duration: 0.2)) { model.lastError = nil } } label: {
+                    Image(systemName: "xmark").font(.system(size: 9))
+                }.buttonStyle(.plain).foregroundStyle(theme.p.textTertiary).help(l.t("cancel"))
+            }
+            .padding(.horizontal, 16).padding(.vertical, 9)
+            .background(theme.p.tileFill)
+            Rectangle().fill(theme.p.hairline).frame(height: 1)
         }
     }
 }
@@ -143,12 +171,15 @@ private struct ActionBar: View {
         HStack(spacing: 8) {
             ActionButton(title: l.t(ntag ? "read" : "decode"), icon: "square.grid.3x3",
                          prominent: true, enabled: model.card != nil && !busy) { Task { await model.decode() } }
+            // Write lights up as soon as there is a document to write; it does NOT
+            // require a card on the reader (the target is asked for at write time in
+            // the sheet), so lifting the source card to place a blank never darkens it.
             ActionButton(title: l.t("write"), icon: "square.and.arrow.down.on.square",
-                         enabled: model.cloneSource != nil && model.card != nil && !busy) { model.cloneSheet = true }
-            // Format requires a prior decode: it auths with the recovered keys,
-            // and gating on liveDump means the user has seen the card before wiping.
+                         enabled: model.cloneSource != nil && !busy) { model.cloneSheet = true }
+            // Format is destructive and auths with the document's keys, so it is only
+            // offered when the card on the reader IS the one this document came from.
             ActionButton(title: l.t("format"), icon: "eraser",
-                         enabled: model.card != nil && model.liveDump != nil && !busy) { model.formatConfirm = true }
+                         enabled: model.canFormat && !busy) { model.formatConfirm = true }
             // Nested / reader key recovery: the crypto + collection are ready and
             // the engine method exists, but it is not yet verified live, so the
             // action stays disabled with a "soon" hint until it is.
@@ -156,7 +187,7 @@ private struct ActionBar: View {
                          enabled: false, help: l.t("soon")) { }
             Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
             ActionButton(title: l.t("save_dump"), icon: "arrow.down.doc",
-                         enabled: model.liveDump != nil) { model.saveDumpDialog() }
+                         enabled: model.source != nil) { model.saveDumpDialog() }
             ActionButton(title: l.t("open_dump"), icon: "folder", enabled: true) { model.openDumpDialog() }
             ActionButton(title: "apdu", icon: "terminal", on: model.apduOpen, enabled: true) { model.apduOpen.toggle() }
             Spacer()
@@ -230,7 +261,7 @@ private struct SourceTag: View {
             Text(l.t("source")).font(l.sans(9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
             Text(src.uid.isEmpty ? src.name : src.uid)
                 .font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary).lineLimit(1)
-            Button { withAnimation(.easeInOut(duration: 0.3)) { model.source = nil } } label: {
+            Button { model.clearDocument() } label: {
                 Image(systemName: "xmark").font(.system(size: 8))
             }.buttonStyle(.plain).foregroundStyle(theme.p.textTertiary).help(l.t("cancel"))
         }
@@ -248,20 +279,83 @@ private struct CanvasView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let c = model.card {
+            if !model.sectors.isEmpty || !model.pages.isEmpty {
+                // A document is loaded (decoding, decoded, or an NTAG page dump): show
+                // it. It persists across card swaps, so the working image never
+                // vanishes when the source card is lifted to place a target.
+                DocHeader()
+                Rectangle().fill(theme.p.hairline).frame(height: 1)
+                ReaderHint()
+                if !model.pages.isEmpty { PageTable() } else { SectorGrid() }
+            } else if let c = model.card {
+                // A card is on the reader and nothing is decoded yet: offer to read it.
                 CardHeader(card: c)
                 Rectangle().fill(theme.p.hairline).frame(height: 1)
-                if c.isNTAG {
-                    if model.pages.isEmpty { PreDecode() } else { PageTable() }
-                } else if model.sectors.isEmpty {
-                    PreDecode()
-                } else {
-                    SectorGrid()
-                }
+                PreDecode()
             } else {
                 EmptyState()
             }
         }
+    }
+}
+
+/// Identity of the DOCUMENT on the canvas (the decoded / loaded image), not the live
+/// card: its uid is labelled "document" so it reads as a held image independent of
+/// whatever card is on the reader. Falls back to the card being decoded before its
+/// dump exists.
+private struct DocHeader: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        let uid = model.source?.uid ?? model.card?.uid
+        let sak = model.source?.sak ?? model.card?.sak
+        // NTAG-ness is a property of the DOCUMENT (a page dump), not of whatever card
+        // is on the reader: only a page dump populates `pages`.
+        let isNTAG = !model.pages.isEmpty
+        HStack(alignment: .top, spacing: 28) {
+            metric(l.t("document"), uid ?? "-")
+            metric("sak", sak.map { String(format: "%02x", $0) } ?? "-")
+            metric(l.t("type"), cardType(sak, isNTAG: isNTAG), mono: false)
+            Spacer()
+        }
+        .padding(.horizontal, 24).padding(.vertical, 16)
+    }
+    private func metric(_ label: String, _ value: String, mono: Bool = true) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(l.sans(9)).tracking(0.8).foregroundStyle(theme.p.textTertiary)
+            Text(value).font(mono ? Typeface.mono(14) : l.sans(14))
+                .foregroundStyle(theme.p.textPrimary).textSelection(.enabled)
+        }
+    }
+}
+
+/// The one line that keeps the document-vs-reader flow honest: when a writable
+/// document is held it says what to do next given the card on the reader - place a
+/// target to write, or (a different card is sitting there) decode it or write over it.
+/// Silent when the reader card is the document itself, so nothing nags in the calm case.
+private struct ReaderHint: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        if let hint = hintText {
+            HStack(spacing: 7) {
+                Circle().fill(model.card == nil ? theme.p.textTertiary : theme.p.accent)
+                    .frame(width: 6, height: 6)
+                Text(hint).font(l.sans(11)).foregroundStyle(theme.p.textSecondary)
+                Spacer()
+            }
+            .padding(.horizontal, 24).padding(.vertical, 9)
+            .background(theme.p.panel)
+            Rectangle().fill(theme.p.hairline).frame(height: 1)
+        }
+    }
+    private var hintText: String? {
+        guard let doc = model.source?.uid else { return nil }   // only for a writable document
+        guard model.readerOnline else { return nil }            // reader unplugged: the header already says so
+        guard let card = model.card?.uid else { return l.t("place_target") }
+        return AppModel.normUID(card) == AppModel.normUID(doc) ? nil : l.t("decode_to_read")
     }
 }
 

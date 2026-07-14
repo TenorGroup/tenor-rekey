@@ -3,7 +3,7 @@ import SwiftUI
 /// The selected sector's detail: key + provenance, a tappable block list, and a
 /// Quick-Look of the chosen block (16 bytes laid out 4x4 with an ASCII gutter,
 /// plus the decoded access conditions for a trailer). Hex density lives here so
-/// the overview grid stays calm (Codex r5).
+/// the overview grid stays calm.
 struct SectorInspector: View {
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme

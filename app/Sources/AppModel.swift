@@ -2,8 +2,9 @@ import SwiftUI
 import Observation
 import AppKit
 
-/// Observable app state. The CARD is the document; reading / decoding act on it.
-/// Heavy work stays on the X7Engine actor; this holds @MainActor UI state only.
+/// Observable app state. The decoded / loaded image is the DOCUMENT; the card on the
+/// reader is a separate live device state. Heavy work stays on the X7Engine actor;
+/// this holds @MainActor UI state only.
 @MainActor
 @Observable
 final class AppModel {
@@ -20,13 +21,17 @@ final class AppModel {
     var lastError: String?
     var inspectorOpen = true
 
-    /// The most recent live decode, kept so File > Save can write it out.
-    var liveDump: CardDump?
-    /// A loaded or freshly decoded source dump - the thing clone writes.
+    /// The working DOCUMENT: the image produced by a decode or loaded from a file.
+    /// It is what the canvas shows, what Save writes out, and what Write clones onto
+    /// the card on the reader. It is independent of whichever card is currently on
+    /// the reader and deliberately persists across card swaps, so decoding a source
+    /// card and writing it onto a blank needs no save/open dance and never visually
+    /// vanishes when the source card is lifted.
     var source: CardDump?
     var cloneSheet = false
     var cloning = false
-    /// Per-block write outcome from the last/in-flight clone (block -> ok).
+    /// Per-block write outcome from the last/in-flight clone (block -> ok). Tied to a
+    /// specific target card, so it resets when the card on the reader changes.
     var cloneResults: [Int: Bool] = [:]
     var formatConfirm = false
     var formatting = false
@@ -48,21 +53,25 @@ final class AppModel {
         return sectors.first { $0.index == s }
     }
 
-    /// What "write" clones FROM: an explicit source loaded from disk or produced by
-    /// a successful decode. A decoded source intentionally survives a card swap so
-    /// it can be written to the target. The fallback live dump counts only when it
-    /// belongs to the card currently on the reader.
-    var cloneSource: CardDump? {
-        if let source { return source }
-        if let d = liveDump, let cuid = card?.uid, Self.normUID(d.uid) == Self.normUID(cuid) { return d }
-        return nil
+    /// What "write" clones onto the card on the reader: the working document. It has
+    /// no dependency on a card being present, so the write action is available as soon
+    /// as there is something to write; the target card is asked for at write time.
+    var cloneSource: CardDump? { source }
+
+    /// Format erases the card on the reader, so it is only offered when the card
+    /// present is the one this document was decoded from (same uid): only then do we
+    /// hold its recovered keys to auth it, and only then is wiping it unambiguous.
+    var canFormat: Bool {
+        guard let c = card?.uid, let d = source?.uid else { return false }
+        return Self.normUID(c) == Self.normUID(d)
     }
+
     static func normUID(_ s: String) -> String {
         s.replacingOccurrences(of: " ", with: "").lowercased()
     }
 
-    /// Start the daemon + read device info, then look for a card (Codex r1:
-    /// connect at launch, not lazily).
+    /// Start the daemon + read device info, then look for a card (connect at launch,
+    /// not lazily).
     func connect() async {
         do {
             info = try await engine.info()
@@ -102,19 +111,21 @@ final class AppModel {
             }
             readerOnline = true
             if info == nil { info = try? await engine.info() }   // refetch until it lands
-            lastError = nil
+            // NOTE: do not clear lastError here - the 1.5s poll would wipe a clone /
+            // decode / format error banner before the user could read it. Operations
+            // clear it when they start; the banner also has a dismiss button.
             if p.present {
                 cardAbsentStreak = 0
-                // A different card (or first placement): clear everything bound to
-                // the previous card BEFORE swapping in the new one, so its grid,
-                // live decode and clone results never bleed onto the new card.
+                // A different card (or first placement): the DOCUMENT stays (it is the
+                // working image, not bound to this card); only the previous write's
+                // per-block glyphs reset so they never show on the new card.
                 if card == nil || p.uid != card?.uid {
-                    withAnimation(.easeInOut(duration: 0.3)) { clearCardState(); card = p }
+                    withAnimation(.easeInOut(duration: 0.3)) { clearCardBound(); card = p }
                 }
             } else {
                 cardAbsentStreak += 1
                 if card != nil && cardAbsentStreak >= 2 {
-                    withAnimation(.easeInOut(duration: 0.3)) { card = nil; clearCardState() }
+                    withAnimation(.easeInOut(duration: 0.3)) { card = nil; clearCardBound() }
                 }
             }
         } catch {
@@ -122,14 +133,24 @@ final class AppModel {
         }
     }
 
-    /// Forget everything tied to the card on the reader: the decode grid, page
-    /// dump, selection, the live decode used as an implicit clone source, and the
-    /// per-block clone results. The explicit `source` document is kept because it
-    /// is the image to write, not state bound to the current target card. Shared by
-    /// the swap, removal, and reader-gone paths so they cannot drift.
-    private func clearCardState() {
-        sectors = []; pages = []; selected = nil; selectedBlock = nil
-        liveDump = nil; cloneResults = [:]
+    /// Reset state tied to the physical card on the reader: the last clone's per-block
+    /// glyphs and the NTAG page view (NTAG has no writable document, so its pages are
+    /// bound to the live card). The writable Classic DOCUMENT (sector grid + source
+    /// image + selection) is deliberately kept so it survives a card swap, removal, or
+    /// reader unplug - the working image is not bound to whatever card is on the
+    /// reader. Shared by the swap, removal, and reader-gone paths so they cannot drift.
+    private func clearCardBound() {
+        cloneResults = [:]
+        pages = []
+    }
+
+    /// Drop the working document entirely (the source tag's clear button): the image,
+    /// its grid, page dump, and selection. The card on the reader is untouched.
+    func clearDocument() {
+        withAnimation(.easeInOut(duration: 0.3)) {
+            source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
+            cloneResults = [:]
+        }
     }
 
     /// Reader unplugged or the daemon went away: go offline and clear everything
@@ -141,7 +162,7 @@ final class AppModel {
             readerOnline = false
             info = nil
             card = nil
-            clearCardState()
+            clearCardBound()
         }
     }
 
@@ -153,23 +174,30 @@ final class AppModel {
         decodeProgress = nil
         lastError = nil
         cloneResults = [:]
+        // A fresh decode REPLACES the working document, so drop it up front: the
+        // canvas then follows the card being read, and a decode that fails does not
+        // leave the previous image's header sitting over a half-filled grid.
+        withAnimation(.easeInOut(duration: 0.3)) {
+            source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
+        }
         do {
             if card?.isNTAG == true {
-                // NTAG / Ultralight: a page dump, not a sector/key decode.
+                // NTAG / Ultralight: a read-only page view, not a writable document.
                 let r = try await engine.readNTAG()
                 let pgs = Self.buildPages(r)
-                withAnimation(.easeInOut(duration: 0.3)) { sectors = []; selected = nil; pages = pgs }
+                withAnimation(.easeInOut(duration: 0.3)) { pages = pgs; source = nil }
             } else {
                 // show the whole grid right away (all pending) so sectors fill in
                 // live as each one is searched, instead of a blank wait.
                 let count = card?.sak.map { sectorsForSak($0) } ?? 16
                 withAnimation(.easeInOut(duration: 0.3)) {
-                    sectors = Self.pendingSectors(count: count); pages = []; selected = nil; selectedBlock = nil
+                    sectors = Self.pendingSectors(count: count)
                 }
                 let r = try await engine.decode(userKeys: keyStore.keys,
                     onProgress: { [weak self] ev in Task { @MainActor in self?.applyDecodeEvent(ev) } })
                 if let startUID, Self.normUID(r.uid) != Self.normUID(startUID) {
                     lastError = "card changed during decode"
+                    withAnimation(.easeInOut(duration: 0.3)) { sectors = []; source = nil }
                 } else {
                     let vms = Self.buildSectors(r)
                     let dump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
@@ -178,15 +206,18 @@ final class AppModel {
                         sectors = vms
                         pages = []
                         selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
-                        liveDump = dump
                         source = dump
                     }
                 }
             }
         } catch {
             // a user cancel kills the daemon, which surfaces as a thrown error - not
-            // something to show as a failure.
+            // something to show as a failure. Either way, do not leave a half-filled
+            // grid or a stale image behind.
             if !decodeCancelled { lastError = "\(error)" }
+            withAnimation(.easeInOut(duration: 0.3)) {
+                sectors = []; pages = []; selected = nil; source = nil
+            }
         }
         decoding = false
         decodeCancelled = false
@@ -261,6 +292,31 @@ final class AppModel {
         }
     }
 
+    /// Build the grid from a loaded dump (File > Open), so an opened image renders
+    /// its memory map exactly like a fresh decode. Dump block hex is stored without
+    /// spaces; re-space it to match the daemon's display form the grid expects.
+    static func buildSectors(fromDump d: CardDump) -> [SectorVM] {
+        (0..<d.sectorCount).map { s in
+            let k = d.keys[s]
+            let kh = k?.hex
+            let prov: KeyProvenance = kh == nil
+                ? .unknown
+                : (kh == "ffffffffffff" ? .dictionary : .nonDefault)
+            let blocks = blockNumbers(ofSector: s).map { b in d.blocks[b].map(spacedHex) ?? "?" }
+            return SectorVM(index: s, keyType: k?.type, keyHex: kh, provenance: prov, blocks: blocks,
+                            status: kh == nil ? .failed : .found)
+        }
+    }
+
+    /// "0102..1f" -> "01 02 .. 1f" so dump-loaded blocks render like decode blocks.
+    static func spacedHex(_ h: String) -> String {
+        stride(from: 0, to: h.count, by: 2).compactMap { i -> String? in
+            let start = h.index(h.startIndex, offsetBy: i)
+            let end = h.index(start, offsetBy: min(2, h.count - i))
+            return String(h[start..<end])
+        }.joined(separator: " ")
+    }
+
     /// The full sector grid, all pending, shown the instant decode starts so the
     /// card's memory map is visible and fills in live sector by sector.
     static func pendingSectors(count: Int) -> [SectorVM] {
@@ -314,18 +370,24 @@ final class AppModel {
         cloning = true
         cloneResults = [:]
         lastError = nil
+        // Pin the write to the card the sheet just showed the user; the daemon refuses
+        // if a different card slid onto the reader before it acquired one.
+        let target = card?.uid
         do {
             let r = try await engine.writeMFD(
                 blocks: src.blockParams, keys: src.keyParams, trailers: trailers, uid: uid,
+                targetUID: target,
                 onBlock: { [weak self] b, ok in
                     Task { @MainActor in
                         withAnimation(.easeOut(duration: 0.16)) { self?.cloneResults[b] = ok }
                     }
                 })
-            // Per-block glyphs in the grid/inspector are the primary failure
-            // surface; lastError is the summary for when one is shown.
+            // Per-block glyphs in the grid/inspector are the primary failure surface;
+            // lastError is the summary shown in the status banner.
             if r.present == false {
                 lastError = "no card on reader"
+            } else if let e = r.error {
+                lastError = e
             } else if let failed = r.failed, !failed.isEmpty {
                 lastError = "\(failed.count) block(s) failed to write: \(failed)"
             }
@@ -335,24 +397,31 @@ final class AppModel {
         cloning = false
     }
 
-    /// Factory-reset the card on the reader (zero data + factory trailer). Uses
-    /// the keys from the last decode so it can auth; destructive, so the UI gates
-    /// it behind a confirm. After a successful format the decode is cleared - the
-    /// card is blank and should be re-read to confirm.
+    /// Factory-reset the card on the reader (zero data + factory trailer). Auths with
+    /// the document's recovered keys; `canFormat` guarantees that document is this very
+    /// card. Destructive, so the UI gates it behind a confirm. On success the document
+    /// is dropped - the card is blank now, and its old image should not linger.
     func format() async {
-        guard card != nil, !formatting else { return }
+        guard canFormat, !formatting else { return }
         formatting = true
         cloneResults = [:]
         lastError = nil
+        let target = card?.uid
         do {
-            let r = try await engine.formatCard(keys: liveDump?.keyParams ?? [:])
+            let r = try await engine.formatCard(keys: source?.keyParams ?? [:], targetUID: target)
             if r.present == false {
                 lastError = "no card on reader"
+            } else if let e = r.error {
+                lastError = e                      // aborted (wrong / swapped card): keep the image
+            } else if let failed = r.failed, !failed.isEmpty {
+                // A partial or fully failed format did NOT blank the card, so keep the
+                // document: it may still be the only copy of the image.
+                lastError = "\(failed.count) block(s) could not be formatted: \(failed)"
             } else {
-                if let failed = r.failed, !failed.isEmpty {
-                    lastError = "\(failed.count) block(s) could not be formatted: \(failed)"
+                // Clean format: the card is factory now, so drop its stale image.
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
                 }
-                withAnimation(.easeInOut(duration: 0.3)) { sectors = []; selected = nil; liveDump = nil }
             }
         } catch {
             lastError = "\(error)"
@@ -414,7 +483,7 @@ final class AppModel {
     }
 
     func saveDumpDialog() {
-        guard let dump = liveDump else { return }
+        guard let dump = source else { return }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = Self.defaultDumpFilename(dump)
         panel.allowsOtherFileTypes = true
@@ -424,10 +493,21 @@ final class AppModel {
         if panel.runModal() == .OK, let url = panel.url { saveDump(dump, to: url) }
     }
 
+    /// Open a dump as the working document: it becomes the source AND its memory map
+    /// is rendered on the canvas (a loaded image is a document just like a decode), so
+    /// the canvas never shows a stale grid under a freshly opened source.
     func loadDump(from url: URL) {
         do {
             let dump = try CardDump.load(mfd: url)
-            withAnimation(.easeInOut(duration: 0.3)) { source = dump }
+            let vms = Self.buildSectors(fromDump: dump)
+            withAnimation(.easeInOut(duration: 0.3)) {
+                source = dump
+                sectors = vms
+                pages = []
+                selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
+                selectedBlock = nil
+                cloneResults = [:]
+            }
             NSDocumentController.shared.noteNewRecentDocumentURL(url)
             lastError = nil
         } catch {

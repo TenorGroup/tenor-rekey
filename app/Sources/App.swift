@@ -23,14 +23,14 @@ struct TenorRekeyApp: App {
                     .keyboardShortcut("o")
                 Button(l10n.t("save_dump")) { model.saveDumpDialog() }
                     .keyboardShortcut("s")
-                    .disabled(model.liveDump == nil)
+                    .disabled(model.source == nil)
             }
             CommandMenu(l10n.t("card")) {
                 Button(l10n.t("decode")) { Task { await model.decode() } }
                     .keyboardShortcut("r")
                     .disabled(model.card == nil || model.decoding)
                 Button(l10n.t("clone")) { model.cloneSheet = true }
-                    .disabled(model.cloneSource == nil || model.card == nil || model.cloning)
+                    .disabled(model.cloneSource == nil || model.cloning || model.decoding || model.formatting)
                 Divider()
                 Button(l10n.t("apdu")) { model.apduOpen.toggle() }
                     .keyboardShortcut("t")

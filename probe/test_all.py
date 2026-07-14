@@ -255,6 +255,22 @@ def test_daemon_write():
     res3 = d3.write_mfd({"blocks": blocks, "keys": keys, "trailers": True, "uid": True})
     check("write_mfd falls back to factory FF on a blank sector", res3["wrote"] == 4, str(res3))
 
+    # target_uid pins the write to the card the UI showed: a mismatch refuses to
+    # write, so a card swapped in before the daemon acquired one is never cloned onto.
+    ct = FakeCard(keymap={0: ("A", "a0b1c2d3e4f5")})    # uid 01 02 03 04
+    dt = daemon_with(ct); dt.emit = lambda o: None
+    rt = dt.write_mfd({"blocks": blocks, "keys": keys, "trailers": True, "uid": True,
+                       "target_uid": "09 09 09 09"})
+    check("write_mfd refuses a target uid that is not the card on the reader",
+          rt.get("error") == "the card on the reader is not the target shown" and ct.writes == [],
+          str(rt))
+    # the matching uid writes normally
+    cm = FakeCard(keymap={0: ("A", "a0b1c2d3e4f5")})
+    dm = daemon_with(cm); dm.emit = lambda o: None
+    rm = dm.write_mfd({"blocks": blocks, "keys": keys, "trailers": True, "uid": True,
+                       "target_uid": "01 02 03 04"})
+    check("write_mfd writes when the target uid matches", rm["wrote"] == 4 and not rm.get("error"), str(rm))
+
     # no card -> guarded
     cg = FakeCard(); cg.wait_for_card = lambda tries=25: None
     dg = daemon_with(cg); dg.emit = lambda o: None

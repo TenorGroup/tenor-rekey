@@ -45,7 +45,7 @@ class Daemon:
         self.card = None
 
     def _open(self):
-        """Open + RF-init the reader once; reuse across commands (Codex r1: start
+        """Open + RF-init the reader once; reuse across commands (start
         the engine at launch, not lazily per action)."""
         if self.card is None:
             self.card = X7Card()
@@ -153,12 +153,19 @@ class Daemon:
                 "resp": (hx(resp) if resp else None)}
 
     def write_mfd(self, p):
-        """params: blocks {blk: hex16}, keys {sector:[kt,key]}, trailers, uid."""
+        """params: blocks {blk: hex16}, keys {sector:[kt,key]}, trailers, uid,
+        target_uid (optional). target_uid pins the write to the exact card the UI
+        showed the user: if a different card is on the reader by the time we acquire
+        it, we refuse rather than clone onto a card whose uid was never displayed."""
         c = self._open()
         i = c.wait_for_card()
         if not i:
             return {"present": False}
         target = i["uid"]                      # the card we committed to writing
+        expected = (p.get("target_uid") or "").replace(" ", "").lower()
+        if expected and hx(target).replace(" ", "").lower() != expected:
+            return {"present": True, "wrote": 0, "failed": [],
+                    "error": "the card on the reader is not the target shown"}
         # Validate block payloads up front: a block that is not exactly 16 bytes is
         # never sent to the card (write_block would assert mid-card, half-writing
         # it); record it as failed so the caller still gets full accounting.
@@ -257,6 +264,10 @@ class Daemon:
         if not i:
             return {"present": False}
         target = i["uid"]                      # the card we committed to formatting
+        expected = (p.get("target_uid") or "").replace(" ", "").lower()
+        if expected and hx(target).replace(" ", "").lower() != expected:
+            return {"present": True, "formatted": 0, "failed": [],
+                    "error": "the card on the reader is not the one shown"}
         keys = {int(s): v for s, v in (p.get("keys") or {}).items()}
         zero = bytes(16)
         ok, fail, swapped = 0, [], False

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// The clone action as a native attached sheet (Codex r5: two-slot source ->
+/// The clone action as a native attached sheet: two-slot source ->
 /// target, not a tab). Data blocks copy by default; trailers (keys/access) and
 /// block 0 (the uid) are opt-in - block 0 is fenced as a guarded zone when on.
 struct CloneSheet: View {

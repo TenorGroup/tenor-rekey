@@ -47,6 +47,7 @@ struct WriteResult: Codable, Sendable {
     let present: Bool
     let wrote: Int?
     let failed: [Int]?
+    let error: String?      // set when the daemon aborted (wrong / swapped target card)
 }
 
 /// Result of a format (factory reset). `present` is false when no card.
@@ -54,6 +55,7 @@ struct FormatResult: Codable, Sendable {
     let present: Bool
     let formatted: Int?
     let failed: [Int]?
+    let error: String?      // set when the daemon aborted (wrong / swapped target card)
 }
 
 /// Result of an NTAG / Ultralight (SAK 0x00) page dump.
