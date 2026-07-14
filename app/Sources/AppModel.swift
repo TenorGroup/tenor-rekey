@@ -17,6 +17,9 @@ final class AppModel {
     var selectedBlock: Int?             // selected absolute block, for the quick-look
     var decoding = false
     var decodeProgress: DecodeProgress?      // live sector / key-walk progress
+    /// A decode finished but recovered NO key: the card's keys are not in the
+    /// dictionary. Shown as an honest "no keys" result instead of a fake empty grid.
+    var noKeysFound = false
     private var decodeCancelled = false
     var lastError: String?
     var inspectorOpen = true
@@ -142,6 +145,7 @@ final class AppModel {
     private func clearCardBound() {
         cloneResults = [:]
         pages = []
+        noKeysFound = false
     }
 
     /// Drop the working document entirely (the source tag's clear button): the image,
@@ -149,7 +153,7 @@ final class AppModel {
     func clearDocument() {
         withAnimation(.easeInOut(duration: 0.3)) {
             source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
-            cloneResults = [:]
+            cloneResults = [:]; noKeysFound = false
         }
     }
 
@@ -179,6 +183,7 @@ final class AppModel {
         // leave the previous image's header sitting over a half-filled grid.
         withAnimation(.easeInOut(duration: 0.3)) {
             source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
+            noKeysFound = false
         }
         do {
             if card?.isNTAG == true {
@@ -198,6 +203,15 @@ final class AppModel {
                 if let startUID, Self.normUID(r.uid) != Self.normUID(startUID) {
                     lastError = "card changed during decode"
                     withAnimation(.easeInOut(duration: 0.3)) { sectors = []; source = nil }
+                } else if r.recovered == 0 {
+                    // No key in the dictionary within the scan budget. Never turn an
+                    // all-unread card into a clone-ready document (its blocks would be
+                    // zeros); show an honest "no keys" result pointing at recovery.
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
+                        sectors = []; pages = []; selected = nil; source = nil
+                        noKeysFound = true
+                    }
                 } else {
                     let vms = Self.buildSectors(r)
                     let dump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
@@ -233,23 +247,25 @@ final class AppModel {
     }
 
     /// Fold a decode progress event into `decodeProgress`. The daemon emits a
-    /// sector-boundary event (carries `total` = sector count) and a key-walk event
-    /// (carries keys_tried / keys_total) as it searches a sector's key.
+    /// sector-boundary event (carries `total` = sector count) and a dictionary-walk
+    /// event (carries attempts / budget) as it searches a sector's key.
     private func applyDecodeEvent(_ ev: EngineEvent) {
         guard decoding, let s = ev.sector else { return }
         let fallbackTotal = card?.sak.map { sectorsForSak($0) } ?? 16
-        var p = decodeProgress ?? DecodeProgress(sector: 0, total: fallbackTotal, keysTried: nil, keysTotal: nil)
+        var p = decodeProgress ?? DecodeProgress(sector: 0, total: fallbackTotal, attempts: nil, budget: nil)
         p.sector = s
-        if let t = ev.total { p.total = t; p.keysTried = nil; p.keysTotal = nil }
-        if let kt = ev.keys_total { p.keysTotal = kt; p.keysTried = ev.keys_tried }
+        // `attempts` is the scan's GLOBAL, monotonic auth counter, so keep it across
+        // sector boundaries - the status line then only ever moves forward.
+        if let t = ev.total { p.total = t }
+        if let a = ev.attempts { p.attempts = a; p.budget = ev.budget }
         decodeProgress = p
 
         // per-sector live tile state
         guard sectors.indices.contains(s) else { return }
-        if ev.keys_total != nil {                         // key-walk event: this sector is searching
+        if ev.attempts != nil {                           // walk event: this sector is searching
             sectors[s].status = .searching
-            sectors[s].searchTried = ev.keys_tried
-            sectors[s].searchTotal = ev.keys_total
+            sectors[s].searchTried = ev.attempts
+            sectors[s].searchTotal = ev.budget
         } else if ev.total != nil {                       // sector boundary: this sector is done
             sectors[s].searchTried = nil
             sectors[s].searchTotal = nil

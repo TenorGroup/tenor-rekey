@@ -193,7 +193,7 @@ private struct ActionBar: View {
             Spacer()
             if model.decoding {
                 if let p = model.decodeProgress {
-                    Text("\(l.t("sector")) \(min(p.sector + 1, p.total))/\(p.total)")
+                    Text(decodeStatusLine(p, l))
                         .font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
                 } else {
                     ProgressView().controlSize(.small)
@@ -287,6 +287,12 @@ private struct CanvasView: View {
                 Rectangle().fill(theme.p.hairline).frame(height: 1)
                 ReaderHint()
                 if !model.pages.isEmpty { PageTable() } else { SectorGrid() }
+            } else if model.noKeysFound, let c = model.card {
+                // Decoded, but no key was in the dictionary: an honest result, not a
+                // fake empty grid the user could clone.
+                CardHeader(card: c)
+                Rectangle().fill(theme.p.hairline).frame(height: 1)
+                NoKeysState()
             } else if let c = model.card {
                 // A card is on the reader and nothing is decoded yet: offer to read it.
                 CardHeader(card: c)
@@ -390,11 +396,13 @@ private struct PreDecode: View {
         VStack(spacing: 14) {
             Spacer()
             if model.decoding {
+                // An indeterminate bar + an honest, always-forward status line (sector
+                // while resolving common keys, auth-attempt count once the dictionary
+                // walk starts). No determinate bar, so nothing can jump backward.
+                ProgressView().controlSize(.small)
                 if let p = model.decodeProgress {
-                    ProgressView(value: p.fraction).frame(width: 230).tint(theme.p.accent)
-                    Text(progressText(p)).font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
+                    Text(decodeStatusLine(p, l)).font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
                 } else {
-                    ProgressView().controlSize(.small)
                     Text(l.t("decoding")).font(l.sans(12)).foregroundStyle(theme.p.textSecondary)
                 }
                 Button(l.t("cancel")) { Task { await model.cancelDecode() } }
@@ -411,13 +419,38 @@ private struct PreDecode: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+}
 
-    private func progressText(_ p: DecodeProgress) -> String {
-        var s = "\(l.t("sector")) \(min(p.sector + 1, p.total))/\(p.total)"
-        if let kt = p.keysTotal, let tried = p.keysTried {
-            s += "  ·  \(l.t("trying_keys")) \(tried)/\(kt)"
+/// One live status line for a running decode. While a card resolves via key reuse
+/// there is no walk to report (just the sector); once the dictionary walk starts it
+/// reports honest auth-attempt counts against the budget, so it never looks frozen.
+@MainActor
+func decodeStatusLine(_ p: DecodeProgress, _ l: L10n) -> String {
+    if let a = p.attempts, let b = p.budget {
+        return "\(l.t("trying_keys")) \(a)/\(b)"
+    }
+    return "\(l.t("sector")) \(min(p.sector + 1, p.total))/\(p.total)"
+}
+
+/// Shown when a decode found no key in the dictionary: an honest dead-end with the
+/// real next step (key recovery), not a blank grid that looks clone-ready.
+private struct NoKeysState: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "key.slash").font(.system(size: 22)).foregroundStyle(theme.p.textTertiary)
+            Text(l.t("no_keys_title")).font(l.sans(13, .medium)).foregroundStyle(theme.p.textPrimary)
+            Text(l.t("no_keys_msg")).font(l.sans(11)).foregroundStyle(theme.p.textSecondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 380).fixedSize(horizontal: false, vertical: true)
+            Button { Task { await model.decode() } } label: {
+                Text(l.t("decode_card")).font(l.sans(12))
+            }.buttonStyle(.bordered).tint(theme.p.accent).padding(.top, 4)
+            Spacer()
         }
-        return s
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

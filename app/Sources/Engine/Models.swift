@@ -36,6 +36,8 @@ struct DecodeResult: Codable, Equatable {
     let sak: Int
     let sectors: Int
     let recovered: Int
+    let attempts: Int?                  // auth attempts the scan spent
+    let exhausted: Bool?               // true if the scan budget ran out before a full search
     let blocks: [String: String?]      // block index -> hex, or null if unreadable
     let keys: [String: [String]?]      // sector -> [keytype, keyhex], or null
 }
@@ -104,9 +106,9 @@ struct EngineEvent: Decodable, Sendable {
     let total: Int?
     let keytype: String?
     let key: String?          // decode: the key found for `sector` (nil = not found)
-    let phase: String?
-    let keys_tried: Int?      // decode: keys walked so far on the current sector
-    let keys_total: Int?      // decode: dictionary size for that walk
+    let phase: String?        // decode walk phase: "hot" (common/hotel) or "dict"
+    let attempts: Int?        // decode: auth attempts spent so far in the scan
+    let budget: Int?          // decode: the scan's attempt budget
 }
 
 /// How a sector's key was obtained - drives the provenance dot.
@@ -131,14 +133,17 @@ enum KeyProvenance: Equatable {
 struct DecodeProgress: Equatable {
     var sector: Int
     var total: Int
-    var keysTried: Int?
-    var keysTotal: Int?
+    var attempts: Int?      // auth attempts spent walking the dictionary (this scan)
+    var budget: Int?        // the scan's attempt budget
 
-    /// 0...1 overall: completed sectors plus the current sector's key-walk fraction.
+    /// 0...1 for the progress bar. A normal card resolves via key reuse almost
+    /// instantly (no walk), so we show sector progress; once the dictionary walk
+    /// starts reporting attempts (a hard / unknown card), the budget is the honest
+    /// measure of how far the scan has gone.
     var fraction: Double {
+        if let a = attempts, let b = budget, b > 0 { return min(1, Double(a) / Double(b)) }
         guard total > 0 else { return 0 }
-        let within = (keysTotal ?? 0) > 0 ? Double(keysTried ?? 0) / Double(keysTotal!) : 0
-        return min(1, (Double(sector) + within) / Double(total))
+        return min(1, Double(sector) / Double(total))
     }
 }
 

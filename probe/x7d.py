@@ -19,7 +19,8 @@ import sys
 import json
 from x7 import X7, hx
 from x7lib import (X7Card, trailer_block, first_block, sector_count, card_kind,
-                   access_bits_valid, trailer_locks_keys, DEFAULT_KEYS, BUILTIN_KEYS)
+                   access_bits_valid, trailer_locks_keys, DEFAULT_KEYS, BUILTIN_KEYS,
+                   DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_SECONDS)
 
 
 def _valid_key_hex(k):
@@ -116,22 +117,27 @@ class Daemon:
         user = p.get("user_keys") or p.get("keys") or []
         uset = set(user)
         keys = list(user) + [k for k in BUILTIN_KEYS if k not in uset]
+        # Scan budget (an unknown card fails fast); an "extended scan" can raise these.
+        max_attempts = int(p.get("max_attempts") or DEFAULT_SCAN_ATTEMPTS)
+        max_seconds = int(p.get("max_seconds") or DEFAULT_SCAN_SECONDS)
 
         def prog(s, n, f):
             self.emit({"event": "progress", "method": "decode", "sector": s,
                        "total": n, "keytype": (f[0] if f else None),
                        "key": (f[1] if f else None)})
 
-        def on_try(s, i, n):
+        def on_try(s, attempts, phase):
             self.emit({"event": "progress", "method": "decode", "sector": s,
-                       "total": None, "keys_tried": i, "keys_total": n})
-        d = c.dump(keys=keys, user_keys=list(user), progress=prog, on_try=on_try)
+                       "total": None, "attempts": attempts, "budget": max_attempts,
+                       "phase": phase})
+        d = c.dump(keys=keys, progress=prog, on_try=on_try,
+                   max_attempts=max_attempts, max_seconds=max_seconds)
         blocks = {str(b): (hx(v) if v else None) for b, v in d["blocks"].items()}
-        keys = {str(s): ([k[0], k[1]] if k else None) for s, k in d["keys"].items()}
+        keys_out = {str(s): ([k[0], k[1]] if k else None) for s, k in d["keys"].items()}
         return {"uid": hx(d["uid"]), "atqa": hx(d["atqa"]), "sak": d["sak"],
-                "sectors": d["sectors"],
-                "recovered": sum(1 for k in d["keys"].values() if k),
-                "blocks": blocks, "keys": keys}
+                "sectors": d["sectors"], "recovered": d["recovered"],
+                "attempts": d["attempts"], "exhausted": d["exhausted"],
+                "blocks": blocks, "keys": keys_out}
 
     def read_ntag(self, p):
         """Dump an NTAG21x / Ultralight (SAK 0x00) as 4-byte pages."""

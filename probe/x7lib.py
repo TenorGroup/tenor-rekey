@@ -10,8 +10,50 @@ MIFARE ops use standard PN532 InDataExchange (verified working on this firmware)
   write : D4 40 01 A0 <block> <data16>
 """
 import os
+import time
 from x7 import X7, hx
 from x7_init import INIT_SEQ
+
+# Automatic scan budget: an unknown card (keys not in the dictionary) must fail
+# FAST, not grind the whole list for ~15 minutes. With the hotel-first dictionary
+# every labelled brand key is in the first few hundred entries, so ~3500 attempts /
+# 90 s comfortably covers the hotel + common + frequency-ranked keys while stopping
+# a hopeless walk quickly. Reuse of a key already proven on the card is done OUTSIDE
+# this budget (it is cheap and always worth trying). The caller then offers recovery.
+DEFAULT_SCAN_ATTEMPTS = 3500
+DEFAULT_SCAN_SECONDS = 90
+
+# How many of the dictionary's front keys (common defaults + hotel/vendor brands,
+# since the dict is hotel-first) are tried on EVERY sector for free, outside the
+# budget. This guarantees each sector a common-key probe so a single hard sector
+# can never starve the others, at a bounded cost (~HOT_KEYS_N*2 auths/sector).
+HOT_KEYS_N = 24
+
+
+class _Budget:
+    """Caps the automatic dictionary walk by auth attempts AND wall-clock."""
+    def __init__(self, max_attempts=DEFAULT_SCAN_ATTEMPTS, max_seconds=DEFAULT_SCAN_SECONDS):
+        self.max_attempts = max_attempts
+        self.attempts = 0
+        self._start = time.monotonic()
+        self._deadline = self._start + max_seconds
+        self._last_emit = 0.0
+
+    def tick(self):
+        self.attempts += 1
+
+    def expired(self):
+        return self.attempts >= self.max_attempts or time.monotonic() >= self._deadline
+
+    def elapsed(self):
+        return time.monotonic() - self._start
+
+    def should_emit(self):
+        now = time.monotonic()
+        if now - self._last_emit >= 0.25:      # throttle progress to ~4x/second
+            self._last_emit = now
+            return True
+        return False
 
 # Well-known MIFARE Classic keys (proxmark/mfoc dictionary) + ones recovered here.
 # Ordered so the most common (FF, then this deployment's key) hit first. This is
@@ -195,57 +237,72 @@ class X7Card:
         r = self._pt([0xD4, 0x40, 0x01, 0xA0, block] + list(data16))
         return len(r) >= 3 and r[1] == 0x41 and r[2] == 0x00
 
-    def find_key(self, block, keys=DEFAULT_KEYS, on_try=None):
+    def find_key(self, block, keys=DEFAULT_KEYS, budget=None, on_progress=None):
         """Return (keytype, keyhex) that authenticates `block`, or None.
 
-        Mirrors nfcPro's captured fast cycle so a dictionary walk runs at its
-        speed (~26 ms/key, measured): each attempt is _select() (d4 4e) + auth()
-        (d4 40) on a short timeout; a failed auth halts the card, so a re-poll
-        (d4 4a) re-selects it for the next attempt.
+        Mirrors nfcPro's captured fast cycle so a dictionary walk runs at its speed
+        (~26 ms/auth, measured): each attempt is _select() (d4 4e) + auth() (d4 40)
+        on a short timeout; a failed auth halts the card, so a re-poll (d4 4a)
+        re-selects it. The common head (FAST_HEAD keys) is tried as BOTH KeyA and
+        KeyB so a KeyB-only card is caught early; the tail is swept as KeyA then KeyB,
+        KeyA preferred throughout.
 
-        ONE auth per key, structured so the common cases stay at ~26 ms/key while
-        a KeyB-readable card is not lost:
-          1. the common head of the dictionary (FAST_HEAD keys) is tried as BOTH
-             KeyA and KeyB - so a card opened only by a common KeyB (e.g. KeyB=FF,
-             secret KeyA) is caught at once instead of after a full KeyA sweep;
-          2. the rest of the dictionary is swept as KeyA, then as KeyB.
-        KeyA is preferred (tried first within each head pair, and the whole A sweep
-        precedes the B sweep). `on_try` reports progress across the KeyA coverage
-        (head + A sweep) so the bar advances monotonically and never resets."""
+        `budget` (a _Budget) caps total auth attempts / wall-clock: once it is spent
+        find_key stops and returns None, so an unknown card fails fast instead of
+        walking the whole dictionary. Pass budget=None for the cheap reuse of keys
+        already proven on the card (always worth trying). `on_progress(attempts,
+        phase)` streams live progress (throttled) so the UI never looks frozen."""
         if not self.poll() and not self.wait_for_card():
             return None
         n = len(keys)
         head = min(n, FAST_HEAD)
-        for i in range(head):                          # phase 1: common head, A and B
-            k = keys[i]
+
+        def attempt(k, kt, phase):
+            # returns True (found), False (miss), or "stop" (budget spent)
+            if budget is not None:
+                if budget.expired():
+                    return "stop"
+                budget.tick()
+                if on_progress is not None and budget.should_emit():
+                    on_progress(budget.attempts, phase)
+            self._select()
+            if self.auth(block, k, kt, to=FAST_TO):
+                return True
+            self.poll()                                # re-select after the failed auth
+            return False
+
+        for i in range(head):                          # common head, A and B
             for kt in ("A", "B"):
-                self._select()
-                if self.auth(block, k, kt, to=FAST_TO):
-                    return (kt, k)
-                self.poll()
+                r = attempt(keys[i], kt, "hot")
+                if r == "stop":
+                    return None
+                if r:
+                    return (kt, keys[i])
         tail = keys[head:]
-        for kt in ("A", "B"):                          # phase 2/3: tail as A, then B
-            for i, k in enumerate(tail):
-                if on_try is not None and kt == "A" and (head + i) % 256 == 0:
-                    on_try(head + i, n)
-                self._select()
-                if self.auth(block, k, kt, to=FAST_TO):
+        for kt in ("A", "B"):                          # tail as A, then B
+            for k in tail:
+                r = attempt(k, kt, "dict")
+                if r == "stop":
+                    return None
+                if r:
                     return (kt, k)
-                self.poll()                            # re-select after the failed auth
         return None
 
-    def dump(self, keys=None, user_keys=None, progress=None, on_try=None):
-        """Dump the whole card. Returns dict: blocks{n:16B}, keys{sector:(kt,key)}, sak, uid.
+    def dump(self, keys=None, progress=None, on_try=None,
+             max_attempts=DEFAULT_SCAN_ATTEMPTS, max_seconds=DEFAULT_SCAN_SECONDS):
+        """Dump the whole card. Returns blocks/keys/sak/uid + recovered count.
 
-        Key REUSE: a key proven on one sector is tried first on the rest (MIFARE
-        deployments reuse keys), so a normal card resolves in a handful of auths
-        regardless of dictionary size; the full dict is only walked on a sector
-        whose key is genuinely unknown.
+        `keys` is the ranked dictionary (the daemon puts the user's keys first, then
+        the hotel-first built-in list). SINGLE pass with key REUSE: for each sector,
+        first retry the keys already proven on this card (cheap, unbounded), then walk
+        the dictionary within a GLOBAL budget. The moment a key is proven it is tried
+        FIRST on every later sector, so a uniform card resolves in a handful of auths.
 
-        Search order: first try user and common keys card-wide, then deep-sweep
-        unresolved sectors until the first full miss. A proven key is promoted for
-        reuse on later sectors. When nothing is recovered the caller can offer
-        nested recovery."""
+        The budget (max_attempts / max_seconds, shared across all sectors) caps the
+        dictionary walk so a card whose keys are NOT in the dictionary fails in ~90 s
+        instead of grinding ~15 minutes; the caller then offers key recovery. Reuse
+        is never budget-capped, so a later sector sharing a proven key is always
+        recovered. `on_try(sector, attempts, phase)` streams live progress."""
         if keys is None:
             keys = BUILTIN_KEYS
         info = self.wait_for_card()
@@ -255,12 +312,7 @@ class X7Card:
         nsec = sector_count(info["sak"])
         blocks, skeys = {}, {}
         found_keys, found_set = [], set()      # proven on THIS card, tried first
-
-        fast_keys, fast_seen = [], set()
-        for k in list(user_keys or []) + list(DEFAULT_KEYS):
-            if k not in fast_seen:
-                fast_seen.add(k)
-                fast_keys.append(k)
+        budget = _Budget(max_attempts, max_seconds)
 
         def read_sector(s, found):
             tb = trailer_block(s)
@@ -308,49 +360,58 @@ class X7Card:
                         t[0:6] = kb
                 blocks[tb] = bytes(t)
 
-        # Pass 1: try only user and common keys across the whole card.
+        def resolve(s, found):
+            skeys[s] = found
+            if found:
+                read_sector(s, found)
+
+        # PASS A - cheap, NEVER budget-capped: on every sector try the keys already
+        # proven on this card, then the small hot set (the dictionary's front: common
+        # defaults + hotel/vendor brands). This guarantees each sector a common-key
+        # probe, so one hard sector can never starve the others of an easy key, and a
+        # uniform card resolves entirely here (sector 0 finds the key, the rest reuse).
+        hot = keys[:HOT_KEYS_N]
         for s in range(nsec):
             self.poll()
             if self.uid != target:
                 raise RuntimeError("card changed during decode")
-            trial = found_keys + [k for k in fast_keys if k not in found_set]
-            found = self.find_key(
-                trailer_block(s), trial,
-                on_try=(lambda i, n, s=s: on_try(s, i, n)) if on_try else None)
-            if found:
-                skeys[s] = found
-                read_sector(s, found)
+            found = None
+            if found_keys:
+                found = self.find_key(trailer_block(s), list(found_keys), budget=None)
+            if found is None:
+                found = self.find_key(trailer_block(s), hot, budget=None)
+            if found:                                          # only report resolved here;
+                resolve(s, found)                              # the rest are handled in pass B
                 if progress:
                     progress(s, nsec, found)
 
-        # Pass 2: deep-sweep unresolved sectors until the first full dictionary
-        # miss. After that miss the card's keys are almost certainly proprietary,
-        # so we stop the expensive deep sweeps - but still retry keys ALREADY
-        # proven on this card (cheap reuse), so a later sector that shares a deep
-        # key with an earlier one is not silently dropped.
-        dict_exhausted = False
+        # PASS B - the budgeted dictionary walk, only on sectors pass A left open.
+        # Reuse is retried first (a walk hit on one sector can open a later one); the
+        # deep walk skips the hot prefix (already tried) and shares the global budget,
+        # so an unknown card spends it once, not per sector.
+        deep = keys[HOT_KEYS_N:]
         for s in range(nsec):
             if s in skeys:
                 continue
             self.poll()
             if self.uid != target:
                 raise RuntimeError("card changed during decode")
-            if not dict_exhausted:
-                trial = found_keys + [k for k in keys if k not in found_set]
+            found = None
+            if found_keys:
+                found = self.find_key(trailer_block(s), list(found_keys), budget=None)
+            if found is None and not budget.expired():
+                trial = [k for k in deep if k not in found_set]
                 found = self.find_key(
-                    trailer_block(s), trial,
-                    on_try=(lambda i, n, s=s: on_try(s, i, n)) if on_try else None)
-                if not found:
-                    dict_exhausted = True     # deep trial already tried reuse first
-            else:
-                found = self.find_key(trailer_block(s), found_keys) if found_keys else None
-            if found:
-                read_sector(s, found)
-            skeys[s] = found
+                    trailer_block(s), trial, budget=budget,
+                    on_progress=(lambda attempts, phase, s=s: on_try(s, attempts, phase)) if on_try else None)
+            resolve(s, found)
             if progress:
                 progress(s, nsec, found)
+        recovered = sum(1 for v in skeys.values() if v)
         return {"uid": info["uid"], "sak": info["sak"], "atqa": info["atqa"],
-                "blocks": blocks, "keys": skeys, "sectors": nsec}
+                "blocks": blocks, "keys": skeys, "sectors": nsec,
+                "recovered": recovered, "attempts": budget.attempts,
+                "budget": budget.max_attempts, "exhausted": budget.expired()}
 
     def read_ntag(self, max_pages=240):
         """Dump an NTAG21x / Ultralight (SAK 0x00). Returns dict page->4 bytes.

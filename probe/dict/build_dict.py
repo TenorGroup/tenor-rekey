@@ -3,9 +3,12 @@
 
 Merges the curated public dictionaries (Proxmark3 Iceman, MifareClassicTool,
 nbox aggregate, Flipper Unleashed), dedups + validates to 12-hex lowercase, and
-ORDERS them so common + hotel keys are tried first: universal defaults, then the
-hotel/access-control block (incl. the Vietnam BETECH/TESA keys this vendor
-meets), then frequency-ranked keys, then the long tail. Re-run to refresh:
+ORDERS them HOTEL-FIRST so a hotel card's brand key is found in the first few
+hundred attempts, not deep in the list: universal defaults, then the hotel/access
+block (incl. the Vietnam BETECH/TESA keys this vendor meets), then frequency-ranked
+keys, then the curated remainder, then the device-capture tail (nfcPro's own walked
+dictionary from one deployment, merged from ../re/nfcpro_keys.txt if present and
+deliberately ranked LAST). Re-run to refresh:
 
     python3 probe/dict/build_dict.py
 
@@ -89,7 +92,22 @@ def main():
             if k not in fseen:
                 fseen.add(k); freq_order.append(k)
 
-    # Ordered output: defaults, hotel, freq-ranked (that exist), then the tail.
+    # Optional device-capture tail: keys captured from nfcPro on one deployment
+    # (probe/../re/nfcpro_keys.txt, gitignored). These are nfcPro's own walked
+    # dictionary, NOT evidence of card prevalence, so they go LAST - a hotel card's
+    # brand key must not sit behind ~13k capture entries (the bug this fixes). Only
+    # merged if the file is present locally.
+    capture = []
+    cap_path = HERE.parent.parent / "re" / "nfcpro_keys.txt"
+    if cap_path.exists():
+        for k in keys_in(cap_path.read_text("utf-8", "replace")):
+            if k not in seen:
+                seen.add(k)
+            capture.append(k)
+
+    # Ordered output: HOTEL-FIRST so a hotel card resolves in the first few hundred
+    # attempts. defaults, full hotel/vendor block, freq-ranked, curated remainder,
+    # then the device-capture tail.
     ordered, used = [], set()
 
     def take(keys):
@@ -104,7 +122,8 @@ def main():
     take(DEFAULTS)                                    # universal defaults, hot path
     take(HOTEL)                                       # hotel/access (incl. VN BETECH/TESA)
     take(freq_order)                                  # frequency-ranked common
-    take(universe)                                    # everything else
+    take(universe)                                    # remaining curated public keys
+    take(capture)                                     # device-capture tail (deprioritised)
 
     header = (
         "# tenor/rekey bundled MIFARE Classic key dictionary\n"
