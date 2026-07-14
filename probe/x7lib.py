@@ -14,26 +14,30 @@ import time
 from x7 import X7, hx
 from x7_init import INIT_SEQ
 
-# Automatic scan budget: an unknown card (keys not in the dictionary) must fail
-# FAST, not grind the whole list for ~15 minutes. With the hotel-first dictionary
-# every labelled brand key is in the first few hundred entries, so ~3500 attempts /
-# 90 s comfortably covers the hotel + common + frequency-ranked keys while stopping
-# a hopeless walk quickly. Reuse of a key already proven on the card is done OUTSIDE
-# this budget (it is cheap and always worth trying). The caller then offers recovery.
-DEFAULT_SCAN_ATTEMPTS = 3500
-DEFAULT_SCAN_SECONDS = 90
+# The dictionary walk runs to EXHAUSTION per unresolved sector: a sector is declared
+# "no key" only after every applicable candidate has been tried (KeyA and KeyB), not
+# after a fixed attempt count. A repeat card whose real key sits DEEP in the (~4.5k
+# key) dictionary must still be found. What keeps this fast is key-reuse (a key proven
+# on one sector is tried first on every other) and good ordering, not truncation.
+#
+# The only stop other than exhaustion is a generous WALL-CLOCK watchdog: a runaway
+# guard for a stuck reader, NOT a "key absent" signal. If it fires, dump returns
+# whatever was recovered so far. The user cancel path (daemon kill) is separate.
+DEFAULT_SCAN_SECONDS = 600
 
 # How many of the dictionary's front keys (common defaults + hotel/vendor brands,
-# since the dict is hotel-first) are tried on EVERY sector for free, outside the
-# budget. This guarantees each sector a common-key probe so a single hard sector
-# can never starve the others, at a bounded cost (~HOT_KEYS_N*2 auths/sector).
+# since the dict is hotel-first) are tried on EVERY sector in the cheap first pass.
+# This guarantees each sector a common-key probe so a single hard sector can never
+# starve the others, at a bounded cost (~HOT_KEYS_N*2 auths/sector).
 HOT_KEYS_N = 24
 
 
 class _Budget:
-    """Caps the automatic dictionary walk by auth attempts AND wall-clock."""
-    def __init__(self, max_attempts=DEFAULT_SCAN_ATTEMPTS, max_seconds=DEFAULT_SCAN_SECONDS):
-        self.max_attempts = max_attempts
+    """Wall-clock runaway watchdog + auth counter + progress throttle for the
+    dictionary walk. There is NO attempt cap: the walk runs to dictionary exhaustion
+    per sector. `expired()` fires only when the walk has been running past max_seconds
+    (a stuck reader), never as a 'key absent' signal; dump then returns partial."""
+    def __init__(self, max_seconds=DEFAULT_SCAN_SECONDS):
         self.attempts = 0
         self._start = time.monotonic()
         self._deadline = self._start + max_seconds
@@ -43,7 +47,7 @@ class _Budget:
         self.attempts += 1
 
     def expired(self):
-        return self.attempts >= self.max_attempts or time.monotonic() >= self._deadline
+        return time.monotonic() >= self._deadline
 
     def elapsed(self):
         return time.monotonic() - self._start
@@ -247,11 +251,12 @@ class X7Card:
         KeyB so a KeyB-only card is caught early; the tail is swept as KeyA then KeyB,
         KeyA preferred throughout.
 
-        `budget` (a _Budget) caps total auth attempts / wall-clock: once it is spent
-        find_key stops and returns None, so an unknown card fails fast instead of
-        walking the whole dictionary. Pass budget=None for the cheap reuse of keys
-        already proven on the card (always worth trying). `on_progress(attempts,
-        phase)` streams live progress (throttled) so the UI never looks frozen."""
+        `budget` (a _Budget) is the wall-clock watchdog: find_key ticks it per auth
+        and stops only if it expires (a runaway guard), so a walk normally runs to
+        dictionary exhaustion and a deep in-dict key is still found. Pass budget=None
+        for the cheap reuse of keys already proven on the card (always worth trying).
+        `on_progress(attempts, phase)` streams live progress (throttled) so the UI
+        never looks frozen."""
         if not self.poll() and not self.wait_for_card():
             return None
         n = len(keys)
@@ -289,20 +294,24 @@ class X7Card:
         return None
 
     def dump(self, keys=None, progress=None, on_try=None,
-             max_attempts=DEFAULT_SCAN_ATTEMPTS, max_seconds=DEFAULT_SCAN_SECONDS):
+             max_seconds=DEFAULT_SCAN_SECONDS):
         """Dump the whole card. Returns blocks/keys/sak/uid + recovered count.
 
         `keys` is the ranked dictionary (the daemon puts the user's keys first, then
-        the hotel-first built-in list). SINGLE pass with key REUSE: for each sector,
-        first retry the keys already proven on this card (cheap, unbounded), then walk
-        the dictionary within a GLOBAL budget. The moment a key is proven it is tried
-        FIRST on every later sector, so a uniform card resolves in a handful of auths.
+        the hotel-first built-in list). Two passes with key REUSE. Pass A (cheap): on
+        every sector retry the keys already proven on this card, then the small hot
+        set. Pass B (deep): for each sector pass A left open, retry reuse, then walk
+        the REST of the dictionary to EXHAUSTION - every unresolved sector gets its
+        full walk, so a deep in-dict key is found even if an earlier sector was a
+        genuine miss. The moment a key is proven it is tried FIRST on every later
+        sector, so a uniform card resolves in a handful of auths.
 
-        The budget (max_attempts / max_seconds, shared across all sectors) caps the
-        dictionary walk so a card whose keys are NOT in the dictionary fails in ~90 s
-        instead of grinding ~15 minutes; the caller then offers key recovery. Reuse
-        is never budget-capped, so a later sector sharing a proven key is always
-        recovered. `on_try(sector, attempts, phase)` streams live progress."""
+        The only non-exhaustion stop is the wall-clock watchdog (max_seconds): a
+        runaway guard for a stuck reader, not a "key absent" signal. If it fires,
+        dump returns whatever was recovered so far. Reuse is never watchdog-gated.
+        `on_try(sector, attempts, walk_total, phase)` streams live progress, where
+        walk_total is the ADAPTIVE remaining-work estimate (unresolved sectors *
+        candidate count) that shrinks as sectors resolve."""
         if keys is None:
             keys = BUILTIN_KEYS
         info = self.wait_for_card()
@@ -312,7 +321,7 @@ class X7Card:
         nsec = sector_count(info["sak"])
         blocks, skeys = {}, {}
         found_keys, found_set = [], set()      # proven on THIS card, tried first
-        budget = _Budget(max_attempts, max_seconds)
+        budget = _Budget(max_seconds)
 
         def read_sector(s, found):
             tb = trailer_block(s)
@@ -385,10 +394,12 @@ class X7Card:
                 if progress:
                     progress(s, nsec, found)
 
-        # PASS B - the budgeted dictionary walk, only on sectors pass A left open.
-        # Reuse is retried first (a walk hit on one sector can open a later one); the
-        # deep walk skips the hot prefix (already tried) and shares the global budget,
-        # so an unknown card spends it once, not per sector.
+        # PASS B - the deep dictionary walk, only on sectors pass A left open. Reuse
+        # is retried first (a walk hit on one sector can open a later one); the deep
+        # walk skips the hot prefix (already tried) and runs to EXHAUSTION for every
+        # unresolved sector - no early-exit on a full miss, so the Nth sector's deep
+        # key is found even when an earlier sector had none. Only the wall-clock
+        # watchdog (a stuck reader) stops the loop early, returning partial.
         deep = keys[HOT_KEYS_N:]
         for s in range(nsec):
             if s in skeys:
@@ -401,9 +412,15 @@ class X7Card:
                 found = self.find_key(trailer_block(s), list(found_keys), budget=None)
             if found is None and not budget.expired():
                 trial = [k for k in deep if k not in found_set]
+                # Adaptive remaining-work total: unresolved sectors (this one included,
+                # it is not in skeys yet) times the candidate count. It SHRINKS as
+                # sectors resolve, so the UI shows an honest "attempts / walk_total".
+                remaining = sum(1 for i in range(nsec) if i not in skeys)
+                walk_total = remaining * len(trial)
                 found = self.find_key(
                     trailer_block(s), trial, budget=budget,
-                    on_progress=(lambda attempts, phase, s=s: on_try(s, attempts, phase)) if on_try else None)
+                    on_progress=(lambda attempts, phase, s=s, wt=walk_total:
+                                 on_try(s, attempts, wt, phase)) if on_try else None)
             resolve(s, found)
             if progress:
                 progress(s, nsec, found)
@@ -411,7 +428,7 @@ class X7Card:
         return {"uid": info["uid"], "sak": info["sak"], "atqa": info["atqa"],
                 "blocks": blocks, "keys": skeys, "sectors": nsec,
                 "recovered": recovered, "attempts": budget.attempts,
-                "budget": budget.max_attempts, "exhausted": budget.expired()}
+                "exhausted": budget.expired()}
 
     def read_ntag(self, max_pages=240):
         """Dump an NTAG21x / Ultralight (SAK 0x00). Returns dict page->4 bytes.
@@ -496,26 +513,29 @@ class X7Card:
             return status, body
         return None, b""
 
-    # CIU register addresses for the parity/bit-framing control the nested attack
-    # needs. The base addresses (0x63xx) are confirmed by the capture; the SPECIFIC
-    # parity-disable bit location is the one thing NOT exercised by the dictionary
-    # capture and MUST be confirmed live (see PARITY note below).
-    CIU_MFRX = 0x6312        # MfRxReg on PN53x: bit0 ParityDisable (LIVE-PROBE)
-    CIU_BITFRAMING = 0x633D  # TxLastBits[2:0], RxAlign[6:4] (confirmed in capture)
-    CIU_COLL = 0x633E        # CollReg (confirmed in capture)
-    CIU_FIFOLEVEL = 0x633C   # FIFOLevel (confirmed in capture)
-    CIU_ERROR = 0x6306       # ErrorReg: ParityErr bit (read after transceive)
+    # CIU (PN53x/RC522) register addresses. CONFIRMED live against an nfcPro darkside
+    # crack USB capture (2026-07-14, card a7 04 e5 04) cross-checked with libnfc
+    # pn53x-internal.h. The earlier CIU_MFRX=0x6312 was WRONG (0x6312 is CRCResultLSB);
+    # parity control is ManualRCV 0x630D bit4.
+    CIU_MANUALRCV = 0x630D   # bit4 (0x10) = ParityDisable; nfcPro writes 0x10 to turn parity OFF
+    CIU_BITFRAMING = 0x633D  # TxLastBits[2:0]
+    CIU_CONTROL = 0x633C     # Control: RxLastBits[2:0] (== 4 for the darkside 4-bit NACK)
+    CIU_COLL = 0x633E        # CollReg
+    CIU_FIFOLEVEL = 0x633A   # FIFOLevel
+    CIU_ERROR = 0x6336       # ErrorReg: ParityErr bit
+    CIU_TXMODE = 0x6302      # TxMode: bit7 = TxCRCEn (clear for raw frames)
+    CIU_RXMODE = 0x6303      # RxMode: bit7 = RxCRCEn (clear for raw frames)
 
     def _set_parity_raw(self, raw):
-        """Disable (raw=True) or enable controller auto-parity, so software can
-        supply/observe parity bits. PN53x: MfRxReg bit0 = ParityDisable.
-        Returns True if the register write succeeded. LIVE-PROBE: confirm CIU_MFRX
-        is the right register on this emulated firmware before trusting nonces."""
-        v = self.reg_read(self.CIU_MFRX)
+        """Disable (raw=True) or enable the controller's automatic parity, so software
+        can supply/observe the parity bits a darkside attack needs. PN53x ManualRCV
+        0x630D bit4 (0x10): 1 = parity OFF. CONFIRMED live in the nfcPro darkside
+        capture (writes 0x10 to disable, 0x00 to re-enable). Returns True on success."""
+        v = self.reg_read(self.CIU_MANUALRCV)
         if v is None:
             return False
-        v = (v | 0x01) if raw else (v & ~0x01)
-        return self.reg_write(self.CIU_MFRX, v)
+        v = (v | 0x10) if raw else (v & ~0x10)
+        return self.reg_write(self.CIU_MANUALRCV, v)
 
     def collect_nested_nonce(self, known_blk, known_key, known_kt,
                              target_blk, target_kt="A"):
@@ -542,7 +562,7 @@ class X7Card:
             fails; fall back to doing the FIRST auth ALSO via raw InCommThru frames
             (full software crypto1 handshake).
         (b) PARITY RETRIEVAL: PN53x returns received parity only when ParityDisable
-            is set (CIU_MFRX) and you read it from the FIFO/CollReg. Confirm the
+            is set (CIU_MANUALRCV 0x630D bit4) and you read it from the FIFO/CollReg. Confirm the
             register address and that parity bytes actually appear.
         If parity cannot be read, the crack still works with more nonces (the
         keystream/cross-sample constraints carry it), so par may be returned None.

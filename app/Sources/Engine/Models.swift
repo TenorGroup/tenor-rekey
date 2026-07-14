@@ -107,8 +107,8 @@ struct EngineEvent: Decodable, Sendable {
     let keytype: String?
     let key: String?          // decode: the key found for `sector` (nil = not found)
     let phase: String?        // decode walk phase: "hot" (common/hotel) or "dict"
-    let attempts: Int?        // decode: auth attempts spent so far in the scan
-    let budget: Int?          // decode: the scan's attempt budget
+    let attempts: Int?        // decode: cumulative auth attempts spent in the walk
+    let walk_total: Int?      // decode: adaptive remaining-work estimate (shrinks)
 }
 
 /// How a sector's key was obtained - drives the provenance dot.
@@ -133,15 +133,15 @@ enum KeyProvenance: Equatable {
 struct DecodeProgress: Equatable {
     var sector: Int
     var total: Int
-    var attempts: Int?      // auth attempts spent walking the dictionary (this scan)
-    var budget: Int?        // the scan's attempt budget
+    var attempts: Int?      // cumulative auth attempts spent walking the dictionary
+    var walkTotal: Int?     // adaptive remaining-work estimate (unresolved * dict size)
 
-    /// 0...1 for the progress bar. A normal card resolves via key reuse almost
-    /// instantly (no walk), so we show sector progress; once the dictionary walk
-    /// starts reporting attempts (a hard / unknown card), the budget is the honest
-    /// measure of how far the scan has gone.
+    /// 0...1 fallback fraction. A normal card resolves via key reuse almost instantly
+    /// (no walk), so we show sector progress; once the walk starts reporting attempts
+    /// the ratio to the adaptive remaining-work total is a rough measure. The visible
+    /// decode bar stays indeterminate, so this never drives a jumpy determinate bar.
     var fraction: Double {
-        if let a = attempts, let b = budget, b > 0 { return min(1, Double(a) / Double(b)) }
+        if let a = attempts, let w = walkTotal, w > 0 { return min(1, Double(a) / Double(w)) }
         guard total > 0 else { return 0 }
         return min(1, Double(sector) / Double(total))
     }

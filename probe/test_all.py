@@ -2,7 +2,7 @@
 """Hardware-free regression suite for the X7 engine + daemon contract.
 
 Runs with NO reader attached: a FakeCard stands in for the hardware so the REAL
-x7lib logic (find_key sweep, dump key-reuse + early-exit, the x7d.py daemon
+x7lib logic (find_key sweep, dump key-reuse + exhaustive walk, the x7d.py daemon
 dispatch + write/format gating) is exercised end to end. Crypto + the _pt anchor
 have their own self-tests, invoked here too.
 
@@ -150,7 +150,7 @@ def test_find_key_sweep():
 
 
 # --------------------------------------------------------------------------
-# 2. dump: single-pass reuse + a global scan budget.
+# 2. dump: reuse-first, exhaustive (no attempt cap) walk.
 # --------------------------------------------------------------------------
 def test_dump_reuse_and_budget():
     BIG = ["%012x" % i for i in range(17000)]
@@ -165,12 +165,12 @@ def test_dump_reuse_and_budget():
     check("dump reports recovered / attempts / exhausted",
           all(k in d for k in ("recovered", "attempts", "exhausted")))
 
-    # all-unknown -> recovers nothing
+    # all-unknown -> recovers nothing (every sector gets a full walk, none hit).
     f = FakeCard(keymap={s: None for s in range(16)})
     d2 = f.dump(keys=BIG)
     check("unknown card recovers nothing", d2["recovered"] == 0)
 
-    # reuse ALWAYS runs (never budget-capped): a sector sharing a proven key is
+    # reuse ALWAYS runs (never watchdog-gated): a sector sharing a proven key is
     # recovered even when it sits after an unknown sector.
     km = {s: ("A", deep) for s in range(16)}; km[7] = None
     d3 = FakeCard(keymap=km).dump(keys=BIG)
@@ -178,10 +178,13 @@ def test_dump_reuse_and_budget():
           d3["recovered"] == 15, str(d3["recovered"]))
 
 
-def test_dump_budget_stops():
-    # With the REAL find_key (which ticks the budget on every auth), an unknown card
-    # must stop near the budget instead of walking the whole large dictionary.
-    BIG = ["%012x" % i for i in range(17000)]
+def test_dump_exhausts_deep_key():
+    # The walk now runs to dictionary EXHAUSTION per unresolved sector (no attempt
+    # cap). A uniform card whose key sits DEEP - index ~4000 of a ~4500-entry list,
+    # far past the old 3500 cap - must STILL be recovered. With the REAL find_key
+    # (which walks + ticks) only sector 0 pays the deep walk; sectors 1-15 reuse it.
+    BIG = ["%012x" % i for i in range(4500)]
+    deep = BIG[4000]                            # past the old fixed cap
 
     class Walk(FakeCard):
         def find_key(self, block, keys=DEFAULT_KEYS, budget=None, on_progress=None):
@@ -189,26 +192,20 @@ def test_dump_budget_stops():
         def auth(self, block, key, keytype="A", to=700):
             return FakeCard.auth(self, block, key, keytype, to)
 
-    c = Walk(keymap={s: None for s in range(16)})       # all unknown
-    d = c.dump(keys=BIG, max_attempts=500, max_seconds=999)
-    check("scan budget stops an unknown-card walk near the cap",
-          d["attempts"] <= 501 and d["exhausted"], "attempts=%d exhausted=%s" % (d["attempts"], d["exhausted"]))
-    check("budgeted unknown card recovers nothing", d["recovered"] == 0)
-
-    # a uniform card whose key sits early in the dictionary is found well within
-    # the budget (BIG[5] is in the paired head, tried as Key A almost immediately).
-    early = "%012x" % 5
-    c2 = Walk(keymap={s: ("A", early) for s in range(16)})
-    d2 = c2.dump(keys=BIG, max_attempts=500, max_seconds=999)
-    check("an early key is found without exhausting the budget",
-          d2["recovered"] == 16 and not d2["exhausted"], "attempts=%d" % d2["attempts"])
+    c = Walk(keymap={s: ("A", deep) for s in range(16)})
+    d = c.dump(keys=BIG, max_seconds=999)
+    check("a deep in-dict key past the old cap is still found (exhaustive walk)",
+          d["recovered"] == 16 and not d["exhausted"],
+          "recovered=%d exhausted=%s attempts=%d" % (d["recovered"], d["exhausted"], d["attempts"]))
+    check("the exhaustive walk really went past the old fixed cap",
+          d["attempts"] > 3500, "attempts=%d" % d["attempts"])
 
 
 def test_dump_hard_sector_no_starve():
-    # sector 0 is proprietary (not in the dictionary) and exhausts the budget, but
-    # sectors 1-15 use a common key that sits in the hot prefix. The unbudgeted
-    # per-sector hot-set probe must still recover 1-15 - one hard sector may not
-    # starve the rest. (Regression guard for the shared-budget rewrite.)
+    # sector 0 is proprietary (not in the dictionary) and walks the dictionary to
+    # exhaustion, but sectors 1-15 use a common key that sits in the hot prefix. The
+    # cheap per-sector hot-set probe (pass A) must still recover 1-15 - one hard
+    # sector may not starve the rest.
     BIG = ["%012x" % i for i in range(17000)]
     common = "%012x" % 3                        # inside HOT_KEYS_N (the hot prefix)
 
@@ -219,7 +216,7 @@ def test_dump_hard_sector_no_starve():
             return FakeCard.auth(self, block, key, keytype, to)
 
     km = {s: ("A", common) for s in range(16)}; km[0] = None
-    d = Walk(keymap=km).dump(keys=BIG, max_attempts=200, max_seconds=999)
+    d = Walk(keymap=km).dump(keys=BIG, max_seconds=999)
     check("a hard sector does not starve common-key sectors (15/16)",
           d["recovered"] == 15, "recovered=%d" % d["recovered"])
 
@@ -552,7 +549,7 @@ def test_subprocess_selftests():
 if __name__ == "__main__":
     test_find_key_sweep()
     test_dump_reuse_and_budget()
-    test_dump_budget_stops()
+    test_dump_exhausts_deep_key()
     test_dump_hard_sector_no_starve()
     test_daemon_keys()
     test_daemon_decode()

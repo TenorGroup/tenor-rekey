@@ -20,7 +20,7 @@ import json
 from x7 import X7, hx
 from x7lib import (X7Card, trailer_block, first_block, sector_count, card_kind,
                    access_bits_valid, trailer_locks_keys, DEFAULT_KEYS, BUILTIN_KEYS,
-                   DEFAULT_SCAN_ATTEMPTS, DEFAULT_SCAN_SECONDS)
+                   DEFAULT_SCAN_SECONDS)
 
 
 def _valid_key_hex(k):
@@ -117,8 +117,8 @@ class Daemon:
         user = p.get("user_keys") or p.get("keys") or []
         uset = set(user)
         keys = list(user) + [k for k in BUILTIN_KEYS if k not in uset]
-        # Scan budget (an unknown card fails fast); an "extended scan" can raise these.
-        max_attempts = int(p.get("max_attempts") or DEFAULT_SCAN_ATTEMPTS)
+        # The walk runs to dictionary exhaustion; max_seconds is only the wall-clock
+        # runaway watchdog (a stuck reader), overridable for tests.
         max_seconds = int(p.get("max_seconds") or DEFAULT_SCAN_SECONDS)
 
         def prog(s, n, f):
@@ -126,12 +126,14 @@ class Daemon:
                        "total": n, "keytype": (f[0] if f else None),
                        "key": (f[1] if f else None)})
 
-        def on_try(s, attempts, phase):
+        def on_try(s, attempts, walk_total, phase):
+            # walk_total is the ADAPTIVE remaining-work estimate (unresolved sectors *
+            # candidate count); it shrinks as sectors resolve. Distinct from the
+            # boundary event's `total` (the sector count), so the grid is untouched.
             self.emit({"event": "progress", "method": "decode", "sector": s,
-                       "total": None, "attempts": attempts, "budget": max_attempts,
+                       "total": None, "attempts": attempts, "walk_total": walk_total,
                        "phase": phase})
-        d = c.dump(keys=keys, progress=prog, on_try=on_try,
-                   max_attempts=max_attempts, max_seconds=max_seconds)
+        d = c.dump(keys=keys, progress=prog, on_try=on_try, max_seconds=max_seconds)
         blocks = {str(b): (hx(v) if v else None) for b, v in d["blocks"].items()}
         keys_out = {str(s): ([k[0], k[1]] if k else None) for s, k in d["keys"].items()}
         return {"uid": hx(d["uid"]), "atqa": hx(d["atqa"]), "sak": d["sak"],

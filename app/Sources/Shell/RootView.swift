@@ -423,11 +423,12 @@ private struct PreDecode: View {
 
 /// One live status line for a running decode. While a card resolves via key reuse
 /// there is no walk to report (just the sector); once the dictionary walk starts it
-/// reports honest auth-attempt counts against the budget, so it never looks frozen.
+/// reports honest cumulative auth attempts against the adaptive remaining-work total
+/// (which shrinks as sectors resolve), so it never looks frozen.
 @MainActor
 func decodeStatusLine(_ p: DecodeProgress, _ l: L10n) -> String {
-    if let a = p.attempts, let b = p.budget {
-        return "\(l.t("trying_keys")) \(a)/\(b)"
+    if let a = p.attempts, let w = p.walkTotal {
+        return "\(l.t("trying_keys")) \(a)/\(w)"
     }
     return "\(l.t("sector")) \(min(p.sector + 1, p.total))/\(p.total)"
 }

@@ -70,10 +70,13 @@ def key_to_hex(k):
 
 
 def uid_to_int(uid):
-    """4 UID bytes (bytes or int) -> big-endian 32-bit int."""
+    """The 4-byte UID used in Crypto1 auth -> big-endian 32-bit int. A 7-byte UID
+    (Classic EV1) authenticates with its LAST 4 bytes (cascade level 2), matching
+    X7Card.auth's self.uid[-4:]; using the first 4 would break the crypto on 7-byte
+    cards."""
     if isinstance(uid, int):
         return uid & M32
-    return int.from_bytes(bytes(uid[:4]), "big")
+    return int.from_bytes(bytes(uid[-4:]), "big")
 
 
 def oddeven_parity(b):

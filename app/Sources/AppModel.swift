@@ -248,16 +248,17 @@ final class AppModel {
 
     /// Fold a decode progress event into `decodeProgress`. The daemon emits a
     /// sector-boundary event (carries `total` = sector count) and a dictionary-walk
-    /// event (carries attempts / budget) as it searches a sector's key.
+    /// event (carries attempts / walk_total) as it searches a sector's key.
     private func applyDecodeEvent(_ ev: EngineEvent) {
         guard decoding, let s = ev.sector else { return }
         let fallbackTotal = card?.sak.map { sectorsForSak($0) } ?? 16
-        var p = decodeProgress ?? DecodeProgress(sector: 0, total: fallbackTotal, attempts: nil, budget: nil)
+        var p = decodeProgress ?? DecodeProgress(sector: 0, total: fallbackTotal, attempts: nil, walkTotal: nil)
         p.sector = s
         // `attempts` is the scan's GLOBAL, monotonic auth counter, so keep it across
-        // sector boundaries - the status line then only ever moves forward.
+        // sector boundaries - the status line then only ever moves forward. `walkTotal`
+        // is the adaptive remaining-work estimate and shrinks as sectors resolve.
         if let t = ev.total { p.total = t }
-        if let a = ev.attempts { p.attempts = a; p.budget = ev.budget }
+        if let a = ev.attempts { p.attempts = a; p.walkTotal = ev.walk_total }
         decodeProgress = p
 
         // per-sector live tile state
@@ -265,7 +266,7 @@ final class AppModel {
         if ev.attempts != nil {                           // walk event: this sector is searching
             sectors[s].status = .searching
             sectors[s].searchTried = ev.attempts
-            sectors[s].searchTotal = ev.budget
+            sectors[s].searchTotal = ev.walk_total
         } else if ev.total != nil {                       // sector boundary: this sector is done
             sectors[s].searchTried = nil
             sectors[s].searchTotal = nil
