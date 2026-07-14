@@ -4,11 +4,10 @@
 Merges the curated public dictionaries (Proxmark3 Iceman, MifareClassicTool,
 nbox aggregate, Flipper Unleashed), dedups + validates to 12-hex lowercase, and
 ORDERS them HOTEL-FIRST so a hotel card's brand key is found in the first few
-hundred attempts, not deep in the list: universal defaults, then the hotel/access
-block (incl. the Vietnam BETECH/TESA keys this vendor meets), then frequency-ranked
-keys, then the curated remainder, then the device-capture tail (nfcPro's own walked
-dictionary from one deployment, merged from ../re/nfcpro_keys.txt if present and
-deliberately ranked LAST). Re-run to refresh:
+hundred attempts, not deep in the list: universal defaults, Fudan FM11RF08S/08
+backdoor keys, then the hotel/access block (incl. the Vietnam BETECH/TESA keys this
+vendor meets), then frequency-ranked keys, then the curated remainder. Re-run to
+refresh:
 
     python3 probe/dict/build_dict.py
 
@@ -42,6 +41,10 @@ FREQ = [
 DEFAULTS = ["ffffffffffff", "000000000000", "a0a1a2a3a4a5", "d3f7d3f7d3f7",
             "b0b1b2b3b4b5", "a0b0c0d0e0f0", "4d3a99c351dd", "1a982c7e459a",
             "aabbccddeeff"]
+# Fudan FM11RF08S / FM11RF08 universal backdoor keys (Teuwen 2024): they authenticate
+# ANY block on those static-encrypted-nonce chips, which now ship in many hotel cards.
+# A dictionary auth with these opens the whole card, so they are front-loaded.
+BACKDOOR = ["a396efa4e24f", "a31667a8cec1"]
 # Hotel / access-control vendor keys (Proxmark-labelled), incl. the Vietnam
 # brands this vendor actually meets. Tried right after the universal defaults.
 HOTEL = [
@@ -92,22 +95,12 @@ def main():
             if k not in fseen:
                 fseen.add(k); freq_order.append(k)
 
-    # Optional device-capture tail: keys captured from nfcPro on one deployment
-    # (probe/../re/nfcpro_keys.txt, gitignored). These are nfcPro's own walked
-    # dictionary, NOT evidence of card prevalence, so they go LAST - a hotel card's
-    # brand key must not sit behind ~13k capture entries (the bug this fixes). Only
-    # merged if the file is present locally.
-    capture = []
-    cap_path = HERE.parent.parent / "re" / "nfcpro_keys.txt"
-    if cap_path.exists():
-        for k in keys_in(cap_path.read_text("utf-8", "replace")):
-            if k not in seen:
-                seen.add(k)
-            capture.append(k)
-
     # Ordered output: HOTEL-FIRST so a hotel card resolves in the first few hundred
-    # attempts. defaults, full hotel/vendor block, freq-ranked, curated remainder,
-    # then the device-capture tail.
+    # attempts. defaults, Fudan backdoor keys, full hotel/vendor block, freq-ranked,
+    # then the curated remainder. NOTE: an earlier build merged ~13k keys carved from
+    # a USB capture of nfcPro; a 2026-07 RE audit proved those are NOISE extracted from
+    # nfcPro's decompressed hardnested attack tables (near-uniform nibble distribution,
+    # absent from the exe), NOT real keys - they are intentionally NOT merged.
     ordered, used = [], set()
 
     def take(keys):
@@ -115,15 +108,16 @@ def main():
             if HEX12.match(k) and k in seen and k not in used:
                 used.add(k); ordered.append(k)
 
-    # DEFAULTS/HOTEL are front-loaded even if a source happens to drop them, so
-    # mark them present BEFORE take() (which gates on `seen`).
+    # DEFAULTS/BACKDOOR/HOTEL are front-loaded even if a source drops them, so mark
+    # them present BEFORE take() (which gates on `seen`).
     seen.update(DEFAULTS)
+    seen.update(BACKDOOR)
     seen.update(HOTEL)
     take(DEFAULTS)                                    # universal defaults, hot path
+    take(BACKDOOR)                                    # Fudan FM11RF08S/08 backdoor keys
     take(HOTEL)                                       # hotel/access (incl. VN BETECH/TESA)
     take(freq_order)                                  # frequency-ranked common
     take(universe)                                    # remaining curated public keys
-    take(capture)                                     # device-capture tail (deprioritised)
 
     header = (
         "# tenor/rekey bundled MIFARE Classic key dictionary\n"
