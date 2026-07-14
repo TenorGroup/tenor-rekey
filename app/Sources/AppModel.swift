@@ -22,7 +22,7 @@ final class AppModel {
 
     /// The most recent live decode, kept so File > Save can write it out.
     var liveDump: CardDump?
-    /// A loaded source dump (File > Open / drag-drop) - the thing clone writes.
+    /// A loaded or freshly decoded source dump - the thing clone writes.
     var source: CardDump?
     var cloneSheet = false
     var cloning = false
@@ -48,11 +48,10 @@ final class AppModel {
         return sectors.first { $0.index == s }
     }
 
-    /// What "write" clones FROM: an explicitly loaded source dump if there is one,
-    /// otherwise the card just decoded - so decode then write needs no Save / Open
-    /// round-trip (the live decode is already a usable source). The implicit live
-    /// decode counts ONLY when it belongs to the card currently on the reader, so a
-    /// card swap can never silently make card A's image the source for card B.
+    /// What "write" clones FROM: an explicit source loaded from disk or produced by
+    /// a successful decode. A decoded source intentionally survives a card swap so
+    /// it can be written to the target. The fallback live dump counts only when it
+    /// belongs to the card currently on the reader.
     var cloneSource: CardDump? {
         if let source { return source }
         if let d = liveDump, let cuid = card?.uid, Self.normUID(d.uid) == Self.normUID(cuid) { return d }
@@ -125,9 +124,9 @@ final class AppModel {
 
     /// Forget everything tied to the card on the reader: the decode grid, page
     /// dump, selection, the live decode used as an implicit clone source, and the
-    /// per-block clone results. An explicitly loaded `source` document is kept (it
-    /// is a separate file the user opened, not bound to this card). Shared by the
-    /// swap, removal, and reader-gone paths so they cannot drift.
+    /// per-block clone results. The explicit `source` document is kept because it
+    /// is the image to write, not state bound to the current target card. Shared by
+    /// the swap, removal, and reader-gone paths so they cannot drift.
     private func clearCardState() {
         sectors = []; pages = []; selected = nil; selectedBlock = nil
         liveDump = nil; cloneResults = [:]
@@ -147,6 +146,7 @@ final class AppModel {
     }
 
     func decode() async {
+        let startUID = card?.uid
         guard !decoding else { return }
         decoding = true
         decodeCancelled = false
@@ -168,14 +168,20 @@ final class AppModel {
                 }
                 let r = try await engine.decode(userKeys: keyStore.keys,
                     onProgress: { [weak self] ev in Task { @MainActor in self?.applyDecodeEvent(ev) } })
-                let vms = Self.buildSectors(r)
-                withAnimation(.easeInOut(duration: 0.3)) {
-                    card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
-                    sectors = vms
-                    pages = []
-                    selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
+                if let startUID, Self.normUID(r.uid) != Self.normUID(startUID) {
+                    lastError = "card changed during decode"
+                } else {
+                    let vms = Self.buildSectors(r)
+                    let dump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
+                        sectors = vms
+                        pages = []
+                        selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
+                        liveDump = dump
+                        source = dump
+                    }
                 }
-                liveDump = CardDump.from(r, name: r.uid.replacingOccurrences(of: " ", with: ""))
             }
         } catch {
             // a user cancel kills the daemon, which surfaces as a thrown error - not
@@ -297,10 +303,14 @@ final class AppModel {
 
     // ---- clone / write -----------------------------------------------------
 
-    /// Write the loaded source dump onto the card on the reader. Data blocks
+    /// Write the explicit source dump onto the card on the reader. Data blocks
     /// only by default; trailers (keys/access) and block 0 (uid) are opt-in.
     func clone(trailers: Bool, uid: Bool) async {
-        guard let src = cloneSource, !cloning else { return }
+        guard !cloning else { return }
+        guard let src = cloneSource else {
+            lastError = "no clone source"
+            return
+        }
         cloning = true
         cloneResults = [:]
         lastError = nil

@@ -72,7 +72,8 @@ class FakeCard(x7lib.X7Card):
         s = block // 4 if block < 128 else 32 + (block - 128) // 16
         if len(keys) > len(DEFAULT_KEYS) + 2:
             self.full_sweeps.append(s)
-        return self.keymap.get(s)
+        found = self.keymap.get(s)
+        return found if found and found[1] in keys else None
 
     def read_block(self, block):
         return self.data.get(block, bytes(16))
@@ -149,21 +150,21 @@ def test_find_key_sweep():
 
 
 # --------------------------------------------------------------------------
-# 2. dump: key-reuse + early-exit cap (2 full misses -> defaults only).
+# 2. dump: card-wide fast prepass + stop after the first full miss.
 # --------------------------------------------------------------------------
 def test_dump_reuse_and_earlyexit():
     BIG = ["%012x" % i for i in range(17000)]
-    # all-unknown -> exactly 2 full sweeps, then cap; recovered 0
+    # all-unknown -> exactly 1 full sweep, then stop; recovered 0
     f = FakeCard(keymap={s: None for s in range(16)})
     d = f.dump(keys=BIG)
-    check("early-exit caps full sweeps at 2 on an unknown card", f.full_sweeps == [0, 1],
+    check("early-exit stops after the first full miss", f.full_sweeps == [0],
           str(f.full_sweeps))
     check("unknown card recovers nothing", sum(1 for v in d["keys"].values() if v) == 0)
 
-    # sector 0 odd but an in-dict (deep) key elsewhere -> NOT capped, 15/16
-    km = {s: ("A", "beadface0001") for s in range(16)}; km[0] = None
+    # sector 0 odd but a common key elsewhere -> pass 1 still recovers 15/16
+    km = {s: ("A", DEFAULT_KEYS[0]) for s in range(16)}; km[0] = None
     d2 = FakeCard(keymap=km).dump(keys=BIG)
-    check("one odd sector does not trip the cap (15/16)",
+    check("fast prepass recovers common-key sectors before a deep miss (15/16)",
           sum(1 for v in d2["keys"].values() if v) == 15)
 
     # key-reuse: with the REAL find_key, a key proven on sector 0 is tried first on
@@ -185,7 +186,7 @@ def test_dump_reuse_and_earlyexit():
     check("key-reuse recovers all 16 sectors", sum(1 for v in d3["keys"].values() if v) == 16)
     # sector 0 sweeps ~2000; the other 15 reuse the proven key in a couple auths each
     check("key-reuse keeps later sectors cheap (one walk, not sixteen)",
-          c3.auth_calls < 2500, "auths=%d" % c3.auth_calls)
+          c3.auth_calls < 4500, "auths=%d" % c3.auth_calls)
 
 
 # --------------------------------------------------------------------------
@@ -312,6 +313,48 @@ def test_write_safety():
     blocks = {str(b): "00" * 16 for b in range(1, 3)}
     rs = ds.write_mfd({"blocks": blocks, "keys": keys, "trailers": False, "uid": False})
     check("write_mfd aborts on a mid-write card swap", rs.get("error") == "card changed during write", str(rs))
+
+
+def test_dump_swap_safety():
+    # A different card arrives after sector 0 was read. The next sector boundary
+    # poll must abort the whole dump instead of returning a mixed-card image.
+    class Swapper(FakeCard):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.swap_ready = False
+        def poll(self):
+            if self.swap_ready:
+                self.uid = b"\x09\x09\x09\x09"
+            return self._info()
+        def read_block(self, block):
+            data = super().read_block(block)
+            if block == trailer_block(0):
+                self.swap_ready = True
+            return data
+
+    c = Swapper(keymap={s: ("A", DEFAULT_KEYS[0]) for s in range(16)})
+    message = None
+    try:
+        c.dump(keys=list(DEFAULT_KEYS))
+    except RuntimeError as error:
+        message = str(error)
+    check("dump aborts on a mid-decode card swap",
+          message == "card changed during decode", repr(message))
+
+
+def test_dump_reuse_after_exhaust():
+    # A deep (in-dict) key shared across most sectors, plus one truly unknown
+    # sector that sits BEFORE later sectors reusing that deep key. The unknown
+    # sector triggers dict-exhaustion; the later shared-key sectors must still be
+    # recovered via cheap reuse of the already-proven key, not skipped.
+    BIG = ["%012x" % i for i in range(17000)]
+    deep = "%012x" % 15000                      # in BIG, not in DEFAULT_KEYS
+    km = {s: ("A", deep) for s in range(16)}
+    km[7] = None                                # unknown sector before the reuse tail
+    d = FakeCard(keymap=km).dump(keys=BIG)
+    got = sum(1 for v in d["keys"].values() if v)
+    check("reuse after exhaustion recovers shared-key sectors (15/16)",
+          got == 15, "got=%d" % got)
 
 
 def test_dump_keyb_read_fallback():
@@ -477,6 +520,8 @@ if __name__ == "__main__":
     test_daemon_decode()
     test_daemon_write()
     test_write_safety()
+    test_dump_swap_safety()
+    test_dump_reuse_after_exhaust()
     test_dump_keyb_read_fallback()
     test_dump_trailer_mirror()
     test_access_bits_valid()

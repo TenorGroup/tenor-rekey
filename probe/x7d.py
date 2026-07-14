@@ -125,7 +125,7 @@ class Daemon:
         def on_try(s, i, n):
             self.emit({"event": "progress", "method": "decode", "sector": s,
                        "total": None, "keys_tried": i, "keys_total": n})
-        d = c.dump(keys=keys, progress=prog, on_try=on_try)
+        d = c.dump(keys=keys, user_keys=list(user), progress=prog, on_try=on_try)
         blocks = {str(b): (hx(v) if v else None) for b, v in d["blocks"].items()}
         keys = {str(s): ([k[0], k[1]] if k else None) for s, k in d["keys"].items()}
         return {"uid": hx(d["uid"]), "atqa": hx(d["atqa"]), "sak": d["sak"],

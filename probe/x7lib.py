@@ -34,7 +34,7 @@ DEFAULT_KEYS = [
 
 
 def _load_builtin_keys():
-    """The bundled curated dictionary (dict/mfc_keys.dic, ~4.5k keys), or the
+    """The bundled curated dictionary (dict/mfc_keys.dic, ~17.5k keys), or the
     in-binary DEFAULT_KEYS if the file is missing. Loaded once at import."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dict", "mfc_keys.dic")
     try:
@@ -234,7 +234,7 @@ class X7Card:
                 self.poll()                            # re-select after the failed auth
         return None
 
-    def dump(self, keys=None, progress=None, on_try=None):
+    def dump(self, keys=None, user_keys=None, progress=None, on_try=None):
         """Dump the whole card. Returns dict: blocks{n:16B}, keys{sector:(kt,key)}, sak, uid.
 
         Key REUSE: a key proven on one sector is tried first on the rest (MIFARE
@@ -242,43 +242,34 @@ class X7Card:
         regardless of dictionary size; the full dict is only walked on a sector
         whose key is genuinely unknown.
 
-        Early-exit: once TWO sectors have each swept the whole dictionary without a
-        hit, the card's keys are almost certainly not in the dictionary at all, so
-        the remaining sectors fall back to the small common-key set instead of
-        re-walking ~17k keys apiece (which would take hours). Two misses, not one,
-        so a card with one odd sector but an in-dict key elsewhere is still fully
-        decoded; a mostly-FF card stays fast (FF is a common key); and any key
-        already proven on the card is always retried first. When nothing is
-        recovered the caller can offer nested recovery."""
+        Search order: first try user and common keys card-wide, then deep-sweep
+        unresolved sectors until the first full miss. A proven key is promoted for
+        reuse on later sectors. When nothing is recovered the caller can offer
+        nested recovery."""
         if keys is None:
             keys = BUILTIN_KEYS
         info = self.wait_for_card()
         if not info:
             raise RuntimeError("no card on reader")
+        target = info["uid"]
         nsec = sector_count(info["sak"])
         blocks, skeys = {}, {}
         found_keys, found_set = [], set()      # proven on THIS card, tried first
-        full_misses = 0                        # sectors that exhausted the full dict
-        dict_exhausted = False
-        for s in range(nsec):
+
+        fast_keys, fast_seen = [], set()
+        for k in list(user_keys or []) + list(DEFAULT_KEYS):
+            if k not in fast_seen:
+                fast_seen.add(k)
+                fast_keys.append(k)
+
+        def read_sector(s, found):
             tb = trailer_block(s)
-            pool = DEFAULT_KEYS if dict_exhausted else keys
-            trial = found_keys + [k for k in pool if k not in found_set]
-            swept_full = not dict_exhausted and len(trial) > len(found_keys) + len(DEFAULT_KEYS)
-            found = self.find_key(tb, trial, on_try=(lambda i, n, s=s: on_try(s, i, n)) if on_try else None)
-            skeys[s] = found
-            if progress:
-                progress(s, nsec, found)
-            if not found:
-                if swept_full:
-                    full_misses += 1
-                    if full_misses >= 2:
-                        dict_exhausted = True
-                continue
             kt, k = found
-            if k not in found_set:             # promote for the remaining sectors
+            if k in found_set:
+                found_keys.remove(k)
+            else:
                 found_set.add(k)
-                found_keys.insert(0, k)
+            found_keys.insert(0, k)             # promote for the remaining sectors
             other = "B" if kt == "A" else "A"
             for b in range(first_block(s), tb + 1):
                 data = None
@@ -289,6 +280,8 @@ class X7Card:
                     for _ in range(6):              # re-auth per block for reliability
                         if not self.poll():
                             continue
+                        if self.uid != target:
+                            raise RuntimeError("card changed during decode")
                         if not self.auth(tb, k, try_kt):
                             break                  # this key type can't auth; try the other
                         data = self.read_block(b)
@@ -314,6 +307,48 @@ class X7Card:
                     if t[0:6] == bytes(6):
                         t[0:6] = kb
                 blocks[tb] = bytes(t)
+
+        # Pass 1: try only user and common keys across the whole card.
+        for s in range(nsec):
+            self.poll()
+            if self.uid != target:
+                raise RuntimeError("card changed during decode")
+            trial = found_keys + [k for k in fast_keys if k not in found_set]
+            found = self.find_key(
+                trailer_block(s), trial,
+                on_try=(lambda i, n, s=s: on_try(s, i, n)) if on_try else None)
+            if found:
+                skeys[s] = found
+                read_sector(s, found)
+                if progress:
+                    progress(s, nsec, found)
+
+        # Pass 2: deep-sweep unresolved sectors until the first full dictionary
+        # miss. After that miss the card's keys are almost certainly proprietary,
+        # so we stop the expensive deep sweeps - but still retry keys ALREADY
+        # proven on this card (cheap reuse), so a later sector that shares a deep
+        # key with an earlier one is not silently dropped.
+        dict_exhausted = False
+        for s in range(nsec):
+            if s in skeys:
+                continue
+            self.poll()
+            if self.uid != target:
+                raise RuntimeError("card changed during decode")
+            if not dict_exhausted:
+                trial = found_keys + [k for k in keys if k not in found_set]
+                found = self.find_key(
+                    trailer_block(s), trial,
+                    on_try=(lambda i, n, s=s: on_try(s, i, n)) if on_try else None)
+                if not found:
+                    dict_exhausted = True     # deep trial already tried reuse first
+            else:
+                found = self.find_key(trailer_block(s), found_keys) if found_keys else None
+            if found:
+                read_sector(s, found)
+            skeys[s] = found
+            if progress:
+                progress(s, nsec, found)
         return {"uid": info["uid"], "sak": info["sak"], "atqa": info["atqa"],
                 "blocks": blocks, "keys": skeys, "sectors": nsec}
 
