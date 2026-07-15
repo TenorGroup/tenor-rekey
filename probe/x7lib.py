@@ -14,16 +14,15 @@ import time
 from x7 import X7, hx
 from x7_init import INIT_SEQ
 
-# The dictionary walk runs to EXHAUSTION per unresolved sector: a sector is declared
-# "no key" only after every applicable candidate has been tried (KeyA and KeyB), not
-# after a fixed attempt count. A repeat card whose real key sits DEEP in the (~4.5k
-# key) dictionary must still be found. What keeps this fast is key-reuse (a key proven
-# on one sector is tried first on every other) and good ordering, not truncation.
-#
-# The only stop other than exhaustion is a generous WALL-CLOCK watchdog: a runaway
-# guard for a stuck reader, NOT a "key absent" signal. If it fires, dump returns
-# whatever was recovered so far. The user cancel path (daemon kill) is separate.
-DEFAULT_SCAN_SECONDS = 600
+# The dictionary walk is bounded by a wall-clock deadline so an UNKNOWN card fails
+# fast instead of grinding the whole ~4.5k-key dictionary for minutes. Two things
+# keep real cards fast well inside that budget: key-reuse (a key proven on one sector
+# is tried first on every other) and the learned-key cache (a key found once is
+# front-loaded on later cards). A brand-new card whose only key sits very deep may
+# reach the deadline on its FIRST decode; adding that brand's key in Settings, or a
+# later decode seeding the cache, then resolves it. If the deadline fires, dump
+# returns whatever was recovered so far. The user cancel path (daemon kill) is separate.
+DEFAULT_SCAN_SECONDS = 90
 
 # How many of the dictionary's front keys (common defaults + hotel/vendor brands,
 # since the dict is hotel-first) are tried on EVERY sector in the cheap first pass.
@@ -33,10 +32,10 @@ HOT_KEYS_N = 24
 
 
 class _Budget:
-    """Wall-clock runaway watchdog + auth counter + progress throttle for the
-    dictionary walk. There is NO attempt cap: the walk runs to dictionary exhaustion
-    per sector. `expired()` fires only when the walk has been running past max_seconds
-    (a stuck reader), never as a 'key absent' signal; dump then returns partial."""
+    """Wall-clock deadline + auth counter + progress throttle for the dictionary
+    walk. `expired()` fires once the deep walk passes max_seconds, bounding an unknown
+    card's decode (see DEFAULT_SCAN_SECONDS) so it fails fast rather than exhausting
+    the whole dictionary; dump then returns whatever was recovered so far."""
     def __init__(self, max_seconds=DEFAULT_SCAN_SECONDS):
         self.attempts = 0
         self._start = time.monotonic()
