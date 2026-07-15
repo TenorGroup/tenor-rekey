@@ -704,6 +704,14 @@ def test_daemon_learned_cache():
         e = warm._find(K)
         check("learned-daemon: decode records verified keys back into the cache",
               e is not None and e["hits"] == 2, str(e))
+
+        # the Settings-facing methods (learned_stats reports a count, learned_clear empties)
+        stats = d1.learned_stats({})
+        check("learned-daemon: learned_stats returns a count",
+              isinstance(stats.get("count"), int) and stats["count"] >= 1, str(stats))
+        cleared = d1.learned_clear({})
+        check("learned-daemon: learned_clear empties the cache",
+              cleared.get("count") == 0 and warm.stats()["count"] == 0, str(cleared))
     finally:
         try:
             os.remove(cpath)

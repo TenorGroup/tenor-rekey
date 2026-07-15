@@ -218,6 +218,14 @@ actor X7Engine {
     func builtinKeyCount() async throws -> Int {
         try await request("keys_builtin_count", as: CountResult.self).count
     }
+    /// Number of keys the daemon has learned from real cards (Settings line).
+    func learnedKeyCount() async throws -> Int {
+        try await request("learned_stats", as: CountResult.self).count
+    }
+    /// Forget every learned key.
+    func clearLearnedKeys() async throws {
+        _ = try await request("learned_clear", as: CountResult.self)
+    }
     func readNTAG() async throws -> NtagResult {
         try await request("read_ntag", timeout: .seconds(120), as: NtagResult.self)
     }

@@ -50,6 +50,8 @@ final class AppModel {
     let keyStore = KeyStore()
     /// Size of the daemon's built-in curated dictionary (shown in Settings).
     var builtinKeyCount = 0
+    /// Keys the daemon has learned from real cards and reranks decodes with (Settings).
+    var learnedKeyCount = 0
 
     var selectedSector: SectorVM? {
         guard let s = selected else { return nil }
@@ -79,6 +81,7 @@ final class AppModel {
         do {
             info = try await engine.info()
             builtinKeyCount = (try? await engine.builtinKeyCount()) ?? 0
+            learnedKeyCount = (try? await engine.learnedKeyCount()) ?? 0
             readerOnline = true
             lastError = nil
             await refreshStatus()
@@ -86,6 +89,18 @@ final class AppModel {
             applyReaderGone()
             lastError = "\(error)"
         }
+    }
+
+    /// Re-read how many keys the daemon has learned (Settings shows this; it grows
+    /// as decodes recover keys).
+    func refreshLearnedCount() async {
+        learnedKeyCount = (try? await engine.learnedKeyCount()) ?? learnedKeyCount
+    }
+
+    /// Forget every learned key. The cache reranks decodes; clearing it resets that.
+    func clearLearnedKeys() async {
+        try? await engine.clearLearnedKeys()
+        await refreshLearnedCount()
     }
 
     /// Live status: keep the reader / card pill honest when the X7 or a card is

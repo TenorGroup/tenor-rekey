@@ -73,8 +73,18 @@ private struct DictionarySettings: View {
                 Spacer()
                 Button(l.t("remove")) { removeSelected() }.disabled(selection.isEmpty)
             }
+            .padding(.horizontal, 12).padding(.top, 12)
+            Divider()
+            HStack {
+                Text("\(model.learnedKeyCount) \(l.t("learned_keys"))")
+                    .font(l.sans(11)).foregroundStyle(.secondary)
+                Spacer()
+                Button(l.t("clear_learned")) { Task { await model.clearLearnedKeys() } }
+                    .disabled(model.learnedKeyCount == 0)
+            }
             .padding(12)
         }
+        .task { await model.refreshLearnedCount() }
     }
 
     private func addKey() {
