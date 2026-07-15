@@ -11,14 +11,22 @@ have their own self-tests, invoked here too.
 
 Exit code 0 = all passed.
 """
+import json
 import os
 import subprocess
 import sys
+import tempfile
 
 import x7d
 import x7lib
+import learned_keys
+
+# Keep every test's default learned-key cache off the real App Support store.
+os.environ.setdefault("X7_LEARNED_PATH",
+                      os.path.join(tempfile.gettempdir(), "rekey-test-learned.json"))
 from x7lib import (DEFAULT_KEYS, trailer_block, first_block, sector_count,
                    blocks_in_sector)
+from learned_keys import LearnedKeyCache
 
 PASS, FAIL = [], []
 
@@ -94,8 +102,10 @@ class FakeCard(x7lib.X7Card):
         self.closed = True
 
 
-def daemon_with(card):
-    d = x7d.Daemon()
+def daemon_with(card, learned=None):
+    # learned=None -> Daemon builds its default cache at X7_LEARNED_PATH (a temp
+    # file, set at import), so daemon tests never touch the real store.
+    d = x7d.Daemon(learned=learned)
     d.card = card
     d._open = lambda: card
     return d
@@ -546,6 +556,161 @@ def test_subprocess_selftests():
         check("self-test: %s" % mod, ok, (r.stdout + r.stderr)[-200:])
 
 
+# --------------------------------------------------------------------------
+# 11. learned-key cache: the persistent reranker over the static dictionary.
+# --------------------------------------------------------------------------
+def test_learned_keys():
+    paths = []
+
+    def newpath():
+        fd, p = tempfile.mkstemp(prefix="lk-test-", suffix=".json")
+        os.close(fd)
+        paths.append(p)
+        return p
+
+    def make(now=None):
+        return LearnedKeyCache(path=newpath(), now=now)
+
+    # a deterministic clock so recency ordering is reproducible
+    tick = [1000.0]
+    def now():
+        tick[0] += 1.0
+        return tick[0]
+
+    try:
+        # record then read back
+        c = make(now)
+        n = c.record(["aaaaaaaaaaaa", "bbbbbbbbbbbb"], uid="0a1b2c3d")
+        tk = set(c.top_keys())
+        check("learned: record returns count of keys stored", n == 2, str(n))
+        check("learned: top_keys returns the recorded keys",
+              tk == {"aaaaaaaaaaaa", "bbbbbbbbbbbb"}, str(tk))
+
+        # a key recorded twice (different uids) -> hits=2, outranks a hits=1 key
+        c2 = make(now)
+        c2.record(["cccccccccccc"], uid="1111")
+        c2.record(["dddddddddddd"], uid="2222")
+        c2.record(["cccccccccccc"], uid="3333")          # cccc now hits=2
+        e = c2._find("cccccccccccc")
+        check("learned: a key seen twice reaches hits=2", e["hits"] == 2, str(e["hits"]))
+        check("learned: the higher-hit key ranks first",
+              c2.top_keys()[0] == "cccccccccccc", str(c2.top_keys()))
+
+        # uid grouping beats hit count: a uid match ranks ahead of a busier key
+        c3 = make(now)
+        c3.record(["111111111111"], uid="cafe")           # hits=1, uid cafe
+        c3.record(["222222222222"])                        # hits=1
+        c3.record(["222222222222"])                        # hits=2
+        c3.record(["222222222222"])                        # hits=3, no uid
+        check("learned: without a uid the busiest key ranks first",
+              c3.top_keys()[0] == "222222222222", str(c3.top_keys()))
+        check("learned: top_keys(uid) floats uid-matching entries to the front",
+              c3.top_keys(uid="cafe")[0] == "111111111111", str(c3.top_keys(uid="cafe")))
+
+        # limit is honoured
+        check("learned: top_keys respects the limit argument",
+              len(c3.top_keys(limit=1)) == 1, str(c3.top_keys(limit=1)))
+
+        # quota: > MAX_ENTRIES distinct keys caps the store and evicts lowest-hit
+        c4 = make(now)
+        survivors = ["%012x" % i for i in range(5)]
+        for _ in range(10):
+            c4.record(survivors)                           # survivors reach hits=10
+        flood = ["%012x" % i for i in range(1000, 1000 + 600)]
+        c4.record(flood)                                   # hits=1 each
+        keys_now = {e["key"] for e in c4.entries}
+        check("learned: quota caps the store at MAX_ENTRIES",
+              len(c4.entries) == LearnedKeyCache.MAX_ENTRIES, str(len(c4.entries)))
+        check("learned: eviction keeps the high-hit survivors",
+              all(s in keys_now for s in survivors), "missing survivors")
+
+        # persistence: a fresh cache on the same path reloads identical entries
+        p = newpath()
+        c5 = LearnedKeyCache(path=p, now=now)
+        c5.record(["abcabcabcabc", "abcabcabcabd"], uid="0a1b2c3d", site="hcmc")
+        c6 = LearnedKeyCache(path=p, now=now)
+        check("learned: entries survive save/load unchanged",
+              c6.entries == c5.entries, str(c6.entries))
+
+        # robustness: a file of garbage bytes loads as an empty store, no raise
+        pg = newpath()
+        with open(pg, "wb") as f:
+            f.write(b"\x00\x01\xff not json at all {{{")
+        cg = LearnedKeyCache(path=pg, now=now)
+        check("learned: corrupt file loads as empty (no exception)", cg.entries == [], str(cg.entries))
+
+        # invalid keys (wrong length / uppercase / non-hex) are skipped
+        c7 = make(now)
+        n7 = c7.record(["gggggggggggg", "AAAAAAAAAAAA", "abc",
+                        "abcabcabcabcab", "aabbccddeeff"])
+        check("learned: record skips invalid keys, counts only valid ones", n7 == 1, str(n7))
+        check("learned: only the valid key is stored",
+              len(c7.entries) == 1 and c7.entries[0]["key"] == "aabbccddeeff", str(c7.entries))
+
+        # limit <= 0 returns nothing (contract: at most `limit`, not one)
+        c8 = make(now)
+        c8.record(["112233445566", "223344556677"])
+        check("learned: limit<=0 returns no keys",
+              c8.top_keys(limit=0) == [] and c8.top_keys(limit=-3) == [],
+              str(c8.top_keys(limit=0)))
+
+        # a hand-edited file with duplicate keys is coalesced on load
+        pdup = newpath()
+        with open(pdup, "w") as f:
+            json.dump([{"key": "eeeeeeeeeeee", "hits": 3, "last_used": 5.0,
+                        "first_seen": 4.0, "uids": ["aa"], "site": None},
+                       {"key": "eeeeeeeeeeee", "hits": 2, "last_used": 9.0,
+                        "first_seen": 1.0, "uids": ["bb"], "site": "x"}], f)
+        cdup = LearnedKeyCache(path=pdup, now=now)
+        ed = cdup._find("eeeeeeeeeeee")
+        check("learned: duplicate keys coalesce to one entry on load",
+              len(cdup.entries) == 1, str(cdup.entries))
+        check("learned: coalesced entry sums hits and merges metadata",
+              ed and ed["hits"] == 5 and ed["first_seen"] == 1.0
+              and set(ed["uids"]) == {"aa", "bb"} and ed["site"] == "x", str(ed))
+    finally:
+        for p in paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def test_daemon_learned_cache():
+    # End-to-end through the daemon: a learned key is tried ahead of the built-in
+    # dictionary, and a decode records the keys it verified on the card.
+    K = "0f1e2d3c4b5a"   # a key deliberately outside the shipped dictionary
+    check("learned-daemon: test key is not a built-in (test premise)",
+          K not in set(x7lib.BUILTIN_KEYS), "pick another test key")
+    fd, cpath = tempfile.mkstemp(prefix="lk-daemon-", suffix=".json")
+    os.close(fd)
+    try:
+        # cold: the key is not learned, so its sector cannot be reached at all.
+        cold = learned_keys.LearnedKeyCache(path=cpath)
+        d0 = daemon_with(FakeCard(keymap={0: ("A", K)}, uid=b"\x0a\x0b\x0c\x0d"),
+                         learned=cold)
+        r0 = d0.decode({"user_keys": [], "max_seconds": 5})
+        check("learned-daemon: an unlearned key leaves its sector unresolved",
+              r0["keys"].get("0") is None, str(r0["keys"].get("0")))
+
+        # warm: learn the key, and the same card now resolves the sector.
+        warm = learned_keys.LearnedKeyCache(path=cpath)
+        warm.record([K], uid="0a0b0c0d")
+        d1 = daemon_with(FakeCard(keymap={0: ("A", K)}, uid=b"\x0a\x0b\x0c\x0d"),
+                         learned=warm)
+        r1 = d1.decode({"user_keys": [], "max_seconds": 5})
+        check("learned-daemon: a learned key resolves its sector",
+              r1["keys"].get("0") == ["A", K], str(r1["keys"].get("0")))
+        e = warm._find(K)
+        check("learned-daemon: decode records verified keys back into the cache",
+              e is not None and e["hits"] == 2, str(e))
+    finally:
+        try:
+            os.remove(cpath)
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     test_find_key_sweep()
     test_dump_reuse_and_budget()
@@ -565,6 +730,8 @@ if __name__ == "__main__":
     test_read_ntag_wrap()
     test_daemon_dispatch()
     test_apdu_parse()
+    test_learned_keys()
+    test_daemon_learned_cache()
     test_subprocess_selftests()
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
     if FAIL:

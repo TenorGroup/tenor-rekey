@@ -21,6 +21,11 @@ from x7 import X7, hx
 from x7lib import (X7Card, trailer_block, first_block, sector_count, card_kind,
                    access_bits_valid, trailer_locks_keys, DEFAULT_KEYS, BUILTIN_KEYS,
                    DEFAULT_SCAN_SECONDS)
+from learned_keys import LearnedKeyCache
+
+# How many learned keys to try (after user keys, before the dictionary). Keeps the
+# reranker's hot set small so a genuinely new card is not slowed by a long prefix.
+LEARNED_TOP_N = 64
 
 
 def _valid_key_hex(k):
@@ -40,10 +45,14 @@ def _sector_of(b):
 
 class Daemon:
     METHODS = ("info", "poll", "decode", "read_ntag", "apdu", "write_mfd",
-               "format", "nested_recover", "keys_default", "keys_builtin_count")
+               "format", "nested_recover", "keys_default", "keys_builtin_count",
+               "learned_stats", "learned_clear")
 
-    def __init__(self):
+    def __init__(self, learned=None):
         self.card = None
+        # Verified-key reranker: keys that authed live on real cards are tried
+        # ahead of the static dictionary on later decodes. Injectable for tests.
+        self.learned = learned if learned is not None else LearnedKeyCache()
 
     def _open(self):
         """Open + RF-init the reader once; reuse across commands (start
@@ -110,13 +119,28 @@ class Daemon:
         built-in' without ever transferring thousands of keys over the pipe."""
         return {"count": len(BUILTIN_KEYS)}
 
+    def learned_stats(self, p):
+        """Size plus top entries of the learned-key cache (for a Settings summary)."""
+        return self.learned.stats()
+
+    def learned_clear(self, p):
+        """Empty the learned-key cache."""
+        self.learned.clear()
+        return {"count": 0}
+
     def decode(self, p):
         c = self._open()
-        # The app sends only the USER's editable keys; the big curated dictionary
-        # lives here and is appended (user keys tried first).
+        # Key order tried: the USER's editable keys first, then keys learned from
+        # real cards (recency/frequency ranked), then the big curated dictionary.
+        # The app never sees the learned cache or the dictionary; both live here.
         user = p.get("user_keys") or p.get("keys") or []
-        uset = set(user)
-        keys = list(user) + [k for k in BUILTIN_KEYS if k not in uset]
+        keys, seen = list(user), set(user)
+        for k in self.learned.top_keys(limit=LEARNED_TOP_N):
+            if k not in seen:
+                keys.append(k); seen.add(k)
+        for k in BUILTIN_KEYS:
+            if k not in seen:
+                keys.append(k)
         # The walk runs to dictionary exhaustion; max_seconds is only the wall-clock
         # runaway watchdog (a stuck reader), overridable for tests.
         max_seconds = int(p.get("max_seconds") or DEFAULT_SCAN_SECONDS)
@@ -136,6 +160,14 @@ class Daemon:
         d = c.dump(keys=keys, progress=prog, on_try=on_try, max_seconds=max_seconds)
         blocks = {str(b): (hx(v) if v else None) for b, v in d["blocks"].items()}
         keys_out = {str(s): ([k[0], k[1]] if k else None) for s, k in d["keys"].items()}
+        # Learn the keys that authed live on this card so later decodes try them
+        # first. A cache write must never break a decode.
+        recovered = [k[1] for k in d["keys"].values() if k]
+        if recovered and d.get("uid"):
+            try:
+                self.learned.record(recovered, uid=d["uid"].hex())
+            except OSError:
+                pass
         return {"uid": hx(d["uid"]), "atqa": hx(d["atqa"]), "sak": d["sak"],
                 "sectors": d["sectors"], "recovered": d["recovered"],
                 "attempts": d["attempts"], "exhausted": d["exhausted"],
