@@ -427,8 +427,12 @@ private struct PreDecode: View {
 /// (which shrinks as sectors resolve), so it never looks frozen.
 @MainActor
 func decodeStatusLine(_ p: DecodeProgress, _ l: L10n) -> String {
-    if let a = p.attempts, let w = p.walkTotal {
-        return "\(l.t("trying_keys")) \(a)/\(w)"
+    // Just the running auth count, no denominator: the total is sectors x dictionary
+    // (tens of thousands) but the walk is time-bounded and gives up long before that,
+    // so a "N/huge" fraction read as if the decode quit at a few percent. The
+    // indeterminate bar already signals that work is ongoing.
+    if let a = p.attempts {
+        return "\(l.t("trying_keys")) \(a)"
     }
     return "\(l.t("sector")) \(min(p.sector + 1, p.total))/\(p.total)"
 }

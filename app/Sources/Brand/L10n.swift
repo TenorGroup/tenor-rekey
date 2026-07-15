@@ -84,7 +84,7 @@ final class L10n {
         "decoding":      ["vi": "đang giải mã…", "en": "decoding…", "zh": "解码中…", "ja": "デコード中…"],
         "trying_keys":   ["vi": "thử khóa", "en": "trying keys", "zh": "尝试密钥", "ja": "鍵を試行"],
         "no_keys_title": ["vi": "không tìm thấy khóa", "en": "no keys found", "zh": "未找到密钥", "ja": "鍵が見つかりません"],
-        "no_keys_msg":   ["vi": "thẻ này dùng khóa lạ, không có trong từ điển. cần khôi phục khóa từ ổ (nested) - chưa hỗ trợ trong bản này. có thể thêm khóa đã biết ở phần cài đặt rồi giải mã lại.", "en": "this card uses keys that are not in the dictionary. cracking it needs key recovery from the lock (nested), which is not available in this build. you can add a known key in settings and decode again.", "zh": "此卡使用的密钥不在字典中。破解需要从锁进行密钥恢复（嵌套），此版本尚不支持。可在设置中添加已知密钥后重新解码。", "ja": "このカードの鍵は辞書にありません。解読には錠からの鍵復元（ネスト）が必要ですが、このビルドでは未対応です。設定で既知の鍵を追加して再デコードできます。"],
+        "no_keys_msg":   ["vi": "thẻ này dùng khóa không có trong từ điển. nếu bạn có khóa của thẻ, thêm ở cài đặt (từ điển khóa) rồi giải mã lại.", "en": "this card uses a key that is not in the dictionary. if you have this card's key, add it in settings (key dictionary) and decode again.", "zh": "此卡使用的密钥不在字典中。如果您有该卡的密钥，请在设置（密钥字典）中添加后重新解码。", "ja": "このカードの鍵は辞書にありません。鍵をお持ちの場合は、設定（鍵辞書）で追加して再度デコードしてください。"],
         "not_decoded":   ["vi": "chưa giải", "en": "not decoded", "zh": "未解码", "ja": "未デコード"],
         "waiting_card":  ["vi": "đang chờ thẻ", "en": "waiting for card", "zh": "等待卡片", "ja": "カードを待機中"],
         "reader_offline":["vi": "chưa có đầu đọc", "en": "reader offline", "zh": "读卡器离线", "ja": "リーダー オフライン"],
