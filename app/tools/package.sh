@@ -35,7 +35,7 @@ PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/$
 PY_SHA256="f0a7fa7decc75df2b1a789329a44f657c4a15c0a683f197ce46a5cb621bc6ef4"
 
 # Runtime engine modules (the daemon + its import graph) and the dictionary.
-PROBE_MODULES=(x7d.py x7lib.py x7.py x7hid.py x7_init.py x7crypto.py crapto1.py)
+PROBE_MODULES=(x7d.py x7lib.py x7.py x7hid.py x7_init.py x7crypto.py crapto1.py learned_keys.py)
 
 echo "==> 1/7  build release .app"
 cd "$APP_DIR"
