@@ -92,8 +92,11 @@ struct SlotTagType: Identifiable, Equatable {
         SlotTagType(name: "MIFARE_1024", label: "MIFARE Classic 1K"),
         SlotTagType(name: "MIFARE_4096", label: "MIFARE Classic 4K"),
         SlotTagType(name: "MIFARE_Mini", label: "MIFARE Mini"),
+        SlotTagType(name: "NTAG_213", label: "NTAG 213"),
         SlotTagType(name: "NTAG_215", label: "NTAG 215"),
         SlotTagType(name: "NTAG_216", label: "NTAG 216"),
+        SlotTagType(name: "MF0UL11", label: "Ultralight EV1 (640 bit)"),
+        SlotTagType(name: "MF0UL21", label: "Ultralight EV1 (1312 bit)"),
     ]
 
     /// The LF types offered for a slot's LF field. EM410x-only in v1 (LF emulate is scoped

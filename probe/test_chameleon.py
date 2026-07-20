@@ -102,6 +102,14 @@ class FakeChameleon:
         self.t5577_em = None              # id bytes written to a T5577 via em410x_write
         self.t5577_hid = None             # id bytes written to a T5577 via hidprox_write
         self.lf_emu_id = None             # id set via em410x_set_emu_id
+        # ---- UL/NTAG emulator surface (page writes, version/signature/counters, anti-coll) ----
+        self.emu_pages = {}               # page -> 4 bytes (UL/NTAG emulator memory)
+        self.emu_page_writes = []         # (page_start, page_count) in order
+        self.ntag_emu_version = None      # bytes set via mf0_ntag_set_version_data
+        self.ntag_emu_signature = None    # bytes set via mf0_ntag_set_signature_data
+        self.ntag_emu_counters = {}       # index -> (value, reset_tearing)
+        self.ntag_auth_reset = 0          # mfu_reset_auth_cnt call count
+        self.anti_coll = None             # (uid, atqa, sak, ats) from hf14a_set_anti_coll_data
 
     # firmware rejects a card op in tag/emulator mode (Status.DEVICE_MODE_ERROR)
     def _require_reader(self):
@@ -286,6 +294,35 @@ class FakeChameleon:
     def mf1_set_gen2_mode(self, enabled):
         self.magic["gen2"] = bool(enabled)
 
+    # ---- UL/NTAG emulator memory + metadata (mirrors the mfu_* / mf0_ntag_* commands) ----
+    def mfu_write_emu_page_data(self, page_start, data):
+        assert len(data) % 4 == 0, "page data must be a multiple of 4 bytes"
+        n = len(data) // 4
+        self.emu_page_writes.append((page_start, n))
+        for i in range(n):
+            self.emu_pages[page_start + i] = bytes(data[i * 4:(i + 1) * 4])
+
+    def mfu_read_emu_page_data(self, page_start, page_count):
+        out = bytearray()
+        for i in range(page_count):
+            out += self.emu_pages.get(page_start + i, bytes(4))
+        return bytes(out)
+
+    def mf0_ntag_set_version_data(self, data):
+        self.ntag_emu_version = bytes(data)
+
+    def mf0_ntag_set_signature_data(self, data):
+        self.ntag_emu_signature = bytes(data)
+
+    def mfu_write_emu_counter_data(self, index, value, reset_tearing):
+        self.ntag_emu_counters[index] = (int(value), bool(reset_tearing))
+
+    def mfu_reset_auth_cnt(self):
+        self.ntag_auth_reset += 1
+
+    def hf14a_set_anti_coll_data(self, uid, atqa, sak, ats=b""):
+        self.anti_coll = (bytes(uid), bytes(atqa), bytes(sak), bytes(ats))
+
     # ---- physical-card block write (magic clone target) ----
     def mf1_write_one_block(self, block, type_value, key, block_data):
         self._require_reader()
@@ -440,6 +477,69 @@ class MidWriteSwapFake(FakeChameleon):
         ok = super().mf1_write_one_block(block, type_value, key, block_data)
         self.uid = b"\x09\x09\x09\x09"
         return ok
+
+
+class FakeUltralight(FakeChameleon):
+    """A UL/NTAG tag on the reader (SAK 0x00, ATQA 0x0044, 7-byte UID). Answers the reader-mode
+    raw transceive commands the Ultralight scan uses: GET_VERSION (0x60), READ page (0x30 ->
+    16 bytes = 4 pages), READ_SIG (0x3C 00), READ_CNT (0x39 idx). The default version's byte 6
+    (0x11) identifies NTAG215 -> 135 pages. Configurable to exercise the daemon's real paths:
+      `num_pages`   how many real pages the tag has.
+      `version`     GET_VERSION bytes (b"" = no GET_VERSION, so the type/size is unknown).
+      `locked_from` page reads at or past this index NAK (a password-protected region).
+      `rollover`    True: a READ past the last page WRAPS to page 0 (real NTAG); False: it NAKs.
+      `page_faults` {page: exception} to raise on that page's READ (e.g. a mid-read TimeoutError).
+      `signature`   READ_SIG response (a non-32-byte value models a short NAK, not a signature)."""
+    def __init__(self, num_pages=135, version=None, signature=None, counters=(7,),
+                 locked_from=None, rollover=True, page_faults=None, pages=None, **kw):
+        kw.setdefault("uid", b"\x04\x11\x22\x33\x44\x55\x66")
+        kw.setdefault("sak", b"\x00")
+        kw.setdefault("atqa", b"\x44\x00")            # wire LSB-first == semantic 00 44
+        super().__init__(**kw)
+        self.num_pages = num_pages
+        self.ntag_version = (version if version is not None
+                             else bytes.fromhex("0004040201001103"))  # byte6 0x11 = NTAG215
+        self.ntag_signature = signature if signature is not None else bytes(range(32))
+        self.ntag_counter_values = list(counters)
+        self.locked_from = locked_from
+        self.rollover = rollover
+        self.page_faults = dict(page_faults or {})
+        self.ntag_pages = (dict(pages) if pages is not None
+                           else {p: bytes([p & 0xFF, 0xA0 | (p & 0x0F), 0xBB, 0xCC])
+                                 for p in range(num_pages)})
+
+    def hf14a_raw(self, options, resp_timeout_ms=100, data=None, bitlen=None):
+        self._require_reader()
+        cmd = bytes(data or b"")
+        if not cmd:
+            return b""
+        if cmd[0] == 0x60:                             # GET_VERSION
+            return self.ntag_version
+        if cmd[0] == 0x3C:                             # READ_SIG
+            return self.ntag_signature
+        if cmd[0] == 0x39:                             # READ_CNT <index>
+            idx = cmd[1] if len(cmd) > 1 else 0
+            if idx < len(self.ntag_counter_values):
+                v = self.ntag_counter_values[idx]
+                return bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF])
+            return b""
+        if cmd[0] == 0x30:                             # READ <page> -> 16 bytes (4 pages)
+            page = cmd[1] if len(cmd) > 1 else 0
+            if page in self.page_faults:
+                raise self.page_faults[page]           # e.g. a mid-read TimeoutError
+            # Past the end of memory FIRST (a real NTAG wraps / NAKs there regardless of any
+            # password region, which lives WITHIN memory), then the password gate on real pages.
+            if page >= self.num_pages:
+                if not self.rollover:
+                    return b""                         # NAKs past end of memory (no wrap)
+                page = page % self.num_pages           # a READ past end WRAPS to page 0
+            if self.locked_from is not None and page >= self.locked_from:
+                return b""                             # password NAK (a locked page in memory)
+            out = bytearray()
+            for i in range(4):
+                out += self.ntag_pages.get(page + i, bytes(4))
+            return bytes(out)
+        return b""
 
 
 def cham_daemon(fake, learned=None, cracker=None):
@@ -2367,6 +2467,198 @@ def test_cham_dfu_cancel_through_run(check):
           str(ans))
 
 
+# --------------------------------------------------------------------------
+# NTAG / Ultralight read: page dump (x7d shape) + version/signature/counters.
+# --------------------------------------------------------------------------
+def test_cham_read_ntag(check):
+    fake = FakeUltralight()
+    d = cham_daemon(fake)
+    r = d.read_ntag({})
+    check("read_ntag ensures reader mode before reading (tag-mode default -> reader)",
+          fake.reader_mode is True, str(fake.mode_sets))
+    check("read_ntag reports present + 7-byte uid + int sak (mirrors x7d read_ntag shape)",
+          r["present"] is True and r["uid"] == "04 11 22 33 44 55 66" and r["sak"] == 0x00, str(r))
+    check("read_ntag reads all NTAG215 pages (135) as 4-byte hex, page 0 first",
+          len(r["pages"]) == 135 and r["pages"]["0"] == chameleon_d.hx(fake.ntag_pages[0]),
+          "%d pages" % len(r["pages"]))
+    check("read_ntag surfaces the detected type (NTAG_215) so emulate can reproduce it",
+          r.get("type") == "NTAG_215", str(r.get("type")))
+    check("read_ntag surfaces version + signature where the chip exposes them (NTAG21x)",
+          r.get("version") == chameleon_d.hx(fake.ntag_version)
+          and r.get("signature") == chameleon_d.hx(fake.ntag_signature), str(r.get("version")))
+    check("read_ntag returns the NFC one-way counter keyed by its index (NTAG21x has one)",
+          r.get("counters") == {"0": 7}, str(r.get("counters")))
+    # no card -> present:false (never raises)
+    r2 = cham_daemon(FakeUltralight(present=False)).read_ntag({})
+    check("read_ntag with no card reports present:false", r2 == {"present": False}, str(r2))
+
+
+# --------------------------------------------------------------------------
+# NTAG read is partial (not fatal) when a page is password-locked (PWD_AUTH).
+# --------------------------------------------------------------------------
+def test_cham_read_ntag_locked(check):
+    fake = FakeUltralight(locked_from=130)        # pages 130..134 NAK (password-protected)
+    d = cham_daemon(fake)
+    r = d.read_ntag({})
+    check("read_ntag reads what is readable when a page NAKs (no crash, full count kept)",
+          r["present"] is True and len(r["pages"]) == 135, "%d pages" % len(r["pages"]))
+    check("read_ntag marks a locked page null and keeps the readable ones intact",
+          r["pages"]["0"] is not None and r["pages"]["129"] is not None
+          and r["pages"]["130"] is None and r["pages"]["134"] is None,
+          str((r["pages"].get("129"), r["pages"].get("130"))))
+
+
+# --------------------------------------------------------------------------
+# decode routes an NTAG card to read_ntag, NOT the Classic key-recovery chain.
+# --------------------------------------------------------------------------
+def test_cham_decode_ntag_route(check):
+    fake = FakeUltralight()
+    d = cham_daemon(fake)
+    d.emit = lambda o: None
+    r = d.decode({})
+    check("decode routes an NTAG card (sak 0x00, atqa 0x0044) to read_ntag (kind + pages)",
+          r.get("kind") == "ntag" and "pages" in r and "sectors" not in r,
+          str(sorted(r.keys())))
+    check("decode NTAG route reads pages and never runs the Classic key-recovery chain",
+          len(r["pages"]) == 135 and fake.reads == [] and fake.acquired == [], str(fake.reads))
+
+
+# --------------------------------------------------------------------------
+# UL/NTAG slot emulation: emulate_load_ntag sets the type + writes pages + uid.
+# --------------------------------------------------------------------------
+def test_cham_emulate_load_ntag(check):
+    fake = FakeChameleon(active=0)
+    d = cham_daemon(fake)
+    ntag_pages = {str(p): (bytes([p & 0xFF]) + b"\xaa\xbb\xcc").hex() for p in range(135)}
+    r = d.emulate_load_ntag({"type": "NTAG_215", "pages": ntag_pages, "uid": "04112233445566"})
+    check("emulate_load_ntag sets the active slot's type (+ default) to the UL/NTAG type",
+          fake.type_sets[-1] == (0, TagSpecificType.NTAG_215)
+          and fake.default_sets[-1] == (0, TagSpecificType.NTAG_215), str(fake.type_sets))
+    check("emulate_load_ntag writes every page into the UL/NTAG emulator (135 pages)",
+          r["pages"] == 135 and len(fake.emu_pages) == 135
+          and fake.emu_pages[0] == bytes([0]) + b"\xaa\xbb\xcc", str(r))
+    check("emulate_load_ntag sets the anti-collision UID/ATQA(0044)/SAK(00) for the emulated tag",
+          fake.anti_coll is not None and fake.anti_coll[0] == bytes.fromhex("04112233445566")
+          and fake.anti_coll[1] == b"\x44\x00" and fake.anti_coll[2] == b"\x00", str(fake.anti_coll))
+    check("emulate_load_ntag reports the loaded type + that a uid was set",
+          r["type"] == "NTAG_215" and r["uid"] is True and r["loaded"] is True, str(r))
+    # a non-UL/NTAG (Classic) type is refused: this path is UL/NTAG only
+    err = d.handle({"id": 1, "method": "emulate_load_ntag",
+                    "params": {"type": "MIFARE_1024", "pages": {}}})
+    check("emulate_load_ntag refuses a non-UL/NTAG type (Classic slot never mis-configured)",
+          "error" in err and "UL/NTAG" in err["error"], str(err))
+    # version / signature / index-keyed counters are loaded when present + auth counter reset
+    f2 = FakeChameleon(active=0)
+    cham_daemon(f2).emulate_load_ntag(
+        {"type": "MF0UL11", "pages": {"0": "04112233"},
+         "version": "0004030101000b03", "signature": "aa" * 32,
+         "counters": {"0": 5, "1": 6, "2": 7}})
+    check("emulate_load_ntag loads version/signature/index-keyed counters + resets auth cnt",
+          f2.ntag_emu_version == bytes.fromhex("0004030101000b03")
+          and f2.ntag_emu_signature == bytes.fromhex("aa" * 32)
+          and f2.ntag_emu_counters[0][0] == 5 and f2.ntag_emu_counters[2][0] == 7
+          and f2.ntag_auth_reset == 1, str((f2.ntag_emu_counters, f2.ntag_auth_reset)))
+    # no explicit uid: the emulated UID is derived from pages 0-1 (uid[0:3]+BCC0, uid[3:7])
+    f3 = FakeChameleon(active=0)
+    cham_daemon(f3).emulate_load_ntag(
+        {"type": "NTAG_215", "pages": {"0": "04112288", "1": "33445566"}})
+    check("emulate_load_ntag derives the emulated UID from pages 0-1 when no uid given",
+          f3.anti_coll is not None and f3.anti_coll[0] == bytes.fromhex("04112233445566"),
+          str(f3.anti_coll))
+
+
+# --------------------------------------------------------------------------
+# NTAG read - unknown size (no / unrecognized GET_VERSION) must NOT truncate.
+# --------------------------------------------------------------------------
+def test_cham_read_ntag_unknown_size(check):
+    # (a) a real 135-page tag whose GET_VERSION storage byte is UNRECOGNIZED: the type does not
+    # resolve, so the bounded fallback must dump ALL 135 pages (via rollover), never 16.
+    ver = bytes.fromhex("0004040201009903")           # byte6 0x99 = unmapped storage size
+    ra = cham_daemon(FakeUltralight(num_pages=135, version=ver, rollover=True)).read_ntag({})
+    check("read_ntag dumps a full 135-page tag with an unrecognized storage byte (not 16 pages)",
+          len(ra["pages"]) == 135 and all(ra["pages"][str(p)] is not None for p in range(135)),
+          "%d pages" % len(ra["pages"]))
+    check("read_ntag omits the type when GET_VERSION does not resolve one (still carries version)",
+          "type" not in ra and ra.get("version") == chameleon_d.hx(ver), str(ra.get("type")))
+    # (b) an unknown-size tag (no GET_VERSION) with a locked page mid-way: the NAK marks the
+    # page null and the dump CONTINUES to the real end (rollover), never truncating at the NAK.
+    rb = cham_daemon(FakeUltralight(num_pages=48, version=b"", locked_from=44)).read_ntag({})
+    check("read_ntag (unknown size) marks a locked page null and continues, not truncates at the NAK",
+          len(rb["pages"]) == 48 and rb["pages"]["43"] is not None
+          and rb["pages"]["44"] is None and rb["pages"]["47"] is None, "%d pages" % len(rb["pages"]))
+    # (c) an unknown-size tag that NAKs past the end (no rollover): stop after a small NAK run
+    # and drop that off-the-end run so no phantom pages past the real end are reported.
+    rc = cham_daemon(FakeUltralight(num_pages=16, version=b"", rollover=False)).read_ntag({})
+    check("read_ntag (unknown size, NAKs past end) stops at the real end with no phantom null pages",
+          len(rc["pages"]) == 16 and all(rc["pages"][str(p)] is not None for p in range(16)),
+          str(sorted(int(k) for k in rc["pages"])))
+
+
+# --------------------------------------------------------------------------
+# NTAG read - raw safety: a mid-read TimeoutError -> null page; a short-NAK
+# signature -> rejected (only an exact 32-byte signature is stored).
+# --------------------------------------------------------------------------
+def test_cham_read_ntag_raw_safety(check):
+    fake = FakeUltralight(page_faults={5: TimeoutError("read stalled")}, signature=b"\x04")
+    r = cham_daemon(fake).read_ntag({})
+    check("read_ntag treats a mid-read TimeoutError as a null page and keeps going (no failed request)",
+          len(r["pages"]) == 135 and r["pages"]["5"] is None and r["pages"]["4"] is not None,
+          str(r["pages"].get("5")))
+    check("read_ntag rejects a signature that is not exactly 32 bytes (a short NAK is not a signature)",
+          "signature" not in r, str(r.get("signature")))
+
+
+# --------------------------------------------------------------------------
+# Regression: a blank / magic MIFARE Classic (SAK 00, ATQA 0004) stays Classic.
+# --------------------------------------------------------------------------
+def test_cham_decode_blank_classic_regression(check):
+    learned, path = _fresh_learned()
+    # SAK 0x00 like an NTAG, but ATQA is 0x0004 (wire 04 00), NOT 0x0044: a blank / magic Classic.
+    fake = FakeChameleon(sak=b"\x00", atqa=b"\x04\x00")
+    d = cham_daemon(fake, learned=learned)
+    d.emit = lambda o: None
+    r = d.decode({})
+    check("decode keeps a blank Classic (SAK 00, ATQA 0004) on the Classic chain, not read_ntag",
+          "kind" not in r and "sectors" in r and "pages" not in r
+          and r["sectors"] == 16 and fake.reads != [], str(sorted(r.keys())))
+    os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# Round-trip: read -> emulate. A gap (locked/omitted page) is not written as a
+# fabricated page (separate runs around it), and type/UID/metadata match the read.
+# --------------------------------------------------------------------------
+def test_cham_emulate_load_ntag_gap(check):
+    # (a) a MIDDLE gap: page 5 omitted -> two separate emulator write runs (0..4 and 6..9),
+    # never a fabricated zero page at 5.
+    fg = FakeChameleon(active=0)
+    cham_daemon(fg).emulate_load_ntag(
+        {"type": "MF0UL11",
+         "pages": {str(p): (bytes([p]) + b"\x00\x00\x00").hex() for p in range(10) if p != 5}})
+    check("emulate_load_ntag splits into separate runs around a missing page (no fabricated page)",
+          5 not in fg.emu_pages and fg.emu_page_writes == [(0, 5), (6, 4)], str(fg.emu_page_writes))
+    # (b) round-trip: read a password-locked NTAG (pages 130..134 null), feed the READ result
+    # straight into emulate (as the Swift document does). The locked pages are not written, and
+    # the emulated type / UID / version / counters match what was read - not defaults or guesses.
+    reader = FakeUltralight(locked_from=130)
+    read = cham_daemon(reader).read_ntag({})
+    emu = FakeChameleon(active=0)
+    pages = {k: v for k, v in read["pages"].items() if v is not None}   # locked pages omitted
+    cham_daemon(emu).emulate_load_ntag(
+        {"type": read["type"], "pages": pages, "uid": read["uid"].replace(" ", ""),
+         "version": read["version"].replace(" ", ""), "counters": read.get("counters")})
+    check("round-trip emulate reproduces the READ type (NTAG_215) and skips the locked pages",
+          emu.type_sets[-1] == (0, TagSpecificType.NTAG_215)
+          and len(emu.emu_pages) == 130 and 130 not in emu.emu_pages and 129 in emu.emu_pages,
+          str((emu.type_sets[-1], len(emu.emu_pages))))
+    check("round-trip emulate uses the tag's OWN read UID (not a live-card or page-count guess)",
+          emu.anti_coll is not None and emu.anti_coll[0] == bytes.fromhex("04112233445566"),
+          str(emu.anti_coll))
+    check("round-trip emulate carries the read version + counter metadata (not emulator defaults)",
+          emu.ntag_emu_version == bytes.fromhex(read["version"].replace(" ", ""))
+          and emu.ntag_emu_counters[0][0] == 7, str(emu.ntag_emu_counters))
+
+
 TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_read_block, test_cham_decode, test_cham_decode_partial,
          test_cham_decode_nocard, test_cham_decode_swap, test_cham_decode_user_key,
@@ -2376,7 +2668,11 @@ TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_decode_cancel, test_cham_attack_budget_guard,
          test_cham_decode_hardnested_chain, test_cham_decode_hardnested_no_anchor,
          test_cham_capability_hardnested,
+         test_cham_read_ntag, test_cham_read_ntag_locked, test_cham_read_ntag_unknown_size,
+         test_cham_read_ntag_raw_safety, test_cham_decode_ntag_route,
+         test_cham_decode_blank_classic_regression,
          test_cham_slot_config, test_cham_emulate_mode, test_cham_emulate_load,
+         test_cham_emulate_load_ntag, test_cham_emulate_load_ntag_gap,
          test_cham_emu_read, test_cham_lf_scan, test_cham_lf_write, test_cham_lf_emu,
          test_cham_slot_set_type_lf_scope,
          test_cham_magic_write, test_cham_magic_write_guards,

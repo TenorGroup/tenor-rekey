@@ -12,7 +12,11 @@ final class AppModel {
     var info: DeviceInfo?
     var card: PollResult?
     var sectors: [SectorVM] = []
-    var pages: [NtagPage] = []          // NTAG / Ultralight page dump (SAK 0x00)
+    /// The live NTAG / Ultralight read (page rows + the metadata to re-emulate it). Nil
+    /// when there is no NTAG dump on the canvas. `pages` reads its page rows so the page
+    /// view and the load-to-slot metadata are one source of truth and never drift.
+    var ntagDoc: NtagDocument?
+    var pages: [NtagPage] { ntagDoc?.pages ?? [] }   // NTAG / Ultralight page dump (SAK 0x00)
     var selected: Int?                  // selected sector index
     var selectedBlock: Int?             // selected absolute block, for the quick-look
     var decoding = false
@@ -379,7 +383,7 @@ final class AppModel {
     private func clearCardBound() {
         cloneResults = [:]
         cloneFailReasons = [:]
-        pages = []
+        ntagDoc = nil
         noKeysFound = false
     }
 
@@ -387,7 +391,7 @@ final class AppModel {
     /// its grid, page dump, and selection. The card on the reader is untouched.
     func clearDocument() {
         withAnimation(.easeInOut(duration: 0.3)) {
-            source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
+            source = nil; sectors = []; ntagDoc = nil; selected = nil; selectedBlock = nil
             cloneResults = [:]; cloneFailReasons = [:]; noKeysFound = false
         }
     }
@@ -454,9 +458,12 @@ final class AppModel {
                     lastError = "card changed during read"
                     restoreDocument()
                 } else {
-                    let pgs = Self.buildPages(r)
+                    // Keep the whole read (pages + detected type + its own UID + version /
+                    // signature / counters) so the load-to-slot path re-emulates this exact
+                    // tag, not a page-count guess against the live card.
+                    let doc = Self.buildNtagDoc(r)
                     withAnimation(.easeInOut(duration: 0.3)) {
-                        pages = pgs; source = nil; sectors = []; selected = nil
+                        ntagDoc = doc; source = nil; sectors = []; selected = nil
                     }
                 }
             } else {
@@ -464,7 +471,7 @@ final class AppModel {
                 // live as each one is searched, instead of a blank wait.
                 let count = live.sak.map { sectorsForSak($0) } ?? 16
                 withAnimation(.easeInOut(duration: 0.3)) {
-                    sectors = Self.pendingSectors(count: count); pages = []; selected = nil
+                    sectors = Self.pendingSectors(count: count); ntagDoc = nil; selected = nil
                 }
                 let r = try await activeBridge().decode(userKeys: keyStore.keys,
                     onProgress: { [weak self] ev in Task { @MainActor in self?.applyDecodeEvent(ev) } })
@@ -480,11 +487,11 @@ final class AppModel {
                         if r.cancelled != true { lastError = "no keys found on the card; the document is unchanged" }
                         restoreDocument()
                     } else if r.cancelled == true {
-                        withAnimation(.easeInOut(duration: 0.3)) { sectors = []; pages = []; selected = nil }
+                        withAnimation(.easeInOut(duration: 0.3)) { sectors = []; ntagDoc = nil; selected = nil }
                     } else {
                         withAnimation(.easeInOut(duration: 0.3)) {
                             card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
-                            sectors = []; pages = []; selected = nil
+                            sectors = []; ntagDoc = nil; selected = nil
                             noKeysFound = true
                         }
                     }
@@ -494,7 +501,7 @@ final class AppModel {
                     withAnimation(.easeInOut(duration: 0.3)) {
                         card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
                         sectors = vms
-                        pages = []
+                        ntagDoc = nil
                         selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
                         source = dump
                     }
@@ -525,10 +532,10 @@ final class AppModel {
         withAnimation(.easeInOut(duration: 0.3)) {
             if let s = source {
                 sectors = Self.buildSectors(fromDump: s)
-                pages = []
+                ntagDoc = nil
                 selected = sectors.first(where: { $0.hasKey })?.index ?? sectors.first?.index
             } else {
-                sectors = []; pages = []; selected = nil
+                sectors = []; ntagDoc = nil; selected = nil
             }
         }
     }
@@ -590,8 +597,19 @@ final class AppModel {
         guard let pages = r.pages else { return [] }
         return pages.compactMap { k, hex -> NtagPage? in
             guard let i = Int(k) else { return nil }
+            // A null value is a page that could not be read (password-locked): show it as
+            // a locked placeholder rather than dropping it, so the gap is visible.
+            guard let hex else { return NtagPage(index: i, hex: "-- -- -- --", ascii: "", locked: true) }
             return NtagPage(index: i, hex: hex, ascii: asciiOf(hex))
         }.sorted { $0.index < $1.index }
+    }
+
+    /// The full NTAG working document: the page rows plus the read metadata (detected type,
+    /// the tag's own UID, version / signature / counters) that the load-to-slot path needs
+    /// to re-emulate the exact tag that was read.
+    static func buildNtagDoc(_ r: NtagResult) -> NtagDocument {
+        NtagDocument(pages: buildPages(r), uid: r.uid, type: r.type,
+                     version: r.version, signature: r.signature, counters: r.counters)
     }
 
     /// Printable ASCII rendering of a space-separated hex page (non-printable -> '.').
@@ -918,7 +936,7 @@ final class AppModel {
             let dump = CardDump.fromBlocks(map, sak: geo.sak, name: "slot \(i + 1)")
             let vms = Self.buildSectors(fromDump: dump)
             withAnimation(.easeInOut(duration: 0.3)) {
-                source = dump; sectors = vms; pages = []
+                source = dump; sectors = vms; ntagDoc = nil
                 selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
                 selectedBlock = nil; showSlots = false
                 cloneResults = [:]; cloneFailReasons = [:]; noKeysFound = false
@@ -930,10 +948,58 @@ final class AppModel {
     }
 
     /// Load the working document into a chosen slot's HF emulator, so the Chameleon
-    /// emulates that card. Needs a held document + an emulation-capable device.
+    /// emulates that card. Needs a held document + an emulation-capable device. Routes a
+    /// MIFARE Classic source through the block path, and an NTAG / Ultralight read through
+    /// the UL/NTAG page path.
     func loadDocumentToSlot(_ i: Int) async {
-        guard let src = source else { return }
-        await writeDumpToSlot(src, slot: i)
+        if let src = source {
+            await writeDumpToSlot(src, slot: i)
+        } else if let doc = ntagDoc {
+            await writeNtagToSlot(doc, slot: i)
+        }
+    }
+
+    /// The UL/NTAG TagSpecificType name to emulate a page dump as, chosen by readable page
+    /// count. Only a FALLBACK for a read that did not resolve a type (GET_VERSION absent /
+    /// unrecognized storage byte); a read that resolved its type uses that instead.
+    static func ntagSlotType(pageCount n: Int) -> String {
+        switch n {
+        case ...20: return "MF0UL11"        // Ultralight EV1 640-bit / NTAG210 (20 pages)
+        case 21...41: return "MF0UL21"      // Ultralight EV1 1312-bit / NTAG212 (41 pages)
+        case 42...45: return "NTAG_213"     // 45 pages
+        case 46...135: return "NTAG_215"    // 135 pages
+        default: return "NTAG_216"          // 231 pages
+        }
+    }
+
+    /// Write an NTAG / Ultralight read into a chosen slot's HF emulator so the Chameleon
+    /// emulates the exact tag that was read: select the slot, enable HF, load the pages as a
+    /// UL/NTAG tag using the READ-detected type (page-count fallback only when the read did
+    /// not resolve one), the tag's OWN UID (not the live card), and its version / signature /
+    /// counters, then save. The Classic writeDumpToSlot path is untouched.
+    func writeNtagToSlot(_ doc: NtagDocument, slot i: Int) async {
+        guard capabilities.emulate, !swapping, !deviceBusy else { return }
+        slotBusy = true
+        // Use the detected type; only guess from page count when the read could not resolve one.
+        let type = doc.type ?? Self.ntagSlotType(pageCount: doc.pages.count)
+        var pageMap: [String: String] = [:]
+        for page in doc.pages where !page.locked {
+            pageMap[String(page.index)] = page.hex.replacingOccurrences(of: " ", with: "")
+        }
+        let uid = doc.uid?.replacingOccurrences(of: " ", with: "")
+        let version = doc.version?.replacingOccurrences(of: " ", with: "")
+        let signature = doc.signature?.replacingOccurrences(of: " ", with: "")
+        do {
+            let b = activeBridge()
+            try await b.slotSelect(i)
+            try await b.slotEnable(slot: i, sense: "hf", enabled: true)
+            try await b.emulateLoadNtag(pages: pageMap, type: type, uid: uid,
+                                        version: version, signature: signature, counters: doc.counters)
+            try await b.slotSave()
+            slots = try await b.slotsList()
+            lastError = nil
+        } catch { lastError = "\(error)" }
+        slotBusy = false
     }
 
     /// Write a dump into a chosen slot's HF emulator: select the slot, set its type +
@@ -1125,7 +1191,7 @@ final class AppModel {
             withAnimation(.easeInOut(duration: 0.3)) {
                 source = dump
                 sectors = vms
-                pages = []
+                ntagDoc = nil
                 selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
                 selectedBlock = nil
                 cloneResults = [:]; cloneFailReasons = [:]
@@ -1172,7 +1238,7 @@ final class AppModel {
             let dump = try savedCardStore.load(card.id)
             let vms = Self.buildSectors(fromDump: dump)
             withAnimation(.easeInOut(duration: 0.3)) {
-                source = dump; sectors = vms; pages = []
+                source = dump; sectors = vms; ntagDoc = nil
                 selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
                 selectedBlock = nil; showLibrary = false
                 cloneResults = [:]; cloneFailReasons = [:]; noKeysFound = false

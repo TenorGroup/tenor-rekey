@@ -209,6 +209,72 @@ def _sense(s):
     return TagSenseType.LF if str(s).lower() == "lf" else TagSenseType.HF
 
 
+# ---- Ultralight / NTAG geometry (kept local, mirrors the reference GUI's
+# mifare_ultralight/general.dart) so read_ntag can size a dump per chip type and the
+# slot-emulate path can refuse a non-UL/NTAG type. -----------------------------------
+
+# The UL/NTAG HF TagSpecificType set (>= 1100). A slot may only be UL/NTAG-emulated
+# with one of these; any other HF type is refused by emulate_load_ntag.
+_NTAG_UL_TYPES = frozenset({
+    TagSpecificType.NTAG_210, TagSpecificType.NTAG_212, TagSpecificType.NTAG_213,
+    TagSpecificType.NTAG_215, TagSpecificType.NTAG_216, TagSpecificType.MF0ICU1,
+    TagSpecificType.MF0ICU2, TagSpecificType.MF0UL11, TagSpecificType.MF0UL21,
+})
+
+# Page count per chip type (4-byte pages). Values from the NXP datasheets, matching
+# the GUI's mfUltralightGetPagesCount.
+_UL_PAGE_COUNT = {
+    TagSpecificType.MF0ICU1: 16,             # Mifare Ultralight
+    TagSpecificType.MF0ICU2: 48,             # Mifare Ultralight C
+    TagSpecificType.MF0UL11: 20,             # Ultralight EV1 (640 bit)
+    TagSpecificType.MF0UL21: 41,             # Ultralight EV1 (1312 bit)
+    TagSpecificType.NTAG_210: 20,
+    TagSpecificType.NTAG_212: 41,
+    TagSpecificType.NTAG_213: 45,
+    TagSpecificType.NTAG_215: 135,
+    TagSpecificType.NTAG_216: 231,
+}
+
+
+def _ultralight_type(version):
+    """UL/NTAG TagSpecificType inferred from the 8-byte GET_VERSION (byte 6 = storage size),
+    mirroring the GUI's mfUltralightGetType. A short/empty version (a plain UL that NAKs
+    GET_VERSION) -> UNDEFINED so the caller reads via the bounded fallback. An UNRECOGNIZED
+    storage byte ALSO -> UNDEFINED (bounded fallback) rather than being forced to a 16-page
+    plain Ultralight: a real 135-page tag with an unexpected storage byte must dump fully,
+    not truncate to 16 pages."""
+    if len(version) < 7:
+        return TagSpecificType.UNDEFINED
+    b6 = version[6]
+    if b6 in (0x0B, 0x00):
+        return TagSpecificType.MF0UL11
+    if b6 == 0x0E:
+        return TagSpecificType.MF0UL21
+    if b6 == 0x0F:
+        return TagSpecificType.NTAG_213
+    if b6 == 0x11:
+        return TagSpecificType.NTAG_215
+    if b6 == 0x13:
+        return TagSpecificType.NTAG_216
+    return TagSpecificType.UNDEFINED          # unrecognized storage byte: bounded fallback, never truncate
+
+
+def _ultralight_pages(tt):
+    """Readable-page count for a UL/NTAG type, or 0 when the type is unknown (the caller
+    then reads until the tag rolls over / NAKs)."""
+    return _UL_PAGE_COUNT.get(tt, 0)
+
+
+def _ultralight_counters(tt):
+    """Number of one-way NFC counters the type exposes (UL EV1 = 3, NTAG21x = 1, else 0)."""
+    if tt in (TagSpecificType.MF0UL11, TagSpecificType.MF0UL21):
+        return 3
+    if tt in (TagSpecificType.NTAG_210, TagSpecificType.NTAG_212, TagSpecificType.NTAG_213,
+              TagSpecificType.NTAG_215, TagSpecificType.NTAG_216):
+        return 1
+    return 0
+
+
 # LF (125 kHz) slot types with an emulation path in v1: em410x_set_emu_id supports
 # EXACTLY these two (5-byte EM410x, 13-byte Electra). Any OTHER LF-sense type (Viking /
 # PAC / ioProx / Idteck / Jablotron / HID Prox / the EM410x ASK sub-variants with no
@@ -396,9 +462,10 @@ _DEAD = (OSError, NotOpenException, OpenFailException)
 
 class Daemon:
     METHODS = ("info", "poll", "slots_list", "slot_select", "mf_read_block",
-               "decode", "cancel",
+               "decode", "read_ntag", "cancel",
                "slot_set_type", "slot_enable", "slot_nick", "slot_save",
-               "emulate_mode", "emulate_load", "emu_read", "magic_write",
+               "emulate_mode", "emulate_load", "emulate_load_ntag", "emu_read",
+               "magic_write",
                "lf_scan", "lf_write", "lf_emu",
                "dfu_check", "dfu_flash")
 
@@ -580,6 +647,106 @@ class Daemon:
         data = c.mf1_read_one_block(block, mkt, key)
         return {"block": block, "data": hx(data)}
 
+    # ---- NTAG / Ultralight read (reader-mode 14a raw transceive) ----------------
+
+    # Consecutive NAKs on an UNKNOWN-size tag that mean the READ has walked off the end of
+    # memory (not merely a locked page): the fallback stops and drops this terminating run.
+    NTAG_OFF_END_MARGIN = 4
+    # Hard cap on any page dump so an oddly-behaving tag cannot spin (NTAG216 = 231 pages).
+    NTAG_PAGE_CAP = 256
+
+    @staticmethod
+    def _14a_raw(c, cmd, check_crc=True):
+        """One reader-mode ISO14443A transceive (auto-select + append CRC), returning the
+        tag's response bytes (empty on a NAK / no answer / transient fault). Mirrors the
+        reference GUI's send14ARaw defaults; the emulator-independent page read the Ultralight
+        scan uses. The undecorated hf14a_raw can raise UnexpectedResponseError (an unsupported
+        command / device-mode status), TimeoutError (a slow / mid-read stall), or ValueError
+        (a malformed frame) - all are collapsed to empty data so a single unreadable page is
+        a null page, not a failed daemon request. A truly dead port raises OSError from the
+        transport, which handle() catches to drop + reconnect."""
+        opts = {"activate_rf_field": 1, "wait_response": 1, "append_crc": 1,
+                "auto_select": 1, "keep_rf_field": 0,
+                "check_response_crc": 1 if check_crc else 0}
+        try:
+            return bytes(c.hf14a_raw(options=opts, resp_timeout_ms=100, data=list(cmd)))
+        except (UnexpectedResponseError, TimeoutError, ValueError):
+            return b""
+
+    def _dump_pages(self, c, count):
+        """Read a UL/NTAG tag's pages via the emulator-independent READ (0x30), keeping the
+        first 4 bytes of each 16-byte response. With a KNOWN `count` (from GET_VERSION) read
+        exactly that many, marking any unreadable (password-locked) page null but NEVER
+        stopping early. With an UNKNOWN count (0), read with a bounded fallback: a NAK marks
+        the page null and the dump CONTINUES; the walk stops when a READ rolls over to page 0
+        (past end of memory) or a run of consecutive NAKs exceeds NTAG_OFF_END_MARGIN (walked
+        off the end) - the terminating off-end null run is then dropped so no phantom pages
+        past the real end are reported. Capped at NTAG_PAGE_CAP either way."""
+        pages, page0, nak_run, pg = {}, None, 0, 0
+        limit = count if count else self.NTAG_PAGE_CAP
+        while pg < limit:
+            data = self._14a_raw(c, [0x30, pg])           # READ returns 16 bytes (4 pages)
+            if len(data) < 4:                             # NAK: password-locked OR past end
+                pages[str(pg)] = None
+                pg += 1
+                if not count:
+                    nak_run += 1
+                    if nak_run > self.NTAG_OFF_END_MARGIN:
+                        for k in range(pg - nak_run, pg):  # drop the off-the-end null run
+                            pages.pop(str(k), None)
+                        break
+                continue
+            nak_run = 0
+            first = data[:4]
+            if pg == 0:
+                page0 = first
+            elif not count and first == page0:            # rolled over to page 0: past end
+                break
+            pages[str(pg)] = hx(first)
+            pg += 1
+        return pages
+
+    def read_ntag(self, p):
+        """Dump an NTAG21x / Ultralight (SAK 0x00) as 4-byte pages via reader-mode 14a raw
+        transceive, returning the SAME shape as x7d.read_ntag ({present, uid, sak, pages})
+        plus the detected `type` and version/signature/counters where the chip exposes them
+        (UL EV1 / NTAG21x), so the emulate path can reproduce the exact tag that was read.
+
+        GET_VERSION (0x60) identifies the chip type + page count; an unresolved type reads via
+        the bounded fallback (see _dump_pages) rather than truncating. A page that needs
+        PWD_AUTH NAKs and is marked null while the dump continues. Reader-mode gated like the
+        HF read, so a card op is never issued in tag/emulator mode."""
+        c = self._connect(p.get("port"))
+        self._ensure_reader(c)
+        try:
+            tags = c.hf14a_scan()
+        except UnexpectedResponseError:
+            return {"present": False}
+        if not tags:
+            return {"present": False}
+        t = tags[0]
+        version = self._14a_raw(c, [0x60])                # GET_VERSION: 8 bytes on EV1/NTAG21x
+        ntype = _ultralight_type(version)
+        pages = self._dump_pages(c, _ultralight_pages(ntype))   # 0 count -> bounded fallback
+        out = {"present": True, "uid": hx(t["uid"]), "sak": t["sak"][0], "pages": pages}
+        if ntype != TagSpecificType.UNDEFINED:
+            out["type"] = ntype.name                      # the detected type (carried into emulate)
+        if len(version) == 8:
+            out["version"] = hx(version)
+            sig = self._14a_raw(c, [0x3C, 0x00])          # READ_SIG: EXACTLY 32 bytes when present
+            if len(sig) == 32 and any(sig):               # a short NAK (e.g. one byte) is NOT a signature
+                out["signature"] = hx(sig)
+        # Counters keyed by INDEX so a failed counter is absent-at-its-index, never dropped-
+        # and-shifted (a failed counter 0 must not move counter 1's value into slot 0).
+        counters = {}
+        for i in range(_ultralight_counters(ntype)):
+            r = self._14a_raw(c, [0x39, i])               # READ_CNT: 3-byte LE counter value
+            if len(r) >= 3:
+                counters[str(i)] = r[0] | (r[1] << 8) | (r[2] << 16)
+        if counters:
+            out["counters"] = counters
+        return out
+
     # ---- slot library (Chameleon-only; the shell gates on capabilities.slots) --
 
     def slot_set_type(self, p):
@@ -686,6 +853,72 @@ class Daemon:
         CHUNK = 128
         for off in range(0, len(buf), CHUNK):
             c.mf1_write_emu_block_data(start + off // 16, bytes(buf[off:off + CHUNK]))
+
+    def emulate_load_ntag(self, p):
+        """Load a UL/NTAG page dump into the ACTIVE slot's HF emulator as an Ultralight /
+        NTAG tag. Mirrors the reference GUI's Ultralight slot-load: set the slot tag type
+        (+ default data) to the UL/NTAG type, set the anti-collision (UID/ATQA/SAK), write
+        the 4-byte emulator pages over contiguous runs, then set the version / signature /
+        counters where present. `type` MUST be a UL/NTAG type (NTAG_213/215/216, MF0UL11/21,
+        ...) - any other type is refused, so this path never mis-configures a Classic slot.
+        `pages`: {page-index: 4-byte hex}. `uid` (optional, hex): the emulated 7-byte UID;
+        when absent it is derived from pages 0-1 if those were loaded.
+
+        This is the UL/NTAG sibling of emulate_load (which handles MIFARE Classic blocks);
+        both operate on the active slot the caller selected."""
+        c = self._connect(p.get("port"))
+        tt = _resolve_type(p["type"])
+        if tt not in _NTAG_UL_TYPES:
+            raise RuntimeError("emulate_load_ntag needs a UL/NTAG tag type, got %s" % tt.name)
+        sn = SlotNumber.from_fw(int(c.get_active_slot()))
+        c.set_slot_tag_type(sn, tt)
+        c.set_slot_data_default(sn, tt)
+        pages = p.get("pages") or {}
+        items = sorted((int(k), bytes.fromhex(v.replace(" ", "")))
+                       for k, v in pages.items() if v)
+        by_index = dict(items)
+        # The emulated identity: an explicit `uid` wins; else derive the 7-byte UID from
+        # pages 0-1 (page0 = uid[0:3] + BCC0, page1 = uid[3:7]) when both were loaded. NTAG /
+        # UL are ATQA 0x0044 / SAK 0x00. Skipped when neither a uid nor page 0/1 is available.
+        uid = bytes.fromhex((p.get("uid") or "").replace(" ", "")) if p.get("uid") else b""
+        if not uid and 0 in by_index and 1 in by_index:
+            uid = by_index[0][:3] + by_index[1][:4]
+        uid_set = False
+        if uid:
+            c.hf14a_set_anti_coll_data(uid, b"\x44\x00", b"\x00", b"")
+            uid_set = True
+        # Write pages 4 at a time via contiguous runs (mfu_write_emu_page_data takes a
+        # multiple of 4 bytes and writes from page_start). A sparse dump (a locked page
+        # omitted) loads as separate runs, so a hole is never written as a fabricated page.
+        written, run_start, run_buf, prev = 0, None, bytearray(), None
+        for pg, data in items:
+            if prev is None or pg != prev + 1:
+                if run_start is not None:
+                    c.mfu_write_emu_page_data(run_start, bytes(run_buf))
+                run_start, run_buf = pg, bytearray()
+            run_buf += data
+            written += 1
+            prev = pg
+        if run_start is not None:
+            c.mfu_write_emu_page_data(run_start, bytes(run_buf))
+        # Version / signature / counters (UL EV1 / NTAG21x), best-effort like the GUI, so the
+        # emulated tag reproduces the metadata that was read - not the emulator defaults.
+        version = (p.get("version") or "").replace(" ", "")
+        if version:
+            c.mf0_ntag_set_version_data(bytes.fromhex(version))
+        signature = (p.get("signature") or "").replace(" ", "")
+        if signature:
+            c.mf0_ntag_set_signature_data(bytes.fromhex(signature))
+        # Counters arrive keyed by index ({index: value}) so each is written to its own
+        # emulator counter; a legacy list is still accepted (index = position).
+        counters = p.get("counters") or {}
+        pairs = (sorted(counters.items(), key=lambda kv: int(kv[0]))
+                 if isinstance(counters, dict) else list(enumerate(counters)))
+        for idx, val in pairs:
+            c.mfu_write_emu_counter_data(int(idx), int(val), True)
+        if pairs:
+            c.mfu_reset_auth_cnt()
+        return {"pages": written, "loaded": True, "type": tt.name, "uid": uid_set}
 
     def emu_read(self, p):
         """Read the active slot's HF emulator memory back as a block-index -> hex map
@@ -1563,6 +1796,15 @@ class Daemon:
         target = t["uid"]                                 # the card we committed to
         atqa = t["atqa"][::-1]                            # wire (LSB-first) -> semantic
         sak = t["sak"]
+        # Route a non-Classic card out of the crypto1 key-recovery chain: an NTAG /
+        # Ultralight (SAK 0x00, ATQA 0x0044) can never crypto1-auth, so the whole
+        # check-keys + nonce-attack chain would grind to nothing. Read its pages
+        # instead (mirrors x7d.decode's guard). A blank/magic Classic (SAK 0x00,
+        # ATQA 0x0004) is NOT ntag and falls through to the Classic chain.
+        if card_kind(sak[0], atqa) == "ntag":
+            out = self.read_ntag(p)
+            out["kind"] = "ntag"
+            return out
         n = sector_count(sak[0])
 
         # Key order: user keys first, then learned (ranked), then the dictionary.

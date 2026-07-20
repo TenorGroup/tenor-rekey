@@ -76,20 +76,45 @@ struct FormatResult: Codable, Sendable {
     let error: String?      // set when the daemon aborted (wrong / swapped target card)
 }
 
-/// Result of an NTAG / Ultralight (SAK 0x00) page dump.
+/// Result of an NTAG / Ultralight (SAK 0x00) page dump. A page value is null when it
+/// could not be read (a password-protected page that NAKs) - the readable pages are
+/// still returned. `type` is the detected TagSpecificType name (nil when GET_VERSION did
+/// not resolve one). `version` / `signature` / `counters` are present only where the chip
+/// exposes them (UL EV1 / NTAG21x); the X7 daemon omits type/version/signature/counters.
+/// `counters` is keyed by counter index so a failed counter is absent-at-its-index rather
+/// than shifting later values.
 struct NtagResult: Codable, Sendable {
     let present: Bool
     let uid: String?
     let sak: Int?
-    let pages: [String: String]?    // page index -> 4-byte hex
+    let pages: [String: String?]?   // page index -> 4-byte hex, or null if unreadable
+    var type: String? = nil         // detected TagSpecificType name (e.g. "NTAG_215")
+    var version: String? = nil      // 8-byte GET_VERSION hex
+    var signature: String? = nil    // originality signature hex
+    var counters: [String: Int]? = nil   // counter index -> value
 }
 
-/// One NTAG page row for the page table.
+/// One NTAG page row for the page table. `locked` marks a page that could not be read
+/// (password-protected): its bytes are shown as a placeholder rather than real data.
 struct NtagPage: Identifiable, Equatable {
     let index: Int
     let hex: String
     let ascii: String
+    var locked: Bool = false
     var id: Int { index }
+}
+
+/// A live NTAG / Ultralight read held on the canvas: the page rows plus the metadata
+/// needed to re-emulate the exact tag that was read (its detected type, its own UID, and
+/// version / signature / counters). Kept as one unit so the page view and the load-to-slot
+/// path share one source of truth and can never drift.
+struct NtagDocument: Equatable {
+    var pages: [NtagPage]
+    var uid: String?
+    var type: String?               // detected TagSpecificType name (nil when undetermined)
+    var version: String?
+    var signature: String?
+    var counters: [String: Int]?
 }
 
 /// Result of an apdu passthrough. `present` is false when no card; `resp` is

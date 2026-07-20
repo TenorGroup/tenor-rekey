@@ -383,6 +383,21 @@ actor DeviceBridge {
     func emulateLoad(blocks: [String: String]) async throws {
         _ = try await request("emulate_load", params: EmulateLoadParam(blocks: blocks), timeout: .seconds(120), as: EmulateLoadResult.self)
     }
+    /// Load a UL/NTAG page dump into the ACTIVE slot's HF emulator as an Ultralight / NTAG
+    /// tag: set the slot type, write the 4-byte pages, set the anti-coll (UID), and load the
+    /// version / signature / counters so the emulated tag reproduces the one that was read.
+    /// `type` is a UL/NTAG TagSpecificType name (e.g. "NTAG_215"); `uid` is the emulated UID
+    /// hex (nil -> derived from pages 0-1); `counters` are keyed by counter index. The Classic
+    /// emulateLoad path above is untouched.
+    func emulateLoadNtag(pages: [String: String], type: String, uid: String?,
+                         version: String? = nil, signature: String? = nil,
+                         counters: [String: Int]? = nil) async throws {
+        _ = try await request("emulate_load_ntag",
+                              params: EmulateLoadNtagParam(pages: pages, type: type, uid: uid,
+                                                           version: version, signature: signature,
+                                                           counters: counters),
+                              timeout: .seconds(120), as: EmulateLoadNtagResult.self)
+    }
     /// Read the active slot's HF emulator memory back as a block-index -> hex map.
     func emuRead(count: Int) async throws -> [String: String] {
         try await request("emu_read", params: EmuReadParam(count: count), timeout: .seconds(120), as: EmuReadResult.self).blocks
@@ -460,6 +475,10 @@ actor DeviceBridge {
     private struct SlotNickParam: Encodable { let slot: Int; let sense: String; let name: String? }
     private struct EmulateModeParam: Encodable { let reader: Bool }
     private struct EmulateLoadParam: Encodable { let blocks: [String: String] }
+    private struct EmulateLoadNtagParam: Encodable {
+        let pages: [String: String]; let type: String; let uid: String?
+        let version: String?; let signature: String?; let counters: [String: Int]?
+    }
     private struct EmuReadParam: Encodable { let count: Int }
     private struct LfWriteParams: Encodable { let kind: String; let id: String }
     private struct LfEmuParams: Encodable { let id: String }
@@ -472,6 +491,7 @@ actor DeviceBridge {
     private struct SavedResult: Decodable { let saved: Bool }
     private struct EmulateModeResult: Decodable { let reader: Bool }
     private struct EmulateLoadResult: Decodable { let blocks: Int; let loaded: Bool }
+    private struct EmulateLoadNtagResult: Decodable { let pages: Int; let loaded: Bool; let type: String }
     private struct CloneParams: Encodable {
         let blocks: [String: String]; let keys: [String: [String]]
         let trailers: Bool; let uid: Bool; let target_uid: String?

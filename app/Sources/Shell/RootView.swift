@@ -255,7 +255,9 @@ private struct ActionBar: View {
             }
             if model.capabilities.emulate {
                 EmulateToggle()
-                if model.source != nil { LoadToSlotMenu() }
+                // A held Classic document (source) OR a live NTAG / Ultralight page dump
+                // can be loaded into a slot to emulate.
+                if model.source != nil || !model.pages.isEmpty { LoadToSlotMenu() }
             }
             // Firmware update (DFU), gated on the device advertising it: the X7 has
             // dfu:false and never shows it. Opening the sheet reads the current + latest
