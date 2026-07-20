@@ -17,10 +17,19 @@ Hex at the JSON boundary is lowercase space-separated ("01 02 03 04"); keys are
 12-char hex. SAK is an int (matching x7d, so the shell's parser is unchanged).
 """
 import sys
+import os
+import re
 import json
 import time
 import queue
+import shutil
+import hashlib
+import zipfile
+import tempfile
 import threading
+import subprocess
+import collections
+import importlib.util
 
 # Vendored upstream engine (GPLv3, RfidResearchGroup/ChameleonUltra). Imports on a
 # bare interpreter - serial/colorama/prompt_toolkit are optional in the package.
@@ -52,6 +61,46 @@ except Exception:                        # pragma: no cover - import guard
 
 # USB CDC vendor id of the Chameleon Ultra / Lite (VID 0x6868, PID 0x8686).
 CHAMELEON_VID = 0x6868
+
+# Firmware update (Nordic Secure DFU). In normal run the device is CDC VID 0x6868;
+# once rebooted into the bootloader it re-enumerates as VID 0x1915 / PID 0x521f. The
+# exact 10-byte ENTER_BOOTLOADER frame (cmd 0x03f2 = 1010) is taken verbatim from the
+# upstream resource/tools/enter_dfu.py: SOF 0x11, header-LRC 0xef, cmd 0x03 0xf2,
+# status 0x00 0x00, length 0x00 0x00, header-LRC 0x0b, data-LRC 0x00.
+DFU_VID = 0x1915
+DFU_PID = 0x521f
+DFU_ENTER_FRAME = b"\x11\xef\x03\xf2\x00\x00\x00\x00\x0b\x00"
+# Seconds to wait for the bootloader port to re-appear after the enter-DFU write.
+DFU_WAIT_SECONDS = 20
+# After the first new DFU port appears, keep watching this long for a SECOND one to enumerate
+# (USB re-enum is sub-second, so a second appearing within this settle window means another
+# device is in DFU - the target is then ambiguous and the flash is refused).
+DFU_SETTLE_SECONDS = 2.0
+# Firmware source (v1 is DOWNLOAD-ONLY): the model-specific application-only asset from the
+# official RfidResearchGroup/ChameleonUltra RELEASES. No local files, no nightlies, no CI
+# workflow artifacts, no arbitrary URLs - only the official release asset for the model.
+GITHUB_RELEASES = "https://api.github.com/repos/RfidResearchGroup/ChameleonUltra/releases"
+# Per-asset API endpoint. Downloading through the pinned asset ID (with Accept:
+# application/octet-stream) fetches the EXACT asset resolved during this op, so deleting +
+# replacing an asset under the same tag/filename between resolve and download cannot swap
+# the bytes (browser_download_url would follow the new asset).
+GITHUB_ASSET = "https://api.github.com/repos/RfidResearchGroup/ChameleonUltra/releases/assets/%s"
+# Hard cap on the firmware download (the app image is well under 1 MB; this bounds a
+# truncated/oversized/hostile response). A download that exceeds it is refused.
+MAX_FIRMWARE_BYTES = 16 * 1024 * 1024
+# Nordic dfu-cc Hash.hash_type enum -> hashlib algorithm (mirrors the GUI validateFiles:
+# SHA128 -> sha1, SHA256 -> sha256, SHA512 -> sha512). CRC / NO_HASH are not accepted.
+_HASH_ALGO = {2: "sha1", 3: "sha256", 4: "sha512"}
+# Nordic dfu-cc FwType.APPLICATION - the only image type this tool will flash (a
+# SOFTDEVICE / BOOTLOADER / SOFTDEVICE_BOOTLOADER declared type is a full package).
+_FWTYPE_APPLICATION = 0
+# Filenames that mark a FULL package (bootloader + softdevice). An app-only package
+# ships exactly the application pair (+ manifest); anything naming a bootloader or
+# softdevice image is a full-dfu zip, which can BRICK on a mid-flash failure.
+_FULL_MARKERS = ("bootloader", "softdevice", "sd_bl")
+# Shown when the running firmware cannot be reached to trigger the reboot-into-DFU.
+_MANUAL_FALLBACK = ("power the device off, hold button B while plugging in USB "
+                    "(LEDs 4 and 5 blink = bootloader), then run the update again.")
 
 # How many learned keys to try (after user keys, before the dictionary). Mirrors
 # x7d so the two readers rerank identically.
@@ -93,6 +142,12 @@ def hx(b):
 def _valid_key_hex(k):
     """A key must be exactly 12 hex chars, else it cannot be used for auth."""
     return isinstance(k, str) and len(k) == 12 and all(c in "0123456789abcdefABCDEF" for c in k)
+
+
+def _is_hex(s, n):
+    """True when `s` is exactly `n` lowercase/uppercase hex chars (used to validate a
+    sha256 digest string from the releases API before trusting it)."""
+    return isinstance(s, str) and len(s) == n and all(c in "0123456789abcdefABCDEF" for c in s)
 
 
 # ---- MIFARE Classic geometry (kept local so this daemon does not pull in the X7
@@ -163,6 +218,121 @@ def _capabilities(model):
     return caps
 
 
+# ---- firmware DFU package validation (brick-safety) ------------------------
+# The signed init packet (application.dat) is a Nordic dfu-cc protobuf. We do not
+# pull in a protobuf runtime for one nested field walk; a tiny wire-format reader
+# extracts exactly the path the GUI's validateFiles reads:
+#   Packet.signed_command(2) -> SignedCommand.command(1) -> Command.init(2)
+#     -> InitCommand.hash(8) -> {Hash.hash_type(1), Hash.hash(2)}
+# then confirms reversed(stored hash) == the hash of application.bin. This proves the
+# package is (a) signed and (b) matches its own image, before anything is flashed.
+
+def _pb_varint(data, i):
+    """Read a base-128 varint at offset i; returns (value, next_offset)."""
+    shift, result = 0, 0
+    while True:
+        b = data[i]
+        i += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, i
+        shift += 7
+
+
+def _pb_iter(data):
+    """Yield (field_number, wire_type, value) for a protobuf message. `value` is the
+    raw bytes for length-delimited fields (wire 2) and the int for varints (wire 0);
+    fixed 32/64-bit fields are skipped. A malformed buffer raises (surfaced as a clean
+    'not a valid init packet' error), never a silent partial parse."""
+    i, n = 0, len(data)
+    while i < n:
+        tag, i = _pb_varint(data, i)
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            val, i = _pb_varint(data, i)
+            yield field, wire, val
+        elif wire == 2:
+            ln, i = _pb_varint(data, i)
+            yield field, wire, data[i:i + ln]
+            i += ln
+        elif wire == 5:
+            i += 4
+        elif wire == 1:
+            i += 8
+        else:
+            raise ValueError("bad protobuf wire type %d" % wire)
+
+
+def _pb_single(data, field):
+    """The (wire_type, value) for a SINGULAR `field`, or (None, None) if absent. Raises
+    ValueError on a DUPLICATE occurrence: for security-relevant singular fields (type,
+    sizes, hash), a repeated field could make the host validator and the bootloader read
+    different values, so a duplicate is refused rather than silently taking the first."""
+    found = None
+    for f, w, v in _pb_iter(data):
+        if f == field:
+            if found is not None:
+                raise ValueError("duplicate protobuf field %d" % field)
+            found = (w, v)
+    return found if found is not None else (None, None)
+
+
+def _validate_init_packet(dat, bin_data):
+    """Confirm the init packet DECLARES an app-only image whose hash matches its image.
+    Checks, in order (all fail closed; security-relevant singular fields are read with
+    _pb_single so a DUPLICATE field is refused, not silently first-wins):
+      - the package carries a signed_command wrapper (the shape of an official release;
+        the nRF bootloader is the real signature authority, we do not verify ECDSA here);
+      - InitCommand.type is PRESENT and == APPLICATION, and neither sd_size nor bl_size is
+        set, so a renamed FULL package (a signed bootloader+softdevice image dropped in as
+        an application pair) is refused on its DECLARED type - a MISSING type is refused too;
+      - reversed(Hash.hash) equals the hash of `bin_data` (image integrity).
+    Raises RuntimeError with a clear reason on anything else; returns {'hash_type', 'fw_type',
+    'sd_size', 'bl_size'} on success. NEVER accepts a full / mismatched / untyped image."""
+    try:
+        _, signed = _pb_single(dat, 2)             # Packet.signed_command
+        if signed is None:
+            raise RuntimeError("firmware package is not an official signed release "
+                               "(no signed init packet)")
+        _, command = _pb_single(signed, 1)         # SignedCommand.command
+        if command is None:
+            raise RuntimeError("firmware init packet has no command")
+        _, init = _pb_single(command, 2)           # Command.init
+        if init is None:
+            raise RuntimeError("firmware package command has no init")
+        _, ftype = _pb_single(init, 4)             # InitCommand.type (FwType)
+        _, sd_size = _pb_single(init, 5)           # InitCommand.sd_size
+        _, bl_size = _pb_single(init, 6)           # InitCommand.bl_size
+        _, hashmsg = _pb_single(init, 8)           # InitCommand.hash
+        if hashmsg is None:
+            raise RuntimeError("firmware init packet carries no image hash")
+        _, htype = _pb_single(hashmsg, 1)          # Hash.hash_type
+        _, hbytes = _pb_single(hashmsg, 2)         # Hash.hash
+    except ValueError as e:                        # duplicate field / truncated / non-protobuf
+        raise RuntimeError("firmware init packet is not a valid dfu-cc packet: %s" % e)
+    # DECLARED type gate (brick-safety): the type MUST be present AND APPLICATION. A missing
+    # type is refused (fail closed - we do not lean on the proto default), as is any nonzero
+    # softdevice / bootloader size, so a full package cannot pass by omitting its type.
+    if ftype is None:
+        raise RuntimeError("firmware init packet declares no image type - refused (brick-safety)")
+    if ftype != _FWTYPE_APPLICATION:
+        raise RuntimeError("firmware init packet declares a non-application image "
+                           "(fw type %r) - full DFU refused (brick-safety)" % ftype)
+    if (sd_size or 0) != 0 or (bl_size or 0) != 0:
+        raise RuntimeError("firmware init packet declares a softdevice/bootloader image "
+                           "(sd_size=%r bl_size=%r) - full DFU refused (brick-safety)"
+                           % (sd_size, bl_size))
+    algo = _HASH_ALGO.get(htype)
+    if algo is None or not hbytes:
+        raise RuntimeError("firmware init packet uses an unsupported hash type %r" % htype)
+    expected = bytes(reversed(hbytes))             # stored hash is byte-reversed
+    actual = hashlib.new(algo, bin_data).digest()
+    if expected != actual:
+        raise RuntimeError("firmware image hash does not match the init packet")
+    return {"hash_type": algo, "fw_type": ftype,
+            "sd_size": sd_size or 0, "bl_size": bl_size or 0}
+
+
 # Transport-dead exceptions: like x7d dropping the handle on OSError, drop the
 # Chameleon handle when the port is gone so the next command reconnects cleanly.
 # (TimeoutError from send_cmd_sync is an OSError subclass.)
@@ -173,12 +343,19 @@ class Daemon:
     METHODS = ("info", "poll", "slots_list", "slot_select", "mf_read_block",
                "decode", "cancel",
                "slot_set_type", "slot_enable", "slot_nick", "slot_save",
-               "emulate_mode", "emulate_load", "emu_read", "magic_write")
+               "emulate_mode", "emulate_load", "emu_read", "magic_write",
+               "dfu_check", "dfu_flash")
 
     # Long ops whose cancel window is armed (the flag cleared) at DISPATCH, so a
     # cancel that lands before the worker starts the op still targets it and a stale
-    # cancel from a prior op cannot leak in (mirrors x7d).
-    CANCELLABLE = ("decode",)
+    # cancel from a prior op cannot leak in (mirrors x7d). dfu_flash honors the flag
+    # only BEFORE the flash write begins (never mid-write - that can brick).
+    CANCELLABLE = ("decode", "dfu_flash")
+
+    # Bounded join for a NON-flash in-flight op on stdin EOF (a flash in flight is joined
+    # unbounded instead). A class attribute so tests can shrink it to prove the flash path
+    # takes the unbounded branch rather than this one.
+    EOF_JOIN_TIMEOUT = 5.0
 
     def __init__(self, learned=None, port=None, cracker=crack):
         self.com = None
@@ -187,6 +364,13 @@ class Daemon:
         self._reader_mode = None         # cached: True once the device is in reader mode
         self.crack = cracker             # host-side crackers (injectable for tests)
         self._cancel = threading.Event()  # cooperative abort for the long decode
+        # Two-stage firmware-flash guard, both preventing a mid-flash teardown (brick):
+        # `_flash_pending` is armed at DISPATCH of dfu_flash (before any EOF/timeout could
+        # pick the bounded join, closing the dispatch race), and `_flashing` marks the
+        # committed, uninterruptible write. Either set => EOF/shutdown join UNBOUNDED and
+        # SIGTERM/SIGINT are ignored, so the flasher subprocess is never abandoned.
+        self._flash_pending = threading.Event()
+        self._flashing = threading.Event()
         self._emit_lock = threading.Lock()  # serialize stdout across worker + reader
         # The protocol channel, captured at construction. __main__ redirects
         # sys.stdout to stderr so vendored-library print() cannot corrupt it.
@@ -623,6 +807,505 @@ class Daemon:
                 continue
         return False
 
+    # ---- firmware update (Nordic Secure DFU, app-only, brick-safe) ----------
+    # The port / serial / subprocess / network seams are small overridable methods so
+    # the whole flow is exercised hardware-free in the tests (FakeSerial + a fake
+    # Popen + a stubbed release fetch); the real flash is hardware-gated by the owner.
+
+    @staticmethod
+    def _dfu_asset_name(model):
+        """The app-only DFU asset for the device model. FAIL-CLOSED: 0 -> Ultra, 1 -> Lite,
+        anything else raises - an unexpected / future / wrong-compatible model must never be
+        coerced to a firmware (e.g. mapping 'not 0' to Lite would flash Lite onto it)."""
+        if model == 0:
+            return "ultra-dfu-app.zip"
+        if model == 1:
+            return "lite-dfu-app.zip"
+        raise RuntimeError("unsupported device model %r - refusing to pick firmware" % model)
+
+    @staticmethod
+    def _norm_model(m):
+        """Normalise a model choice to EXACTLY 0 (Ultra) / 1 (Lite), or None if unspecified.
+        Accepts only the exact int 0/1 or the string 'ultra'/'lite' (or '0'/'1'). Anything
+        else - 2, -1, 0.5, True/False, other strings - RAISES rather than being coerced, so a
+        stray value can never silently pick a firmware (we never guess Ultra vs Lite)."""
+        if m is None:
+            return None
+        if isinstance(m, bool):                  # bool is an int subclass - reject explicitly
+            raise RuntimeError("unknown model %r (expected 'ultra' or 'lite')" % m)
+        if isinstance(m, str):
+            s = m.strip().lower()
+            if s in ("ultra", "0"):
+                return 0
+            if s in ("lite", "1"):
+                return 1
+            raise RuntimeError("unknown model %r (expected 'ultra' or 'lite')" % m)
+        if isinstance(m, int) and m in (0, 1):
+            return m
+        raise RuntimeError("unknown model %r (expected 'ultra' or 'lite')" % m)
+
+    def _list_ports(self):
+        """All serial ports (pyserial is imported lazily so the daemon still loads on a
+        bare interpreter). Overridden in tests."""
+        try:
+            from serial.tools import list_ports
+        except ImportError:
+            return []
+        return list(list_ports.comports())
+
+    def _find_dfu_ports(self):
+        """Every serial port of a device in the bootloader (VID 0x1915 / PID 0x521f)."""
+        return [p.device for p in self._list_ports()
+                if getattr(p, "vid", None) == DFU_VID and getattr(p, "pid", None) == DFU_PID]
+
+    def _find_cdc_ports(self):
+        """Every serial port of a Chameleon in normal (CDC) mode (VID 0x6868)."""
+        return [p.device for p in self._list_ports()
+                if getattr(p, "vid", None) == CHAMELEON_VID]
+
+    def _serial(self, port):
+        """Open a raw pyserial port at 115200 (used only to write the enter-DFU frame).
+        Lazy import + overridable in tests."""
+        import serial
+        return serial.Serial(port=port, baudrate=115200)
+
+    def _send_enter_dfu(self, port):
+        """Reboot the running firmware into the Nordic bootloader: open the normal CDC
+        port, raise DTR, write the exact 10-byte ENTER_BOOTLOADER frame, close (mirrors
+        resource/tools/enter_dfu.py). No response is expected - the device re-enumerates."""
+        s = self._serial(port)
+        try:
+            s.dtr = 1
+            s.timeout = 0
+            s.write(DFU_ENTER_FRAME)
+        finally:
+            s.close()
+
+    def _wait_new_dfu_ports(self, before, timeout=DFU_WAIT_SECONDS, settle=DFU_SETTLE_SECONDS):
+        """Return the set of NEW bootloader ports that appear after the enter-DFU write,
+        relative to the snapshot `before` taken BEFORE the reboot (macOS renames the /dev node
+        on re-enumeration, so identity is 'a port that was not present before'). We do NOT
+        return on the first new port: once one appears at time t, we observe the FULL settle
+        window (until t + `settle`) EVEN IF that runs past the original discovery `timeout`, so
+        a first port that shows up near the deadline still gets the whole attribution window and
+        a SECOND device enumerating milliseconds later is still caught. We accumulate the UNION
+        of every new port seen; the caller requires exactly one, so a second new port anywhere in
+        the window makes the target ambiguous and the flash is refused. Returns [] if none shows
+        within `timeout`."""
+        before = set(before)
+        discovery_deadline = time.monotonic() + timeout
+        seen = set()
+        first_at = None
+        while True:
+            now = time.monotonic()
+            # Until the first new port appears, bound by the discovery timeout; after it appears
+            # at first_at, bound by the FULL settle window (first_at + settle), regardless of when
+            # first_at fell relative to the discovery deadline.
+            deadline = discovery_deadline if first_at is None else (first_at + settle)
+            if now >= deadline:
+                break
+            new = set(self._find_dfu_ports()) - before
+            seen |= new
+            if len(seen) > 1:
+                return sorted(seen)              # ambiguous already - stop and let the caller refuse
+            if seen and first_at is None:
+                first_at = time.monotonic()
+            time.sleep(0.1)
+        return sorted(seen)
+
+    def _http_json(self, url, timeout=15):
+        import urllib.request
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "tenor-rekey", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _http_download(self, url, dest, max_bytes=MAX_FIRMWARE_BYTES, timeout=180, accept=None):
+        """Stream an HTTPS download to `dest`, refusing to exceed `max_bytes` (so a hostile or
+        runaway response cannot fill the disk). The initial URL AND the FINAL (post-redirect)
+        response URL must both be https - a redirect that downgrades to http is refused, so the
+        bytes cannot arrive over plaintext. Returns the number of bytes written."""
+        import urllib.request
+        if not str(url).lower().startswith("https://"):
+            raise RuntimeError("refusing a non-https firmware URL")
+        headers = {"User-Agent": "tenor-rekey"}
+        if accept:
+            headers["Accept"] = accept
+        req = urllib.request.Request(url, headers=headers)
+        total = 0
+        with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
+            final = r.geturl()
+            if not str(final).lower().startswith("https://"):
+                raise RuntimeError("firmware download redirected to a non-https URL - refused")
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise RuntimeError("firmware download exceeds the %d-byte size limit - refused"
+                                       % max_bytes)
+                f.write(chunk)
+        return total
+
+    def _latest_release(self, model):
+        """The newest OFFICIAL prerelease whose assets include the model-specific app-only
+        DFU zip. Returns {'tag','url','size','digest','asset_id'} or None if none is
+        published. Releases only (no nightlies / CI artifacts); exact asset-name match."""
+        asset = self._dfu_asset_name(model)
+        data = self._http_json(GITHUB_RELEASES)
+        if not isinstance(data, list):
+            msg = data.get("message") if isinstance(data, dict) else "unexpected response"
+            raise RuntimeError("GitHub releases: %s" % msg)
+        for rel in data:
+            if not rel.get("prerelease"):
+                continue
+            for a in rel.get("assets", []):
+                if a.get("name") == asset:
+                    return {"tag": rel.get("tag_name") or rel.get("name"),
+                            "url": a.get("browser_download_url"),
+                            "size": a.get("size"),
+                            "digest": a.get("digest"),
+                            "asset_id": a.get("id")}
+        return None
+
+    def _download_asset(self, rel, dest):
+        """Download the PINNED release asset (`rel`, resolved once for this op) to `dest`, all
+        checks FAIL CLOSED:
+        - pin the exact asset by its ID via the assets API (Accept: application/octet-stream),
+          so a delete+replace under the same tag/filename cannot swap the bytes;
+        - the asset's declared size MUST be a valid int within the cap, and the bytes written
+          MUST equal it (a missing / non-integer / out-of-range size is refused, not skipped);
+        - a PRESENT digest MUST be a supported `sha256:<hex>` and match; a malformed or
+          unsupported-algorithm digest is refused (never silently ignored). A digest that is
+          entirely ABSENT is allowed (the size + asset-ID pin are the completeness guards)."""
+        asset_id = rel.get("asset_id")
+        if asset_id is None:
+            raise RuntimeError("release asset has no id - cannot pin the exact asset (refused)")
+        expected = rel.get("size")
+        if not (isinstance(expected, int) and not isinstance(expected, bool)
+                and 0 < expected <= MAX_FIRMWARE_BYTES):
+            raise RuntimeError("release asset has no valid size within the limit - refused")
+        url = GITHUB_ASSET % asset_id
+        written = self._http_download(url, dest, accept="application/octet-stream")
+        if written != expected:
+            raise RuntimeError("firmware download is incomplete (%d of %d bytes) - refused"
+                               % (written, expected))
+        digest = rel.get("digest")
+        if digest is not None:
+            algo, sep, hexd = str(digest).partition(":")
+            hexd = hexd.strip().lower()
+            if algo.lower() != "sha256" or not sep or not _is_hex(hexd, 64):
+                raise RuntimeError("firmware asset digest is malformed or unsupported (%r) - refused"
+                                   % digest)
+            actual = self._file_sha(dest)
+            if actual.lower() != hexd:
+                raise RuntimeError("firmware download digest mismatch (expected %s, got %s) - refused"
+                                   % (hexd, actual))
+        return written
+
+    def _validate_dfu_zip(self, zip_path):
+        """App-only SANITY check on the downloaded OFFICIAL asset (v1 is download-only, so
+        this is a sanity gate on a trusted source). Every check FAILS CLOSED:
+        - application.dat + application.bin must be present, and no member filename may name a
+          bootloader / softdevice image;
+        - manifest.json must be PRESENT and its `manifest` object must contain EXACTLY the
+          `application` image class and NOTHING else - a softdevice / bootloader /
+          softdevice_bootloader entry is refused even if its files dodge the name markers, so
+          adafruit-nrfutil (which follows the manifest) can never be steered to a full payload;
+          the application entry must also name the standard application.dat/.bin we validate;
+        - the application init packet must DECLARE an APPLICATION image whose hash matches.
+        Raises on anything unsafe; returns the init-packet info."""
+        with zipfile.ZipFile(zip_path) as z:
+            names = z.namelist()
+            nameset = set(names)
+            if "application.dat" not in nameset or "application.bin" not in nameset:
+                raise RuntimeError("not a Chameleon application DFU package "
+                                   "(missing application.dat / application.bin)")
+            for n in names:
+                if any(tok in n.lower() for tok in _FULL_MARKERS):
+                    raise RuntimeError("this is a FULL DFU package (bootloader + softdevice); "
+                                       "only the application-only asset is flashed (brick-safety)")
+            if "manifest.json" not in nameset:
+                raise RuntimeError("firmware package has no manifest.json; cannot confirm it is "
+                                   "application-only (brick-safety)")
+            try:
+                mani = json.loads(z.read("manifest.json").decode("utf-8"))
+                m = mani.get("manifest")
+            except (ValueError, UnicodeDecodeError, AttributeError) as e:
+                raise RuntimeError("firmware manifest is malformed: %s" % e)
+            if not isinstance(m, dict) or "application" not in m:
+                raise RuntimeError("firmware manifest declares no application image (brick-safety)")
+            extra = sorted(k for k in m if k != "application")
+            if extra:
+                raise RuntimeError("firmware manifest declares non-application images (%s) - "
+                                   "full DFU refused (brick-safety)" % ", ".join(extra))
+            app = m.get("application")
+            dat_name = app.get("dat_file") if isinstance(app, dict) else None
+            bin_name = app.get("bin_file") if isinstance(app, dict) else None
+            # The manifest's application must name the exact files we validate, so it cannot
+            # point the flasher at a different (renamed full) init packet / image.
+            if dat_name != "application.dat" or bin_name != "application.bin":
+                raise RuntimeError("firmware manifest application entry does not name the standard "
+                                   "application.dat / application.bin (refused)")
+            dat = z.read("application.dat")
+            binf = z.read("application.bin")
+        return _validate_init_packet(dat, binf)
+
+    @staticmethod
+    def _flasher_head():
+        """Resolve the adafruit-nrfutil flasher WITHOUT relying on PATH. The packaged app spawns
+        this daemon with the launchd PATH (/usr/bin:/bin:...), which does NOT include the bundled
+        runtime's bin dir, so a bare `["adafruit-nrfutil", ...]` would FileNotFoundError at flash
+        time. Resolution order, most-specific first:
+          1. the console script next to THIS interpreter (bundle: $RES/python/bin/adafruit-nrfutil;
+             also any venv) if present + executable;
+          2. else run the importable `nordicsemi` module on this interpreter (the bundle runtime
+             has it installed) - `[sys.executable, "-m", "nordicsemi"]`;
+          3. else the flasher on PATH (dev) via shutil.which;
+          4. else a clear error.
+        Returns the argv HEAD (the flasher invocation); the caller appends the dfu arguments."""
+        cand = os.path.join(os.path.dirname(sys.executable), "adafruit-nrfutil")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return [cand]
+        if importlib.util.find_spec("nordicsemi") is not None:
+            return [sys.executable, "-m", "nordicsemi"]
+        found = shutil.which("adafruit-nrfutil")
+        if found:
+            return [found]
+        raise RuntimeError("firmware flasher not found (adafruit-nrfutil / nordicsemi); "
+                           "reinstall the app or `pip install adafruit-nrfutil`")
+
+    def _nrfutil_argv(self, zip_path, port):
+        """The full adafruit-nrfutil DFU serial command line: the PATH-independent flasher head
+        (see _flasher_head) followed by the dfu arguments."""
+        return self._flasher_head() + ["dfu", "serial",
+                                       "-pkg", zip_path, "-p", port, "-b", "115200"]
+
+    def _popen(self, argv):
+        """Spawn the flasher with its progress merged onto one stream (some builds print
+        progress on stderr). Overridable in tests."""
+        return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+
+    @staticmethod
+    def _flash_percent(line):
+        """Extract a 0..100 percent from a flasher output line, or None."""
+        m = re.search(r"(\d{1,3})\s*%", line)
+        if not m:
+            return None
+        pct = int(m.group(1))
+        return pct if 0 <= pct <= 100 else None
+
+    @staticmethod
+    def _file_sha(path):
+        """sha256 hexdigest of a file's bytes (used to verify a download against the
+        releases API asset digest)."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _run_flash(self, zip_path, port):
+        """Run adafruit-nrfutil and stream percent progress as `dfu_flash` events. Raises
+        RuntimeError (with the tail of the tool output) on a non-zero exit. This is the
+        POINT OF NO CANCEL - only reached once the package is validated and the bootloader
+        port is confirmed. Progress emits are best-effort (a broken protocol pipe must not
+        stop us DRAINING the flasher, or its stdout pipe fills and it wedges); the finally
+        WAITS for the subprocess to fully exit, so the flasher is never left running when
+        the caller drops the flash guard."""
+        argv = self._nrfutil_argv(zip_path, port)
+        self._emit_best_effort({"event": "progress", "method": "dfu_flash",
+                                "stage": "flash", "percent": 0})
+        proc = self._popen(argv)
+        tail = collections.deque(maxlen=20)
+        last, code = -1, None
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    tail.append(line.rstrip())
+                    pct = self._flash_percent(line)
+                    if pct is not None and pct != last:
+                        last = pct
+                        self._emit_best_effort({"event": "progress", "method": "dfu_flash",
+                                                "stage": "flash", "percent": pct})
+            code = proc.wait()
+        except Exception:
+            # A streaming glitch or a wait() that raised (e.g. EINTR) must NOT be taken as a
+            # failure or (worse) let us return with the child still running; the finally below
+            # determines the real exit code once poll() reports the child has actually exited.
+            code = None
+        finally:
+            # Never return while the flasher is still running: an abandoned mid-write child
+            # can brick. Keep waiting until poll() actually reports it has exited - a wait()
+            # that RAISES is NOT taken as "it exited"; we re-check poll() and wait again. This
+            # deliberately blocks (does not give up) rather than clear the flash guard on a
+            # still-alive child.
+            while proc.poll() is None:
+                try:
+                    proc.wait()
+                except Exception:
+                    time.sleep(0.05)
+            if code is None:
+                code = proc.poll()          # the child has now exited; take its real code
+        if code is None:
+            raise RuntimeError("firmware flash was interrupted before the flasher reported")
+        if code != 0:
+            detail = " | ".join(t for t in tail if t)[-300:]
+            raise RuntimeError("firmware flash failed (adafruit-nrfutil exit %d): %s"
+                               % (code, detail))
+        self._emit_best_effort({"event": "progress", "method": "dfu_flash",
+                                "stage": "done", "percent": 100})
+
+    def _emit_best_effort(self, obj):
+        """emit() that swallows a broken protocol pipe: during a flash the protocol channel
+        may be gone, but we must keep draining the flasher rather than abort mid-write."""
+        try:
+            self.emit(obj)
+        except Exception:
+            pass
+
+    def dfu_check(self, p):
+        """Report the CURRENT firmware (app version + git hash) and the LATEST published
+        release tag, so the shell can show "update available". A failed release fetch
+        (offline) is not fatal: latest is null and `note` carries the reason."""
+        c = self._connect(p.get("port"))
+        model = c.get_device_model()
+        major, minor = c.get_app_version()
+        git = c.get_git_version()
+        current = "%d.%d" % (major, minor)
+        latest, note = None, None
+        try:
+            rel = self._latest_release(model)
+            latest = rel["tag"] if rel else None
+        except Exception as e:
+            note = str(e)
+        # Heuristic: an update is offered when the latest tag is not already embedded in
+        # the running git description (which is e.g. "v2.0.0-3-gdeadbee"). The shell shows
+        # both versions plainly, so a false negative just means the user flashes manually.
+        update = bool(latest) and (latest not in (git or ""))
+        return {"model": "Chameleon Ultra" if model == 0 else "Chameleon Lite",
+                "current": current, "git": git, "asset": self._dfu_asset_name(model),
+                "latest": latest, "updateAvailable": update, "note": note}
+
+    def dfu_flash(self, p):
+        """Update the Chameleon firmware over Nordic Secure DFU. v1 is DOWNLOAD-ONLY: the
+        source is ALWAYS the model-specific application-only asset from the official releases
+        (no local files, no arbitrary URLs). Params: optional `model` ('ultra'/'lite'), used
+        only to recover a device already stuck in DFU whose model cannot be read. Flow, in
+        strict brick-safe order:
+          1. resolve the target device UNAMBIGUOUSLY. Already in DFU -> require exactly one
+             DFU device and an explicit model (never guess). Otherwise bind to exactly one
+             connected Chameleon and read its model; SNAPSHOT the DFU ports before rebooting.
+          2. resolve the official release ONCE and PIN it; DOWNLOAD the pinned asset into a
+             private per-flash temp dir with a complete-transfer + size + digest check.
+          3. app-only SANITY check the download (reject a full package).
+          4. reboot the bound device (10-byte enter-DFU frame); wait for EXACTLY ONE NEW DFU
+             port (a port not in the pre-reboot snapshot) and flash THAT one.
+          5. flash with adafruit-nrfutil, streaming percent progress.
+        The cooperative cancel is honored ONLY up to the moment the flash write begins; a
+        mid-write abort can brick, so it is never checked past step 5. `dfu_flash` is armed as
+        flash-pending at DISPATCH (run()), so an EOF/shutdown while it is in flight always
+        joins UNBOUNDED and never abandons a flash."""
+        supplied_model = self._norm_model(p.get("model"))
+        dfu_before = self._find_dfu_ports()          # SNAPSHOT before any reboot (identity binding)
+        cdc_ports = self._find_cdc_ports()
+        cdc = None
+        if cdc_ports:
+            # There is a normal Chameleon to reboot. Bind to EXACTLY ONE (never reboot an
+            # arbitrary one), read its model FROM HARDWARE, and resolve the DFU port AFTER the
+            # reboot as the NEW port relative to `dfu_before` - so a device that was already
+            # stuck in DFU is never mistaken for the one we just rebooted.
+            if len(cdc_ports) != 1:
+                raise RuntimeError("more than one Chameleon is connected; connect only the one "
+                                   "to update, then retry")
+            # The model MUST come from the connected device; a caller-supplied model choice is
+            # only valid for in-DFU recovery (where hardware cannot be read). Reject an override
+            # so a live Ultra can never be handed Lite firmware.
+            if supplied_model is not None:
+                raise RuntimeError("the model is read from the connected device and cannot be "
+                                   "overridden; the Ultra/Lite choice is only for recovering a "
+                                   "device already in DFU")
+            dfu_port = None
+            cdc = cdc_ports[0]
+            try:
+                c = self._connect(cdc)
+                raw_model = c.get_device_model()
+            except Exception:
+                raise RuntimeError("the Chameleon is not reachable to enter DFU: " + _MANUAL_FALLBACK)
+            # Validate the HARDWARE model too (fail-closed): an unexpected value (2, future
+            # variants) raises here rather than defaulting to Lite firmware.
+            model = self._norm_model(raw_model)
+        else:
+            # No normal device to reboot -> pure recovery of a device ALREADY in DFU (crashed /
+            # manual B-button). Require exactly ONE DFU device, and an EXPLICIT model - its model
+            # cannot be read in DFU and we never guess (a wrong guess flashes Ultra onto a Lite).
+            if not dfu_before:
+                raise RuntimeError("the Chameleon is not reachable to enter DFU: " + _MANUAL_FALLBACK)
+            if len(dfu_before) != 1:
+                raise RuntimeError("more than one Chameleon is in DFU mode; connect only the one "
+                                   "to update, then retry")
+            dfu_port = dfu_before[0]
+            model = supplied_model
+            if model is None:
+                raise RuntimeError("the Chameleon is already in DFU mode so its model cannot be "
+                                   "read; choose Ultra or Lite to flash-recover it")
+
+        tmp = None
+        try:
+            self.emit({"event": "progress", "method": "dfu_flash", "stage": "prepare", "percent": 0})
+            # Resolve the official release ONCE and PIN it for this whole op (no re-resolve).
+            rel = self._latest_release(model)
+            if not rel or not rel.get("url"):
+                raise RuntimeError("no application DFU release found for %s"
+                                   % self._dfu_asset_name(model))
+            tmp = tempfile.mkdtemp(prefix="cham-dfu-")   # private per-flash dir (mode 0700)
+            os.chmod(tmp, 0o700)
+            pkg = os.path.join(tmp, self._dfu_asset_name(model))
+            self.emit({"event": "progress", "method": "dfu_flash", "stage": "download",
+                       "percent": 0, "tag": rel.get("tag")})
+            self._download_asset(rel, pkg)           # complete + size-capped + digest-checked
+            info = self._validate_dfu_zip(pkg)       # app-only sanity check (reject full)
+            self.emit({"event": "progress", "method": "dfu_flash", "stage": "validated", "percent": 0})
+            if self._cancel.is_set():                # safe cancel: nothing has been written
+                return {"flashed": False, "cancelled": True}
+
+            if dfu_port is None:
+                self._drop()                         # free the CMD handle so the raw serial can open the port
+                self.emit({"event": "progress", "method": "dfu_flash", "stage": "enter", "percent": 0})
+                self._send_enter_dfu(cdc)
+                self.emit({"event": "progress", "method": "dfu_flash", "stage": "wait", "percent": 0})
+                # Accept only a NEW, attributable DFU port (not present before the reboot), and
+                # exactly one - refuse if a second device appears or the target is ambiguous.
+                new = self._wait_new_dfu_ports(dfu_before)
+                if not new:
+                    raise RuntimeError("the Chameleon did not re-appear in DFU mode. Manual fallback: "
+                                       + _MANUAL_FALLBACK)
+                if len(new) != 1:
+                    raise RuntimeError("more than one new Chameleon appeared in DFU after the reboot; "
+                                       "disconnect the others and retry")
+                dfu_port = new[0]
+
+            # Commit handshake (closes the EOF/dispatch race): announce the uninterruptible
+            # write BEFORE the final cancel re-check, so EOF either sees `_flashing` (and joins
+            # unbounded) or the worker still sees the cancel here and aborts before any write.
+            self._flashing.set()
+            try:
+                if self._cancel.is_set():            # last safe cancel point, before any write
+                    self._flashing.clear()
+                    return {"flashed": False, "cancelled": True}
+                # POINT OF NO CANCEL: the bootloader is being written; a mid-write abort can
+                # brick, so the cancel flag is deliberately not checked again.
+                self._run_flash(pkg, dfu_port)
+            finally:
+                self._flashing.clear()
+            return {"flashed": True, "port": dfu_port, "tag": rel.get("tag"),
+                    "hash": info.get("hash_type")}
+        finally:
+            if tmp and os.path.isdir(tmp):
+                shutil.rmtree(tmp, ignore_errors=True)
+
     # ---- decode: dict-only key recovery + full read (nested/darkside is P1) --
 
     def _check_keys(self, c, n_sectors, key_bytes):
@@ -985,7 +1668,14 @@ class Daemon:
                 req = q.get()
                 if req is None:
                     return
-                self.emit(self.handle(req))
+                try:
+                    self.emit(self.handle(req))
+                finally:
+                    # Disarm the flash-pending guard only once the dfu_flash op has fully
+                    # returned (a result, a cancel, or an error) - so from dispatch until
+                    # completion an EOF/shutdown always joins unbounded.
+                    if req.get("method") == "dfu_flash":
+                        self._flash_pending.clear()
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -1002,6 +1692,11 @@ class Daemon:
             if method == "cancel":
                 self.emit(self.handle(req))
             else:
+                # Arm the flash-pending guard at DISPATCH, before the worker can start (and
+                # before any EOF could choose the bounded join), closing the race where EOF
+                # lands between the last cancel check and _flashing being set.
+                if method == "dfu_flash":
+                    self._flash_pending.set()
                 if method in self.CANCELLABLE:
                     # Arm a fresh cancel window for THIS op at dispatch, before any
                     # later cancel line is read - so a cancel that lands before the
@@ -1013,9 +1708,15 @@ class Daemon:
         # handle if the worker actually stopped, so close() cannot race a serial
         # read still in flight on the worker thread (matches x7d's EOF guard). If
         # the worker is still blocked, leave the handle for process-exit cleanup.
+        # EXCEPTION: a firmware flash that is DISPATCHED or WRITING is joined UNBOUNDED -
+        # abandoning it after 5s and letting the process exit would orphan the flasher and
+        # can brick the device, so we wait for it to finish before tearing down.
         self._cancel.set()
         q.put(None)
-        t.join(timeout=5)
+        if self._flashing.is_set() or self._flash_pending.is_set():
+            t.join()
+        else:
+            t.join(timeout=self.EOF_JOIN_TIMEOUT)
         if not t.is_alive():
             self._drop()
 
@@ -1025,6 +1726,22 @@ if __name__ == "__main__":
     # construction; redirect sys.stdout to stderr so any stray library print()
     # (the vendored ChameleonCom prints on frame errors + verbose logging) goes
     # to stderr and never interleaves with the newline-JSON on stdout.
+    import signal
     _daemon = Daemon()
     sys.stdout = sys.stderr
+
+    def _guarded_signal(signum, frame):
+        # Never die while a firmware flash is dispatched or writing: a SIGTERM/SIGINT then
+        # would orphan the flasher and can brick the device. Ignore the signal while a flash
+        # is in flight; otherwise exit cleanly (running finally-blocks + EOF teardown).
+        if _daemon._flashing.is_set() or _daemon._flash_pending.is_set():
+            sys.stderr.write("chameleon_d: signal %d ignored during firmware flash\n" % signum)
+            sys.stderr.flush()
+            return
+        raise SystemExit(0)
+    try:
+        signal.signal(signal.SIGTERM, _guarded_signal)
+        signal.signal(signal.SIGINT, _guarded_signal)
+    except (ValueError, OSError):            # not main thread / unsupported: best-effort
+        pass
     _daemon.run()

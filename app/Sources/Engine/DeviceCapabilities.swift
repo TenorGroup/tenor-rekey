@@ -30,6 +30,13 @@ struct DeviceCapabilities: Codable, Equatable, Sendable {
         slots: 8, emulate: true, lf: true, dfu: true, sniff: true,
         attacks: ["dict", "nested", "staticNested", "darkside"],
         writeModes: ["normal", "denied", "deceive", "shadow", "shadowReq"])
+
+    /// A Chameleon sitting in the Nordic bootloader (re-enumerated to VID 0x1915). It
+    /// exposes no card / slot interface - only DFU - so the shell offers ONLY the
+    /// firmware action, which is exactly what recovers a device stuck in DFU.
+    static let chameleonDFU = DeviceCapabilities(
+        slots: 0, emulate: false, lf: false, dfu: true, sniff: false,
+        attacks: [], writeModes: [])
 }
 
 extension DeviceCapabilities {

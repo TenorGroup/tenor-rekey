@@ -22,12 +22,26 @@ struct RootView: View {
             .onAppear {
                 theme.systemScheme = systemScheme
                 l10n.systemCode = Locale.current.language.languageCode?.identifier ?? "en"
+                // Refuse app quit while a firmware flash is writing (a mid-write kill can
+                // brick the device); warn and keep the update running.
+                AppDelegate.terminationGuard = {
+                    guard model.flashing else { return .terminateNow }
+                    let alert = NSAlert()
+                    alert.messageText = l10n.t("quit_while_flashing_title")
+                    alert.informativeText = l10n.t("quit_while_flashing_msg")
+                    alert.addButton(withTitle: l10n.t("keep_updating"))
+                    alert.runModal()
+                    return .terminateCancel
+                }
             }
             .onChange(of: systemScheme) { _, s in
                 withAnimation(.easeInOut(duration: 0.35)) { theme.systemScheme = s }
             }
             .sheet(isPresented: $model.cloneSheet) {
                 CloneSheet().environment(model).environment(theme).environment(l10n)
+            }
+            .sheet(isPresented: $model.flashingSheet, onDismiss: { model.clearFlashState() }) {
+                FlashingView().environment(model).environment(theme).environment(l10n)
             }
             .confirmationDialog(l10n.t("format_q"), isPresented: $model.formatConfirm, titleVisibility: .visible) {
                 // Pinned to the uid snapshot taken when the dialog opened, so a card
@@ -158,6 +172,7 @@ private struct ReaderStatusInline: View {
         }
     }
     private var text: String {
+        if model.deviceInDFU { return l.t("in_bootloader") }
         if !model.readerOnline { return l.t("reader_offline") }
         if let uid = model.card?.uid { return "\(l.t("card")) · \(uid)" }
         return l.t("reader_online")
@@ -198,7 +213,7 @@ private struct ActionBar: View {
             // Chameleon-only verbs, gated on the connected device's capabilities: the
             // slot library, the reader<->emulate toggle, and loading the working
             // document into a slot for emulation. A plain reader (X7) shows none of them.
-            if model.capabilities.slots > 0 || model.capabilities.emulate {
+            if model.capabilities.slots > 0 || model.capabilities.emulate || model.capabilities.dfu {
                 Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
             }
             if model.capabilities.slots > 0 {
@@ -212,6 +227,19 @@ private struct ActionBar: View {
             if model.capabilities.emulate {
                 EmulateToggle()
                 if model.source != nil { LoadToSlotMenu() }
+            }
+            // Firmware update (DFU), gated on the device advertising it: the X7 has
+            // dfu:false and never shows it. Opening the sheet reads the current + latest
+            // firmware. Disabled while any device op owns the reader.
+            if model.capabilities.dfu {
+                // Reachable when the reader is online OR the device is stuck in the
+                // bootloader (deviceInDFU) - the latter is exactly when flash-recovery is needed.
+                ActionButton(title: l.t("firmware"), icon: "arrow.up.circle",
+                             enabled: (model.readerOnline || model.deviceInDFU) && !busy
+                                 && !model.slotBusy && !model.emulating) {
+                    model.flashingSheet = true
+                    Task { await model.checkFirmware() }
+                }
             }
             Spacer()
             if model.decoding {

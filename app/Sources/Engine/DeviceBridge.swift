@@ -162,7 +162,7 @@ actor DeviceBridge {
         c.resume(returning: line)
     }
 
-    private func transact<T: Decodable>(id: Int, _ reqData: Data, timeout: Duration, as _: T.Type) async throws -> T {
+    private func transact<T: Decodable>(id: Int, _ reqData: Data, timeout: Duration?, as _: T.Type) async throws -> T {
         let line: Data = try await withCheckedThrowingContinuation { cont in
             pending[id] = cont
             try? stdin?.write(contentsOf: reqData)
@@ -171,9 +171,17 @@ actor DeviceBridge {
             // read that never returns) would otherwise orphan this continuation
             // forever - freezing the live-status poll and every later op. On the
             // deadline we fail this request and kill the daemon so it respawns.
-            Task { [weak self] in
-                try? await Task.sleep(for: timeout)
-                await self?.timeoutRequest(id: id)
+            //
+            // A nil timeout means NO deadline: this is used ONLY for the firmware flash,
+            // where a timeout-driven resolve-failed + terminate() would be a mid-write kill
+            // (brick). The daemon holds the flash uninterruptible on its side, so the flash
+            // request is allowed to take as long as it takes and resolves only on the real
+            // result (or a genuine daemon exit).
+            if let timeout {
+                Task { [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    await self?.timeoutRequest(id: id)
+                }
             }
         }
         let env = try JSONDecoder().decode(Envelope<T>.self, from: line)
@@ -191,13 +199,13 @@ actor DeviceBridge {
         process?.terminate()
     }
 
-    private func request<T: Decodable>(_ method: String, timeout: Duration = .seconds(30), as t: T.Type) async throws -> T {
+    private func request<T: Decodable>(_ method: String, timeout: Duration? = .seconds(30), as t: T.Type) async throws -> T {
         try startIfNeeded()
         let id = nextID; nextID += 1
         return try await transact(id: id, JSONEncoder().encode(Req(id: id, method: method)), timeout: timeout, as: t)
     }
 
-    private func request<P: Encodable, T: Decodable>(_ method: String, params: P, timeout: Duration = .seconds(30), as t: T.Type) async throws -> T {
+    private func request<P: Encodable, T: Decodable>(_ method: String, params: P, timeout: Duration? = .seconds(30), as t: T.Type) async throws -> T {
         try startIfNeeded()
         let id = nextID; nextID += 1
         return try await transact(id: id, JSONEncoder().encode(ReqP(id: id, method: method, params: params)), timeout: timeout, as: t)
@@ -382,6 +390,37 @@ actor DeviceBridge {
         return try await request("magic_write", params: params, timeout: .seconds(300), as: WriteResult.self)
     }
 
+    // ---- firmware update (Chameleon-only; gated on capabilities.dfu) ------------
+
+    /// Read the running firmware version + the newest published release, so the
+    /// flashing view can show "update available". Bounded by a short timeout - the
+    /// release fetch is a small network call the daemon degrades gracefully on.
+    func dfuCheck() async throws -> DfuStatus {
+        try await request("dfu_check", timeout: .seconds(60), as: DfuStatus.self)
+    }
+
+    /// Flash firmware over Nordic Secure DFU. v1 is DOWNLOAD-ONLY: the daemon always fetches
+    /// the model-specific application-only asset from the official releases (no local files).
+    /// `model` is nil in normal mode (the daemon reads it off the device) and "ultra"/"lite"
+    /// only when recovering a device already stuck in DFU, whose model cannot be read. The
+    /// daemon downloads (with a size + digest check), app-only-validates, enters the
+    /// bootloader, and streams `download` / `flash` percent progress to `onProgress`.
+    ///
+    /// This request has NO timeout (`timeout: nil`): a timeout-driven resolve-failed would
+    /// trigger a terminate() of the daemon mid-write, which is a brick. The daemon holds the
+    /// flash uninterruptible on its side, so this simply waits for the real result. The
+    /// daemon also refuses a mid-write cancel, so there is no cancel button here.
+    func dfuFlash(model: String?,
+                  onProgress: @escaping @Sendable (String?, Int?) -> Void) async throws -> DfuFlashResult {
+        guard eventSink == nil else { throw EngineError.daemon("an operation is already in progress") }
+        eventSink = { ev in if ev.method == "dfu_flash" { onProgress(ev.stage, ev.percent) } }
+        opGeneration += 1
+        defer { eventSink = nil }
+        let params = DfuFlashParams(model: model)
+        return try await request("dfu_flash", params: params, timeout: nil, as: DfuFlashResult.self)
+    }
+
+    private struct DfuFlashParams: Encodable { let model: String? }
     private struct Req: Encodable { let id: Int; let method: String }
     private struct ReqP<P: Encodable>: Encodable { let id: Int; let method: String; let params: P }
     private struct SlotParam: Encodable { let slot: Int }

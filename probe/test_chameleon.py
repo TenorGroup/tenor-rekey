@@ -17,7 +17,11 @@ Registered by test_all.py (its TESTS list is run there); also runnable standalon
     python3 test_chameleon.py
 """
 import os
+import io
 import sys
+import json
+import zipfile
+import hashlib
 import tempfile
 import threading
 import time
@@ -957,6 +961,1005 @@ def test_cham_magic_write_trailer_keys(check):
           tr is not None and tr[6:9] == bytes.fromhex("ff0780"), tr.hex() if tr else "not written")
 
 
+# --------------------------------------------------------------------------
+# Firmware DFU (chameleon_d dfu_check / dfu_flash) - hardware-free.
+# Every hardware / network / subprocess seam is a small overridable method, so the
+# REAL validation + enter-DFU + argv + progress-parse logic runs against fakes.
+# --------------------------------------------------------------------------
+
+def _pb_varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _pb_lenf(field, data):
+    return _pb_varint(field << 3 | 2) + _pb_varint(len(data)) + data
+
+
+def _pb_varf(field, n):
+    return _pb_varint(field << 3 | 0) + _pb_varint(n)
+
+
+def _init_packet(binf, hash_type=3, signed=True, good_hash=True,
+                 fw_type=0, dup_type=None, sd_size=None, bl_size=None):
+    """Build a Nordic dfu-cc init packet (application.dat) for `binf`, mirroring the real
+    structure the daemon walks: Packet.signed_command -> command -> InitCommand -> hash.
+    Defaults to a valid APPLICATION packet (type=0). When `good_hash` the stored
+    (byte-reversed) hash matches `binf`; `signed=False` omits the signed_command wrapper.
+    `fw_type=None` omits the type field (a MISSING type, which must be refused). `dup_type`
+    appends a SECOND type field (a duplicate security-relevant field, which must be refused).
+    `fw_type` != 0 + `sd_size` / `bl_size` build a RENAMED FULL packet: a signed image that
+    DECLARES bootloader/softdevice even though it is named application.dat."""
+    algo = {2: "sha1", 3: "sha256", 4: "sha512"}[hash_type]
+    digest = hashlib.new(algo, binf).digest()
+    stored = bytes(reversed(digest)) if good_hash \
+        else bytes(reversed(hashlib.new(algo, binf + b"tamper").digest()))
+    hashmsg = _pb_varf(1, hash_type) + _pb_lenf(2, stored)
+    init = b""
+    if fw_type is not None:
+        init += _pb_varf(4, fw_type)
+    if dup_type is not None:
+        init += _pb_varf(4, dup_type)
+    if sd_size is not None:
+        init += _pb_varf(5, sd_size)
+    if bl_size is not None:
+        init += _pb_varf(6, bl_size)
+    init += _pb_lenf(8, hashmsg)
+    command = _pb_varf(1, 1) + _pb_lenf(2, init)
+    if signed:
+        signed_cmd = _pb_lenf(1, command) + _pb_varf(2, 0) + _pb_lenf(3, b"\x00" * 64)
+        return _pb_lenf(2, signed_cmd)
+    return _pb_lenf(1, command)                    # unsigned: Packet.command directly
+
+
+def _make_dfu_zip(dat, binf, full=False):
+    """Write a DFU zip to a temp file and return its path. `full=True` makes it a FULL
+    package (adds sd_bl.* + a manifest declaring softdevice_bootloader) that must be refused."""
+    fd, path = tempfile.mkstemp(prefix="cham-dfu-test-", suffix=".zip")
+    os.close(fd)
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("application.dat", dat)
+        z.writestr("application.bin", binf)
+        mani = {"manifest": {"application": {"bin_file": "application.bin",
+                                             "dat_file": "application.dat"}}}
+        if full:
+            mani["manifest"]["softdevice_bootloader"] = {"bin_file": "sd_bl.bin",
+                                                         "dat_file": "sd_bl.dat"}
+            z.writestr("sd_bl.bin", b"\x00" * 64)
+            z.writestr("sd_bl.dat", b"\x00" * 64)
+        z.writestr("manifest.json", json.dumps(mani))
+    return path
+
+
+class FakeSerial:
+    """Captures the raw bytes written for the enter-DFU frame (stands in for pyserial)."""
+    def __init__(self, port):
+        self.port = port
+        self.writes = []
+        self.dtr = None
+        self.timeout = None
+        self.closed = False
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def close(self):
+        self.closed = True
+
+
+class FakePort:
+    """A pyserial ListPortInfo stand-in (device / vid / pid) for port-discovery tests."""
+    def __init__(self, device, vid, pid):
+        self.device, self.vid, self.pid = device, vid, pid
+
+
+class FakePopen:
+    """Stands in for the adafruit-nrfutil subprocess: yields canned output lines then a
+    chosen exit code, so the daemon's progress parse + non-zero handling are exercised.
+    `poll()` mirrors a real Popen (None while running, the exit code once waited), so the
+    daemon's wait-for-exit-before-releasing-the-guard path is exercised too."""
+    def __init__(self, lines, code=0):
+        self.stdout = iter(lines)
+        self._code = code
+        self._done = False
+
+    def wait(self):
+        self._done = True
+        return self._code
+
+    def poll(self):
+        return self._code if self._done else None
+
+
+class SlowExitPopen:
+    """A flasher that is still RUNNING (poll() -> None) until wait() has been called enough
+    times; the first `raise_waits` wait() calls raise (a transient EINTR-style failure that
+    must be retried). Proves _run_flash never returns while the child is alive and never
+    treats a raising wait() as 'exited'."""
+    def __init__(self, lines, code=0, raise_waits=0):
+        self.stdout = iter(lines)
+        self._code = code
+        self._alive = True
+        self._waits = 0
+        self._raise_waits = raise_waits
+
+    def wait(self):
+        self._waits += 1
+        if self._waits <= self._raise_waits:
+            raise OSError("interrupted wait")
+        self._alive = False
+        return self._code
+
+    def poll(self):
+        return None if self._alive else self._code
+
+
+class _FakeClock:
+    """A deterministic monotonic()/sleep() stand-in: sleep() advances a virtual clock instead
+    of blocking, so time-dependent polling (the DFU settle window) is tested exactly and fast.
+    Installed by rebinding chameleon_d.time for the duration of a call."""
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, dt):
+        self.t += dt
+
+
+class _GatedStream:
+    """A stdin stand-in that yields `lines`, then BLOCKS at EOF until `gate` is set - so a
+    test can hold the stream open (delaying run()'s EOF teardown, which also sets the cancel
+    flag) until an in-flight op has reached a chosen point."""
+    def __init__(self, lines, gate):
+        self._it = iter(lines)
+        self._gate = gate
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            self._gate.wait(5)
+            raise
+
+
+def _dfu_daemon(fake):
+    """A daemon wired to a FakeChameleon, with the network seam stubbed off by default so
+    a stray call cannot reach GitHub. DFU tests override the specific seams they exercise. The
+    flasher head is pinned to a deterministic value so _run_flash works regardless of whether
+    adafruit-nrfutil is installed on the test machine; the REAL PATH-independent resolver is
+    exercised by test_cham_dfu_flasher_resolve."""
+    d = cham_daemon(fake)
+    d._latest_release = lambda model: {"tag": "v2.0.0", "url": "https://example/%s" % model}
+    d._flasher_head = lambda: ["adafruit-nrfutil"]
+    return d
+
+
+def _expect_reject(check, label, fn):
+    try:
+        fn()
+        check("dfu validate rejects %s" % label, False, "ACCEPTED an unsafe package")
+    except RuntimeError as e:
+        check("dfu validate rejects %s" % label, True, str(e))
+
+
+def _good_pkg_bytes(binf=None):
+    """The bytes of a well-formed app-only DFU zip (what an official download would yield)."""
+    binf = binf if binf is not None else bytes(range(256)) * 4
+    p = _make_dfu_zip(_init_packet(binf), binf)
+    data = open(p, "rb").read()
+    os.remove(p)
+    return data
+
+
+def _mock_download(data):
+    """A `_download_asset(rel, dest)` stand-in that writes `data` to dest (v1 is download-only,
+    so the real network + validation seams are the download itself; tests inject the bytes)."""
+    def _dl(rel, dest):
+        with open(dest, "wb") as f:
+            f.write(data)
+        return len(data)
+    return _dl
+
+
+# --------------------------------------------------------------------------
+# 27. dfu asset selection: model 0 -> ultra, else lite.
+# --------------------------------------------------------------------------
+def test_cham_dfu_asset(check):
+    d = _dfu_daemon(FakeChameleon())
+    check("dfu asset: model 0 (Ultra) -> ultra-dfu-app.zip",
+          d._dfu_asset_name(0) == "ultra-dfu-app.zip", d._dfu_asset_name(0))
+    check("dfu asset: model 1 (Lite) -> lite-dfu-app.zip",
+          d._dfu_asset_name(1) == "lite-dfu-app.zip", d._dfu_asset_name(1))
+
+
+# --------------------------------------------------------------------------
+# 27a. model normalisation (finding 6): only exact 0/1 or 'ultra'/'lite' is accepted;
+#      every other value (2, -1, 0.5, bool, other strings) is refused, never coerced.
+# --------------------------------------------------------------------------
+def test_cham_dfu_norm_model(check):
+    d = _dfu_daemon(FakeChameleon())
+    check("norm_model accepts the exact valid choices",
+          [d._norm_model(m) for m in (0, 1, "ultra", "lite", "0", "1", None)]
+          == [0, 1, 0, 1, 0, 1, None], "valid mapping wrong")
+    for bad in (2, -1, 0.5, True, False, "banana", "2", "ULTRAX"):
+        ok = False
+        try:
+            d._norm_model(bad)
+        except RuntimeError:
+            ok = True
+        check("norm_model refuses %r (no numeric/other guess)" % (bad,), ok, "was coerced")
+
+    # finding 2: _dfu_asset_name is fail-closed - 0/1 only, anything else raises (never maps a
+    # non-0 value to Lite).
+    check("dfu_asset_name maps 0/1 to the model assets",
+          d._dfu_asset_name(0) == "ultra-dfu-app.zip" and d._dfu_asset_name(1) == "lite-dfu-app.zip")
+    for bad in (2, -1, "ultra", None):
+        ok = False
+        try:
+            d._dfu_asset_name(bad)
+        except RuntimeError:
+            ok = True
+        check("dfu_asset_name refuses %r (no Lite fallback)" % (bad,), ok, "coerced to an asset")
+
+
+# --------------------------------------------------------------------------
+# 27b. port discovery: CDC (0x6868) vs DFU (0x1915/0x521f) filtering, and the REAL
+#      _wait_new_dfu_ports over _list_ports (a NEW port relative to a pre-reboot snapshot).
+# --------------------------------------------------------------------------
+def test_cham_dfu_port_discovery(check):
+    d = _dfu_daemon(FakeChameleon())
+    d._list_ports = lambda: [
+        FakePort("/dev/cu.usbmodem6868", 0x6868, 0x8686),
+        FakePort("/dev/cu.usbserial", 0x0403, 0x6001),   # an unrelated FTDI adapter
+        FakePort("/dev/cu.usbmodemDFU", 0x1915, 0x521f),
+    ]
+    check("_find_cdc_ports returns only the Chameleon CDC (VID 0x6868) ports",
+          d._find_cdc_ports() == ["/dev/cu.usbmodem6868"], str(d._find_cdc_ports()))
+    check("_find_dfu_ports returns only the bootloader (0x1915/0x521f) ports",
+          d._find_dfu_ports() == ["/dev/cu.usbmodemDFU"], str(d._find_dfu_ports()))
+    check("_wait_new_dfu_ports (real) returns a DFU port not in the snapshot",
+          d._wait_new_dfu_ports([], timeout=1, settle=0.1) == ["/dev/cu.usbmodemDFU"],
+          "did not find the new DFU port")
+    check("_wait_new_dfu_ports ignores a DFU port already in the snapshot (times out to [])",
+          d._wait_new_dfu_ports(["/dev/cu.usbmodemDFU"], timeout=0, settle=0.1) == [],
+          "returned a pre-existing DFU port")
+
+
+# --------------------------------------------------------------------------
+# 28. enter-bootloader writes the EXACT 10-byte frame, DTR high, then closes.
+# --------------------------------------------------------------------------
+def test_cham_dfu_enter_bootloader(check):
+    d = _dfu_daemon(FakeChameleon())
+    fs = FakeSerial("/dev/cu.usbmodem6868")
+    d._serial = lambda port: fs
+    d._send_enter_dfu("/dev/cu.usbmodem6868")
+    check("enter-DFU writes exactly the 10-byte ENTER_BOOTLOADER frame",
+          fs.writes == [b"\x11\xef\x03\xf2\x00\x00\x00\x00\x0b\x00"], str([w.hex() for w in fs.writes]))
+    check("enter-DFU raises DTR before writing and closes the port after",
+          fs.dtr == 1 and fs.closed is True, "dtr=%s closed=%s" % (fs.dtr, fs.closed))
+
+
+# --------------------------------------------------------------------------
+# 29. package validation: accept a well-formed app-only zip; reject full / mismatch /
+#     unsigned / missing-file zips - the brick-safety gate.
+# --------------------------------------------------------------------------
+def test_cham_dfu_validate(check):
+    binf = bytes(range(256)) * 4
+    d = _dfu_daemon(FakeChameleon())
+
+    # NOTE: this is an INTEGRITY check, not a signature check. The host confirms the
+    # package shape (signed_command present), the DECLARED app-only type, and that the
+    # image hash matches the init packet; the nRF bootloader is the real signature
+    # authority (it verifies the ECDSA signature at flash time). The 64 zero "signature"
+    # bytes below satisfy the shape check, not a cryptographic one.
+    good = _make_dfu_zip(_init_packet(binf, good_hash=True), binf)
+    info = d._validate_dfu_zip(good)
+    check("dfu validate ACCEPTS a well-formed app-only package (integrity-only, device signs)",
+          info.get("hash_type") == "sha256" and info.get("fw_type") == 0, str(info))
+
+    full = _make_dfu_zip(_init_packet(binf, good_hash=True), binf, full=True)
+    _expect_reject(check, "a full-dfu package (bootloader + softdevice, by filename + manifest)",
+                   lambda: d._validate_dfu_zip(full))
+
+    # CRITICAL (finding 1): a RENAMED full package - a signed image DECLARING
+    # softdevice+bootloader (type=3, nonzero sd_size/bl_size) but named application.dat/.bin
+    # with an app-only manifest - must be refused on its DECLARED type, not just its name.
+    renamed = _make_dfu_zip(
+        _init_packet(binf, good_hash=True, fw_type=3, sd_size=4096, bl_size=8192), binf)
+    _expect_reject(check, "a RENAMED full package (declared type != application)",
+                   lambda: d._validate_dfu_zip(renamed))
+
+    # CRITICAL (finding 1): a MISSING type field is refused (fail closed - not the proto
+    # default). The old code accepted a no-type packet; this now rejects it.
+    notype = _make_dfu_zip(_init_packet(binf, fw_type=None), binf)
+    _expect_reject(check, "a packet with NO declared type (fail-closed)",
+                   lambda: d._validate_dfu_zip(notype))
+
+    # a DUPLICATE type field is refused (a repeat could make host and bootloader read
+    # different values).
+    duptype = _make_dfu_zip(_init_packet(binf, fw_type=0, dup_type=3), binf)
+    _expect_reject(check, "a packet with a DUPLICATE type field",
+                   lambda: d._validate_dfu_zip(duptype))
+
+    # finding 5: a valid application pair PLUS a manifest.softdevice_bootloader entry whose
+    # files DODGE the name markers - adafruit-nrfutil would follow the manifest and write the
+    # full payload, so the manifest is inspected and any non-application image class refused.
+    fdm, manifull = tempfile.mkstemp(prefix="cham-dfu-test-", suffix=".zip")
+    os.close(fdm)
+    with zipfile.ZipFile(manifull, "w") as z:
+        z.writestr("application.dat", _init_packet(binf))
+        z.writestr("application.bin", binf)
+        z.writestr("core.dat", b"\x00" * 8)                  # dodges bootloader/softdevice markers
+        z.writestr("core.bin", b"\x00" * 8)
+        z.writestr("manifest.json", json.dumps({"manifest": {
+            "application": {"dat_file": "application.dat", "bin_file": "application.bin"},
+            "softdevice_bootloader": {"dat_file": "core.dat", "bin_file": "core.bin"}}}))
+    _expect_reject(check, "a manifest declaring softdevice_bootloader (files dodge the markers)",
+                   lambda: d._validate_dfu_zip(manifull))
+
+    # finding 5: a manifest whose application entry points at NON-standard files (indirection)
+    # is refused - the flasher must read exactly the application.dat/.bin we validated.
+    fdi, indirect = tempfile.mkstemp(prefix="cham-dfu-test-", suffix=".zip")
+    os.close(fdi)
+    with zipfile.ZipFile(indirect, "w") as z:
+        z.writestr("application.dat", _init_packet(binf))
+        z.writestr("application.bin", binf)
+        z.writestr("manifest.json", json.dumps({"manifest": {
+            "application": {"dat_file": "other.dat", "bin_file": "other.bin"}}}))
+    _expect_reject(check, "a manifest whose application entry names non-standard files",
+                   lambda: d._validate_dfu_zip(indirect))
+
+    # a package with NO manifest.json is refused (cannot confirm app-only)
+    fdn, nomani = tempfile.mkstemp(prefix="cham-dfu-test-", suffix=".zip")
+    os.close(fdn)
+    with zipfile.ZipFile(nomani, "w") as z:
+        z.writestr("application.dat", _init_packet(binf))
+        z.writestr("application.bin", binf)
+    _expect_reject(check, "a package with no manifest.json",
+                   lambda: d._validate_dfu_zip(nomani))
+
+    mism = _make_dfu_zip(_init_packet(binf, good_hash=False), binf)
+    _expect_reject(check, "a hash-mismatch package",
+                   lambda: d._validate_dfu_zip(mism))
+
+    uns = _make_dfu_zip(_init_packet(binf, signed=False), binf)
+    _expect_reject(check, "an unsigned package",
+                   lambda: d._validate_dfu_zip(uns))
+
+    # missing application.bin entirely
+    fd, miss = tempfile.mkstemp(prefix="cham-dfu-test-", suffix=".zip")
+    os.close(fd)
+    with zipfile.ZipFile(miss, "w") as z:
+        z.writestr("application.dat", _init_packet(binf))
+    _expect_reject(check, "a package missing application.bin",
+                   lambda: d._validate_dfu_zip(miss))
+
+    for p in (good, full, renamed, notype, duptype, manifull, indirect, nomani, mism, uns, miss):
+        os.remove(p)
+
+
+# --------------------------------------------------------------------------
+# 30. dfu_check: reports the current firmware (app + git) and the latest release tag.
+# --------------------------------------------------------------------------
+def test_cham_dfu_check(check):
+    fake = FakeChameleon(model=0, app=(2, 0), git="v1.9.0-4-gabcdef")
+    d = _dfu_daemon(fake)                          # _latest_release stubbed -> v2.0.0
+    r = d.dfu_check({})
+    check("dfu_check reports the current firmware version + git",
+          r["current"] == "2.0" and r["git"] == "v1.9.0-4-gabcdef", str(r))
+    check("dfu_check reports the latest release tag + the model asset",
+          r["latest"] == "v2.0.0" and r["asset"] == "ultra-dfu-app.zip", str(r))
+    check("dfu_check flags an update when the latest tag is newer than the running git",
+          r["updateAvailable"] is True, str(r.get("updateAvailable")))
+
+    # up to date: the running git already embeds the latest tag -> no update offered
+    fake2 = FakeChameleon(model=0, app=(2, 0), git="v2.0.0-0-gdeadbee")
+    r2 = _dfu_daemon(fake2).dfu_check({})
+    check("dfu_check reports no update when the running firmware already is the latest",
+          r2["updateAvailable"] is False, str(r2.get("updateAvailable")))
+
+    # offline: a failed release fetch is not fatal - latest is null, note carries why
+    fake3 = FakeChameleon(model=0, app=(2, 0), git="v2.0.0")
+    d3 = _dfu_daemon(fake3)
+    d3._latest_release = lambda model: (_ for _ in ()).throw(RuntimeError("network down"))
+    r3 = d3.dfu_check({})
+    check("dfu_check survives an offline release fetch (latest null, note set)",
+          r3["latest"] is None and r3["updateAvailable"] is False and "network down" in (r3["note"] or ""),
+          str(r3))
+
+
+# --------------------------------------------------------------------------
+# 31. flash runner: correct adafruit-nrfutil argv + percent progress + error on non-zero.
+# --------------------------------------------------------------------------
+DFU_ARGV_TAIL = ["dfu", "serial", "-pkg", "/tmp/fw.zip", "-p", "/dev/cu.dfu", "-b", "115200"]
+
+
+def test_cham_dfu_flash_runner(check):
+    d = _dfu_daemon(FakeChameleon())
+    argv = d._nrfutil_argv("/tmp/fw.zip", "/dev/cu.dfu")
+    # the argv is the resolved flasher HEAD (tested for real in test_cham_dfu_flasher_resolve)
+    # followed by the dfu serial arguments - assert the tail + that a non-empty head precedes it.
+    check("dfu argv appends the dfu serial arguments to the resolved flasher head",
+          argv[-len(DFU_ARGV_TAIL):] == DFU_ARGV_TAIL and len(argv) > len(DFU_ARGV_TAIL), str(argv))
+
+    captured = {}
+
+    def fake_popen(argv):
+        captured["argv"] = argv
+        return FakePopen(["Upgrading target...\n", "10%\n", "55%\n", "100%\n",
+                          "Device programmed.\n"], code=0)
+    d._popen = fake_popen
+    emitted = []
+    d.emit = lambda o: emitted.append(o)
+    d._run_flash("/tmp/fw.zip", "/dev/cu.dfu")
+    check("dfu flash runner spawns the argv (dfu serial tail present)",
+          captured["argv"][-len(DFU_ARGV_TAIL):] == DFU_ARGV_TAIL, str(captured))
+    pcts = [e["percent"] for e in emitted if e.get("method") == "dfu_flash" and "percent" in e]
+    check("dfu flash runner streams the parsed percents then a final 100 done",
+          10 in pcts and 55 in pcts and pcts[-1] == 100, str(pcts))
+    check("dfu flash runner emits a terminal 'done' stage",
+          any(e.get("stage") == "done" for e in emitted), str([e.get("stage") for e in emitted]))
+
+    # a non-zero exit surfaces as a RuntimeError carrying the tool output tail
+    d2 = _dfu_daemon(FakeChameleon())
+    d2._popen = lambda argv: FakePopen(["Timed out waiting for ACK\n"], code=1)
+    d2.emit = lambda o: None
+    _expect_reject(check, "a non-zero flasher exit (surfaced as an error)",
+                   lambda: d2._run_flash("/tmp/fw.zip", "/dev/cu.dfu"))
+
+    # finding 5: a wait() that RAISES (still-running child) must NOT be treated as done; the
+    # flasher is waited out until poll() reports exit, and the real exit code is then used.
+    d3 = _dfu_daemon(FakeChameleon())
+    proc3 = SlowExitPopen(["10%\n", "100%\n"], code=0, raise_waits=1)
+    d3._popen = lambda argv: proc3
+    ev3 = []
+    d3.emit = lambda o: ev3.append(o)
+    d3._run_flash("/tmp/fw.zip", "/dev/cu.dfu")    # must not raise despite the transient wait error
+    check("run_flash waits out a still-running flasher (a transient wait error is not fatal)",
+          proc3._alive is False and any(e.get("stage") == "done" for e in ev3),
+          "flasher was abandoned or wrongly failed")
+    # a non-zero exit is still surfaced even after a retried wait()
+    d4 = _dfu_daemon(FakeChameleon())
+    d4._popen = lambda argv: SlowExitPopen(["boom\n"], code=3, raise_waits=1)
+    d4.emit = lambda o: None
+    _expect_reject(check, "a non-zero exit after a retried wait (still surfaced)",
+                   lambda: d4._run_flash("/tmp/fw.zip", "/dev/cu.dfu"))
+
+
+# --------------------------------------------------------------------------
+# 31b. flasher resolution: the REAL _flasher_head resolves adafruit-nrfutil WITHOUT PATH (the
+#      packaged app spawns the daemon with the launchd PATH that excludes the bundled bin dir).
+#      Covers the bundle (interpreter-relative script), module (nordicsemi -m), dev (PATH),
+#      and none (clear error) cases; and that _nrfutil_argv = head + the dfu serial tail.
+# --------------------------------------------------------------------------
+def test_cham_dfu_flasher_resolve(check):
+    d = chameleon_d.Daemon(learned=None)               # real resolver (no _dfu_daemon override)
+    real_exec = chameleon_d.sys.executable
+    real_find = chameleon_d.importlib.util.find_spec
+    real_which = chameleon_d.shutil.which
+    tail = ["dfu", "serial", "-pkg", "/tmp/f.zip", "-p", "/dev/cu.dfu", "-b", "115200"]
+    tmp = tempfile.mkdtemp()
+    empty = tempfile.mkdtemp()
+    try:
+        # (1) BUNDLE: an executable adafruit-nrfutil next to the interpreter is picked, no PATH.
+        scr = os.path.join(tmp, "adafruit-nrfutil")
+        with open(scr, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(scr, 0o755)
+        chameleon_d.sys.executable = os.path.join(tmp, "python3")
+        head1 = d._flasher_head()
+        check("flasher resolve (bundle): the interpreter-relative script is picked",
+              head1 == [scr], str(head1))
+        argv = d._nrfutil_argv("/tmp/f.zip", "/dev/cu.dfu")
+        check("nrfutil argv = resolved head + the dfu serial tail",
+              argv == [scr] + tail, str(argv))
+
+        # (2) MODULE: no interpreter-relative script; nordicsemi importable -> [python, -m, nordicsemi].
+        chameleon_d.sys.executable = os.path.join(empty, "python3")
+        chameleon_d.importlib.util.find_spec = lambda name: object() if name == "nordicsemi" else None
+        head2 = d._flasher_head()
+        check("flasher resolve (module): [interpreter, -m, nordicsemi] when the module is importable",
+              head2 == [os.path.join(empty, "python3"), "-m", "nordicsemi"], str(head2))
+
+        # (3) DEV/PATH: nothing interpreter-relative or importable; shutil.which finds it on PATH.
+        chameleon_d.importlib.util.find_spec = lambda name: None
+        chameleon_d.shutil.which = lambda name: ("/usr/local/bin/adafruit-nrfutil"
+                                                 if name == "adafruit-nrfutil" else None)
+        head3 = d._flasher_head()
+        check("flasher resolve (dev): shutil.which(PATH) is used when nothing else resolves",
+              head3 == ["/usr/local/bin/adafruit-nrfutil"], str(head3))
+
+        # each resolved head is one of the three valid forms
+        forms_ok = ((len(head1) == 1 and os.path.isabs(head1[0]))
+                    and (head2[1:] == ["-m", "nordicsemi"])
+                    and (len(head3) == 1))
+        check("every resolved head is one of the three valid forms (path / -m nordicsemi / which)",
+              forms_ok, str((head1, head2, head3)))
+
+        # (4) NONE resolvable -> a clear error (not a bare bad argv that FileNotFoundErrors later).
+        chameleon_d.shutil.which = lambda name: None
+        ok = False
+        try:
+            d._flasher_head()
+        except RuntimeError as e:
+            ok = "flasher not found" in str(e)
+        check("flasher resolve: raises a clear 'flasher not found' when nothing resolves", ok)
+    finally:
+        chameleon_d.sys.executable = real_exec
+        chameleon_d.importlib.util.find_spec = real_find
+        chameleon_d.shutil.which = real_which
+        __import__("shutil").rmtree(tmp, ignore_errors=True)
+        __import__("shutil").rmtree(empty, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# 32. dfu_flash end-to-end (mocked): validate -> enter-DFU -> wait -> flash.
+# --------------------------------------------------------------------------
+def test_cham_dfu_flash_e2e(check):
+    binf = bytes(range(256)) * 4
+    data = _good_pkg_bytes(binf)                        # what the official download yields
+    fake = FakeChameleon(model=0)
+    d = _dfu_daemon(fake)
+    fs = FakeSerial("/dev/cu.usbmodem6868")
+    d._serial = lambda port: fs
+    d._find_dfu_ports = lambda: []                     # snapshot empty; a NEW port appears after reboot
+    d._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]  # exactly one CDC device
+    d._wait_new_dfu_ports = lambda before, timeout=20: ["/dev/cu.usbmodemDFU"]
+    d._download_asset = _mock_download(data)           # download-only: inject the official bytes
+    flashed = {}
+
+    def fake_run(zp, port):
+        flashed["zip"], flashed["port"] = zp, port
+        d.emit({"event": "progress", "method": "dfu_flash", "stage": "flash", "percent": 50})
+    d._run_flash = fake_run
+    emitted = []
+    d.emit = lambda o: emitted.append(o)
+
+    r = d.dfu_flash({})                                # NO zip_path: model read from the device
+    check("dfu_flash download-only path succeeds end to end",
+          r["flashed"] is True and r["hash"] == "sha256" and r["tag"] == "v2.0.0", str(r))
+    check("dfu_flash wrote the enter-DFU frame before flashing",
+          fs.writes == [b"\x11\xef\x03\xf2\x00\x00\x00\x00\x0b\x00"], str([w.hex() for w in fs.writes]))
+    check("dfu_flash flashes the NEW bootloader port, not the stale CDC one",
+          flashed.get("port") == "/dev/cu.usbmodemDFU", str(flashed))
+    check("dfu_flash flashes the downloaded model-specific asset from a private temp dir",
+          flashed.get("zip") is not None and os.path.basename(flashed["zip"]) == "ultra-dfu-app.zip",
+          str(flashed.get("zip")))
+    stages = [e.get("stage") for e in emitted if e.get("method") == "dfu_flash"]
+    check("dfu_flash streams prepare -> download -> validated -> enter -> wait -> flash",
+          all(s in stages for s in ("prepare", "download", "validated", "enter", "wait", "flash")),
+          str(stages))
+
+    # a device already in DFU (no CDC to reboot) with an EXPLICIT model flashes straight away
+    d2 = _dfu_daemon(FakeChameleon(model=0))
+    d2._find_dfu_ports = lambda: ["/dev/cu.usbmodemDFU"]
+    d2._find_cdc_ports = lambda: []                    # pure recovery: nothing to reboot
+    d2._download_asset = _mock_download(_good_pkg_bytes(binf))
+    already = {}
+    d2._send_enter_dfu = lambda port: already.setdefault("entered", True)
+    d2._run_flash = lambda zp, port: already.update(port=port, zip=zp)
+    d2.emit = lambda o: None
+    r2 = d2.dfu_flash({"model": "lite"})               # explicit model choice for recovery
+    check("dfu_flash recovers an already-in-DFU device with an explicit model (no enter-DFU)",
+          r2["flashed"] is True and "entered" not in already
+          and already.get("port") == "/dev/cu.usbmodemDFU", str((r2, already)))
+    check("dfu_flash recovery flashes the CHOSEN model's asset (lite-dfu-app.zip)",
+          os.path.basename(already.get("zip", "")) == "lite-dfu-app.zip", str(already.get("zip")))
+
+    # already in DFU with NO explicit model: refuse (never guess Ultra vs Lite)
+    d3 = _dfu_daemon(FakeChameleon(model=0))
+    d3._find_dfu_ports = lambda: ["/dev/cu.usbmodemDFU"]
+    d3._find_cdc_ports = lambda: []
+    d3._run_flash = lambda zp, port: None
+    d3.emit = lambda o: None
+    err3 = d3.handle({"id": 1, "method": "dfu_flash", "params": {}})
+    check("dfu_flash refuses an already-in-DFU device of unknown model (requires an explicit choice)",
+          "error" in err3 and "choose Ultra or Lite" in err3["error"], str(err3))
+
+    # finding 1: a caller-supplied model on a LIVE (CDC) device is REJECTED - the model must
+    # come from hardware, so a live Ultra can never be handed Lite firmware. This exercises the
+    # real path (no _download_asset mock is even reached: it fails before touching hardware).
+    d4 = _dfu_daemon(FakeChameleon(model=0))            # a live Ultra
+    d4._find_dfu_ports = lambda: []
+    d4._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    hit4 = {}
+    d4._send_enter_dfu = lambda port: hit4.setdefault("entered", True)
+    d4._run_flash = lambda zp, port: hit4.setdefault("flashed", True)
+    d4.emit = lambda o: None
+    err4 = d4.handle({"id": 2, "method": "dfu_flash", "params": {"model": "lite"}})
+    check("dfu_flash rejects a caller-supplied model on a live device (reads model from hardware)",
+          "error" in err4 and "cannot be overridden" in err4["error"]
+          and "entered" not in hit4 and "flashed" not in hit4, str(err4))
+
+    # finding 2: a live device whose HARDWARE model is an unexpected value (2) is REFUSED, not
+    # coerced to Lite firmware.
+    d5 = _dfu_daemon(FakeChameleon(model=2))            # an unexpected/future model
+    d5._find_dfu_ports = lambda: []
+    d5._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    hit5 = {}
+    d5._send_enter_dfu = lambda port: hit5.setdefault("entered", True)
+    d5._run_flash = lambda zp, port: hit5.setdefault("flashed", True)
+    d5.emit = lambda o: None
+    err5 = d5.handle({"id": 3, "method": "dfu_flash", "params": {}})
+    check("dfu_flash refuses a live device of unexpected hardware model (never picks Lite)",
+          "error" in err5 and "unknown model" in err5["error"]
+          and "entered" not in hit5 and "flashed" not in hit5, str(err5))
+
+
+# --------------------------------------------------------------------------
+# 33. dfu_flash brick-safety: a full package is refused before any hardware touch;
+#     a pre-cancel stops before the flash; an unreachable device gives the manual fallback.
+# --------------------------------------------------------------------------
+def test_cham_dfu_flash_safety(check):
+    binf = bytes(range(256)) * 4
+    full_bytes = open(_make_dfu_zip(_init_packet(binf), binf, full=True), "rb").read()
+    good_bytes = _good_pkg_bytes(binf)
+
+    # a FULL package (downloaded) is refused by the app-only sanity check, before any hardware
+    fake = FakeChameleon(model=0)
+    d = _dfu_daemon(fake)
+    d._find_dfu_ports = lambda: []
+    d._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    d._download_asset = _mock_download(full_bytes)
+    entered = {"n": 0}
+    d._send_enter_dfu = lambda port: entered.__setitem__("n", entered["n"] + 1)
+    d._run_flash = lambda zp, port: entered.__setitem__("flashed", True)
+    d.emit = lambda o: None
+    err = d.handle({"id": 1, "method": "dfu_flash", "params": {}})
+    check("dfu_flash refuses a FULL asset (sanity check) BEFORE touching hardware (no enter, no flash)",
+          "error" in err and entered["n"] == 0 and "flashed" not in entered, str(err))
+
+    # pre-cancel: the flag is set before the op -> it stops after validate, never flashes
+    d2 = _dfu_daemon(FakeChameleon(model=0))
+    d2._find_dfu_ports = lambda: []
+    d2._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    d2._download_asset = _mock_download(good_bytes)
+    d2._send_enter_dfu = lambda port: None
+    ran = {}
+    d2._run_flash = lambda zp, port: ran.setdefault("flashed", True)
+    d2.emit = lambda o: None
+    d2._cancel.set()
+    r = d2.dfu_flash({})
+    check("a pre-cancelled dfu_flash stops before the flash write (never bricks a cancel)",
+          r.get("cancelled") is True and "flashed" not in ran, str((r, ran)))
+
+    # unreachable device (no CDC port, not already in DFU) -> the manual B-button fallback
+    d3 = _dfu_daemon(FakeChameleon(model=0))
+    d3._find_dfu_ports = lambda: []
+    d3._find_cdc_ports = lambda: []
+    d3.emit = lambda o: None
+    err3 = d3.handle({"id": 2, "method": "dfu_flash", "params": {}})
+    check("dfu_flash on an unreachable device returns the manual B-button fallback",
+          "error" in err3 and "button B" in err3["error"], str(err3))
+
+    # more than one device in DFU (and no CDC to reboot) -> refuse
+    d4 = _dfu_daemon(FakeChameleon(model=0))
+    d4._find_dfu_ports = lambda: ["/dev/cu.dfu1", "/dev/cu.dfu2"]
+    d4._find_cdc_ports = lambda: []
+    flashed4 = {}
+    d4._run_flash = lambda zp, port: flashed4.setdefault("flashed", True)
+    d4.emit = lambda o: None
+    err4 = d4.handle({"id": 3, "method": "dfu_flash", "params": {"model": "ultra"}})
+    check("dfu_flash refuses when MULTIPLE devices are in DFU (never flashes the wrong one)",
+          "error" in err4 and "more than one" in err4["error"] and "flashed" not in flashed4, str(err4))
+
+    # more than one Chameleon connected (needing reboot) -> refuse, never reboot an arbitrary one
+    d5 = _dfu_daemon(FakeChameleon(model=0))
+    d5._find_dfu_ports = lambda: []
+    d5._find_cdc_ports = lambda: ["/dev/cu.a", "/dev/cu.b"]
+    entered5 = {}
+    d5._send_enter_dfu = lambda port: entered5.setdefault("entered", True)
+    d5.emit = lambda o: None
+    err5 = d5.handle({"id": 4, "method": "dfu_flash", "params": {}})
+    check("dfu_flash refuses to reboot when MULTIPLE Chameleons are connected (no arbitrary enter)",
+          "error" in err5 and "more than one" in err5["error"] and "entered" not in entered5, str(err5))
+
+
+# --------------------------------------------------------------------------
+# 33b. download integrity (finding 4): a complete download passes; a truncated / oversized /
+#      digest-mismatch / non-https download is refused.
+# --------------------------------------------------------------------------
+def test_cham_dfu_download_checks(check):
+    data = _good_pkg_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    d = _dfu_daemon(FakeChameleon())
+    fd, dest = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+
+    # (finding 3) the download must go through the pinned asset-ID endpoint with an
+    # octet-stream Accept, so a delete+replace of the asset cannot swap the bytes.
+    captured = {}
+
+    def pin_http(url, dest, max_bytes=chameleon_d.MAX_FIRMWARE_BYTES, timeout=180, accept=None):
+        captured["url"], captured["accept"] = url, accept
+        with open(dest, "wb") as f:
+            f.write(data)
+        return len(data)
+    d._http_download = pin_http
+    w = d._download_asset({"asset_id": 4242, "size": len(data), "digest": "sha256:" + sha}, dest)
+    check("download pins the asset by ID (releases/assets/<id>) with octet-stream Accept",
+          w == len(data) and captured["url"].endswith("/releases/assets/4242")
+          and captured["accept"] == "application/octet-stream", str(captured))
+
+    # (finding 3/4) no asset id -> cannot pin -> refused
+    _expect_reject(check, "an asset with no id (cannot pin the exact asset)",
+                   lambda: d._download_asset({"size": len(data)}, dest))
+    # (finding 4) a missing / non-integer / out-of-range size is refused (not silently skipped)
+    _expect_reject(check, "an asset with no declared size",
+                   lambda: d._download_asset({"asset_id": 1}, dest))
+    _expect_reject(check, "an asset whose size exceeds the cap",
+                   lambda: d._download_asset({"asset_id": 1, "size": chameleon_d.MAX_FIRMWARE_BYTES + 1}, dest))
+    for bad_size in (True, 12.0, 0, -5):
+        _expect_reject(check, "an asset with a %r declared size" % (bad_size,),
+                       lambda bs=bad_size: d._download_asset({"asset_id": 1, "size": bs}, dest))
+    # truncated: bytes written != declared size -> refused
+    _expect_reject(check, "a truncated download (size mismatch)",
+                   lambda: d._download_asset({"asset_id": 1, "size": len(data) + 10}, dest))
+    # (finding 4) a present-but-unsupported / malformed digest is refused (not skipped)
+    _expect_reject(check, "a present digest with an unsupported algorithm",
+                   lambda: d._download_asset({"asset_id": 1, "size": len(data), "digest": "md5:abcd"}, dest))
+    _expect_reject(check, "a present digest that is malformed (bad hex)",
+                   lambda: d._download_asset({"asset_id": 1, "size": len(data), "digest": "sha256:nothex"}, dest))
+    # digest mismatch -> refused
+    _expect_reject(check, "a download whose sha256 digest does not match",
+                   lambda: d._download_asset({"asset_id": 1, "size": len(data),
+                                              "digest": "sha256:" + "0" * 64}, dest))
+    # an ENTIRELY ABSENT digest is allowed (size + asset-ID pin are the completeness guards)
+    ok = True
+    try:
+        d._download_asset({"asset_id": 1, "size": len(data)}, dest)
+    except Exception:
+        ok = False
+    check("an absent digest is allowed (size + asset-ID pin guard completeness)", ok)
+
+    # (finding 4) non-https initial url, and a redirect that DOWNGRADES to http, are refused
+    # (real _http_download over a fake urlopen).
+    d2 = chameleon_d.Daemon(learned=None)
+    _expect_reject(check, "a non-https firmware url",
+                   lambda: d2._http_download("http://x/y", dest))
+    import urllib.request as _u
+    _orig = _u.urlopen
+
+    class _Resp:
+        def __init__(s, b, final): s._b = io.BytesIO(b); s._f = final
+        def geturl(s): return s._f
+        def read(s, n): return s._b.read(n)
+        def __enter__(s): return s
+        def __exit__(s, *a): pass
+    try:
+        _u.urlopen = lambda req, timeout=0: _Resp(b"x" * 10, "http://evil/blob")
+        _expect_reject(check, "a redirect that downgrades to a non-https url",
+                       lambda: d2._http_download("https://x/y", dest))
+        _u.urlopen = lambda req, timeout=0: _Resp(b"x" * 5000, "https://ok/blob")
+        _expect_reject(check, "an oversized download (exceeds the byte cap)",
+                       lambda: d2._http_download("https://x/y", dest, max_bytes=100))
+    finally:
+        _u.urlopen = _orig
+    os.remove(dest)
+
+
+# --------------------------------------------------------------------------
+# 33c. device identity binding (finding 6): snapshot the DFU ports BEFORE the reboot, then
+#      accept exactly ONE NEW attributable port; a second new DFU device -> refuse. A device
+#      already stuck in DFU before the reboot is never mistaken for the rebooted one.
+# --------------------------------------------------------------------------
+def test_cham_dfu_identity_binding(check):
+    binf = bytes(range(256)) * 4
+    data = _good_pkg_bytes(binf)
+
+    # (a) DELAYED second enumeration exercised through the REAL _wait_new_dfu_ports: the target
+    #     appears, then a SECOND new DFU device enumerates a poll later (inside the settle
+    #     window). The helper must observe the whole window, accumulate both, and the caller
+    #     refuses - never flashing on the first-seen. (This is the bug a mock that returns both
+    #     at once would hide.)
+    d = _dfu_daemon(FakeChameleon(model=0))
+    d._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    d._serial = lambda port: FakeSerial(port)
+    d._download_asset = _mock_download(data)
+    seq = [[], ["/dev/cu.a"], ["/dev/cu.a", "/dev/cu.b"]]  # b appears one poll after a
+    step = {"i": 0}
+
+    def find_dfu():
+        i = min(step["i"], len(seq) - 1)
+        step["i"] += 1
+        return seq[i]
+    d._find_dfu_ports = find_dfu
+    # keep the settle short so the test is fast, but real (not a helper mock)
+    real_wait = d._wait_new_dfu_ports
+    d._wait_new_dfu_ports = lambda before, timeout=2, settle=0.4: real_wait(before, timeout, settle)
+    flashed = {}
+    d._run_flash = lambda zp, port: flashed.setdefault("flashed", True)
+    d.emit = lambda o: None
+    err = d.handle({"id": 1, "method": "dfu_flash", "params": {}})
+    check("dfu_flash refuses when a SECOND new DFU device enumerates in the settle window (real wait)",
+          "error" in err and "more than one new" in err["error"] and "flashed" not in flashed, str(err))
+
+    # (b) a device already stuck in DFU before the reboot is EXCLUDED by the snapshot; only the
+    #     new attributable port is flashed. Real _wait_new_dfu_ports over a stateful port list.
+    d2 = _dfu_daemon(FakeChameleon(model=0))
+    d2._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    d2._serial = lambda port: FakeSerial(port)
+    d2._download_asset = _mock_download(data)
+    # the stuck device is present the whole time; the fresh one appears after the reboot
+    seq2 = [["/dev/cu.stuckDFU"], ["/dev/cu.stuckDFU", "/dev/cu.freshDFU"]]
+    step2 = {"i": 0}
+
+    def find_dfu2():
+        i = min(step2["i"], len(seq2) - 1)
+        step2["i"] += 1
+        return seq2[i]
+    d2._find_dfu_ports = find_dfu2
+    real_wait2 = d2._wait_new_dfu_ports
+    d2._wait_new_dfu_ports = lambda before, timeout=2, settle=0.4: real_wait2(before, timeout, settle)
+    flashed2 = {}
+    d2._run_flash = lambda zp, port: flashed2.update(port=port)
+    d2.emit = lambda o: None
+    r2 = d2.dfu_flash({})
+    check("dfu_flash flashes ONLY the new attributable port, not the pre-existing stuck one",
+          r2["flashed"] is True and flashed2.get("port") == "/dev/cu.freshDFU", str(flashed2))
+
+
+# --------------------------------------------------------------------------
+# 33d. LATE-FIRST settle boundary (fix 1): the first new DFU port appears NEAR the discovery
+#      deadline; the settle window must still be observed IN FULL past the deadline so a second
+#      device enumerating shortly after is caught. Deterministic via a fake clock.
+# --------------------------------------------------------------------------
+def test_cham_dfu_settle_past_deadline(check):
+    d = _dfu_daemon(FakeChameleon())
+    fc = _FakeClock()
+    real = chameleon_d.time
+
+    def find_dfu():
+        el = fc.t
+        if el < 1.9:                       # first appears at ~1.9s, just under the 2.0s timeout
+            return []
+        if el < 2.2:                       # second appears ~0.3s later at ~2.2s, PAST the deadline
+            return ["/dev/cu.a"]
+        return ["/dev/cu.a", "/dev/cu.b"]
+    d._find_dfu_ports = find_dfu
+    chameleon_d.time = fc
+    try:
+        r = d._wait_new_dfu_ports([], timeout=2.0, settle=1.0)
+    finally:
+        chameleon_d.time = real
+    check("a late-first port still gets the FULL settle window, so the delayed second is caught",
+          set(r) == {"/dev/cu.a", "/dev/cu.b"}, str(r))
+
+    # and the happy case: a lone late-first port (no second) returns exactly it.
+    d2 = _dfu_daemon(FakeChameleon())
+    fc2 = _FakeClock()
+
+    def find_one():
+        return [] if fc2.t < 1.9 else ["/dev/cu.only"]
+    d2._find_dfu_ports = find_one
+    chameleon_d.time = fc2
+    try:
+        r2 = d2._wait_new_dfu_ports([], timeout=2.0, settle=1.0)
+    finally:
+        chameleon_d.time = real
+    check("a lone late-first port returns exactly one after its full settle window",
+          r2 == ["/dev/cu.only"], str(r2))
+
+
+# --------------------------------------------------------------------------
+# 37. EOF never abandons a flash (finding 2): a flash that is WRITING when stdin EOFs
+#     forces run() to join UNBOUNDED (not the bounded window), so the flasher is never
+#     torn down mid-write. EOF_JOIN_TIMEOUT is shrunk so bounded != unbounded is fast to see.
+# --------------------------------------------------------------------------
+def test_cham_dfu_eof_waits_for_flash(check):
+    d = _dfu_daemon(FakeChameleon(model=0))
+    d.EOF_JOIN_TIMEOUT = 0.2                        # a wrong (bounded) join would return in 0.2s
+    d._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    d._find_dfu_ports = lambda: []
+    d._serial = lambda port: FakeSerial(port)
+    d._download_asset = _mock_download(_good_pkg_bytes())
+    d._wait_new_dfu_ports = lambda before, timeout=20: ["/dev/cu.dfu"]
+    started = threading.Event()                     # the flash write has begun (_flashing set)
+    release = threading.Event()                     # let the flash finish
+
+    def slow_flash(zp, port):
+        started.set()
+        release.wait(5)                            # hold the committed write open
+    d._run_flash = slow_flash
+    d.emit = lambda o: None
+    # Hold the stream open until the write has begun, so EOF (and its cancel) fires only AFTER
+    # the flash is committed - the mid-write kill the guard must prevent.
+    stream = _GatedStream(['{"id": 1, "method": "dfu_flash", "params": {}}\n'], started)
+    runner = threading.Thread(target=lambda: d.run(stream))
+    runner.start()
+    ok_started = started.wait(3)                    # worker committed to the (blocked) write
+    runner.join(timeout=0.6)                        # 0.6s >> the 0.2s bounded window
+    check("EOF UNBOUNDED-joins a committed flash (does not abandon it after the bounded window)",
+          ok_started and runner.is_alive() and d._flashing.is_set(),
+          "run() returned while the flash was still writing")
+    release.set()
+    runner.join(timeout=3)
+    check("run() tears down only once the committed flash completes", not runner.is_alive())
+
+
+# --------------------------------------------------------------------------
+# 38. EOF-during-DISPATCH race (finding 2c): EOF lands while dfu_flash is in its PRE-flash
+#     phase - _flashing is not set yet, but _flash_pending (armed at DISPATCH) must still
+#     force the unbounded join, so the imminent flash is not abandoned.
+# --------------------------------------------------------------------------
+def test_cham_dfu_eof_dispatch_race(check):
+    d = _dfu_daemon(FakeChameleon(model=0))
+    d.EOF_JOIN_TIMEOUT = 0.2
+    at_wait = threading.Event()                     # worker reached the PRE-flash wait step
+    release = threading.Event()
+    d._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    d._find_dfu_ports = lambda: []
+    d._serial = lambda port: FakeSerial(port)
+    d._download_asset = _mock_download(_good_pkg_bytes())
+
+    def blocking_wait(before, timeout=20):
+        at_wait.set()                              # pre-flash phase: _flashing NOT set yet
+        release.wait(5)
+        return ["/dev/cu.dfu"]
+    d._wait_new_dfu_ports = blocking_wait
+    d._run_flash = lambda zp, port: None
+    d.emit = lambda o: None
+    # Hold EOF until the worker is in the pre-flash wait, so EOF fires while _flash_pending
+    # (dispatch-armed) is set but _flashing is not - the race the dispatch guard closes.
+    stream = _GatedStream(['{"id": 1, "method": "dfu_flash", "params": {}}\n'], at_wait)
+    runner = threading.Thread(target=lambda: d.run(stream))
+    runner.start()
+    ok_wait = at_wait.wait(3)
+    check("pre-flash phase: _flashing not set yet but _flash_pending is (dispatch-armed guard)",
+          ok_wait and not d._flashing.is_set() and d._flash_pending.is_set(),
+          "dispatch guard not armed during the pre-flash phase")
+    runner.join(timeout=0.6)                        # 0.6s >> the 0.2s bounded window
+    check("EOF unbounded-joins a DISPATCHED-but-not-yet-writing flash (via _flash_pending)",
+          runner.is_alive(), "run() abandoned a dispatched flash during the pre-flash phase")
+    release.set()
+    runner.join(timeout=3)
+    # The EOF cancel safely aborts a not-yet-writing flash; the point proven is that run()
+    # WAITED for the worker (unbounded) rather than exiting mid-approach to the write.
+    check("run() waits out the dispatched flash then tears down (never abandons it)",
+          not runner.is_alive(), "run() did not complete after the dispatched flash resolved")
+
+
+# --------------------------------------------------------------------------
+# 35. cancel THROUGH run(): a cancel line delivered while a dfu_flash op is queued must
+#     stop it before the flash write - exercising the real dispatch, not a pre-set flag.
+# --------------------------------------------------------------------------
+def test_cham_dfu_cancel_through_run(check):
+    d = _dfu_daemon(FakeChameleon(model=0))
+    d._find_cdc_ports = lambda: ["/dev/cu.usbmodem6868"]
+    d._find_dfu_ports = lambda: []
+    d._serial = lambda port: FakeSerial(port)
+    d._download_asset = _mock_download(_good_pkg_bytes())
+    # Block the op at the wait step until the cancel lands, so the cancel is guaranteed to
+    # arrive before the (never-reached) flash write; then the post-wait cancel check fires.
+    d._send_enter_dfu = lambda port: None
+
+    def wait_new(before, timeout=20):
+        d._cancel.wait(2)                          # hold until the cancel line is handled
+        return ["/dev/cu.dfu"]
+    d._wait_new_dfu_ports = wait_new
+    ran = {}
+    d._run_flash = lambda zp, port: ran.setdefault("flashed", True)
+    out = []
+    d.emit = lambda o: out.append(o)
+    d.run(io.StringIO('{"id": 1, "method": "dfu_flash", "params": {}}\n'
+                      '{"id": 2, "method": "cancel"}\n'))
+    ans = next((o for o in out if o.get("id") == 1), None)
+    check("a cancel routed THROUGH run() stops a queued dfu_flash before the flash write",
+          ans is not None and ans["result"].get("cancelled") is True and "flashed" not in ran,
+          str(ans))
+
+
 TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_read_block, test_cham_decode, test_cham_decode_partial,
          test_cham_decode_nocard, test_cham_decode_swap, test_cham_decode_user_key,
@@ -966,7 +1969,15 @@ TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_decode_cancel, test_cham_attack_budget_guard,
          test_cham_slot_config, test_cham_emulate_mode, test_cham_emulate_load,
          test_cham_emu_read, test_cham_magic_write, test_cham_magic_write_guards,
-         test_cham_magic_write_midswap, test_cham_magic_write_trailer_keys]
+         test_cham_magic_write_midswap, test_cham_magic_write_trailer_keys,
+         test_cham_dfu_asset, test_cham_dfu_norm_model, test_cham_dfu_port_discovery,
+         test_cham_dfu_enter_bootloader, test_cham_dfu_validate,
+         test_cham_dfu_check, test_cham_dfu_flash_runner, test_cham_dfu_flasher_resolve,
+         test_cham_dfu_flash_e2e,
+         test_cham_dfu_flash_safety, test_cham_dfu_download_checks,
+         test_cham_dfu_identity_binding, test_cham_dfu_settle_past_deadline,
+         test_cham_dfu_cancel_through_run,
+         test_cham_dfu_eof_waits_for_flash, test_cham_dfu_eof_dispatch_race]
 
 
 if __name__ == "__main__":

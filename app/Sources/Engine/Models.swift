@@ -126,6 +126,8 @@ struct EngineEvent: Decodable, Sendable {
     let attempts: Int?        // decode: cumulative auth attempts spent in the walk
     let walk_total: Int?      // decode: adaptive remaining-work estimate (shrinks)
     let unsafe: String?       // write_mfd: why a trailer was refused ("access-bits" / "trailer-lockout")
+    let stage: String?        // dfu_flash: phase (download / validated / enter / wait / flash / done)
+    let percent: Int?         // dfu_flash: 0..100 within a phase
 }
 
 /// How a sector's key was obtained - drives the provenance dot.

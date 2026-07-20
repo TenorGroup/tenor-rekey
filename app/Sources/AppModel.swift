@@ -71,6 +71,24 @@ final class AppModel {
     /// back to reader mode under the emulation.
     var emulating = false
 
+    // ---- firmware update (Chameleon-only, gated on capabilities.dfu) -------
+    /// The firmware update sheet is open.
+    var flashingSheet = false
+    /// The current firmware + latest release, loaded when the sheet opens.
+    var dfuStatus: DfuStatus?
+    /// A firmware flash is in flight (owns the device; folded into `deviceBusy`, so the
+    /// status monitor pauses while the device reboots into and out of the bootloader).
+    var flashing = false
+    /// The flash phase (download / enter / flash / done) + percent, for the progress UI.
+    var flashStage: String?
+    var flashPercent: Int?
+    /// A finished-successfully flag so the sheet can show a done state without a lingering error.
+    var flashDone = false
+    /// A flash failure, shown INSIDE the flashing sheet (not only the root banner behind the
+    /// modal) with the retry-now recovery path, since a failed flash usually leaves the
+    /// device in the bootloader.
+    var flashError: String?
+
     /// The active device bridge, chosen by the registry at connect and swapped on
     /// hot-plug. Created lazily for `descriptor` (the daemon itself starts on its
     /// first request), so there is no bridge before the first connect.
@@ -92,7 +110,7 @@ final class AppModel {
     /// A device op already owns the reader. Reconnect / swap must not replace the
     /// bridge under one, and a second op must not start while one runs. Slot ops are
     /// included so a slot edit and a decode / clone can never overlap on the reader.
-    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy || slotBusy }
+    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy || slotBusy || flashing }
 
     /// The active bridge, created lazily for the current descriptor. A prior bridge
     /// for a different device is torn down explicitly on the swap path (which nils
@@ -110,6 +128,11 @@ final class AppModel {
     /// active descriptor's static defaults before `info` lands or when a daemon
     /// predates the manifest.
     var capabilities: DeviceCapabilities { info?.capabilities ?? descriptor.capabilities }
+
+    /// True when the connected device is a Chameleon sitting in the Nordic bootloader:
+    /// it has no command interface (so `readerOnline` is false and card ops are off), but
+    /// the firmware flash can still recover it, so the firmware action stays reachable.
+    var deviceInDFU: Bool { descriptor.family == "chameleon-dfu" }
 
     /// The user's editable keys (Settings > Dictionaries), tried before the
     /// daemon's large built-in dictionary.
@@ -164,6 +187,17 @@ final class AppModel {
     /// then sample the reader. Shared by the first connect and a hot-swap, so both
     /// paths land the same state (info, capabilities via `info`, reader/card status).
     private func openCurrentDevice() async {
+        // A device in the bootloader has no command interface to query: present a reachable
+        // "in DFU" state (readerOnline false, but the firmware action stays enabled) so the
+        // user can flash-recover it, instead of a dead "reader offline" with DFU hidden.
+        if deviceInDFU {
+            _ = activeBridge()          // spawn the daemon so the flash path can find the DFU port
+            info = nil
+            readerOnline = false
+            dfuStatus = nil
+            lastError = nil
+            return
+        }
         let b = activeBridge()
         do {
             info = try await b.info()
@@ -250,6 +284,27 @@ final class AppModel {
         selectedSlot = nil
         showSlots = false
         emulating = false
+        dfuStatus = nil
+        // A failed flash usually leaves the device in the bootloader, which triggers a
+        // normal->DFU descriptor swap one monitor cycle later. If the flashing sheet is
+        // still open, KEEP the flash outcome (error / done + progress) so its banner and
+        // recovery text do not vanish under the user; clearFlashState() clears them when
+        // the sheet is dismissed.
+        if !flashingSheet {
+            flashStage = nil
+            flashPercent = nil
+            flashDone = false
+            flashError = nil
+        }
+    }
+
+    /// Clear the flash outcome + progress. Called when the flashing sheet is dismissed, so a
+    /// stale error / done state never carries into the next time it is opened.
+    func clearFlashState() {
+        flashStage = nil
+        flashPercent = nil
+        flashDone = false
+        flashError = nil
     }
 
     /// Consecutive polls that saw the reader but no card; a seated card that blips
@@ -881,6 +936,59 @@ final class AppModel {
             lastError = nil
         } catch { lastError = "\(error)" }
         slotBusy = false
+    }
+
+    // ---- firmware update (Chameleon-only, gated on capabilities.dfu) -------
+
+    /// Read the running firmware + the newest published release (opening the flashing
+    /// sheet or after a flash). A failed release fetch is not fatal - the daemon returns
+    /// the current version with a null latest + a note.
+    func checkFirmware() async {
+        guard capabilities.dfu, !swapping, !deviceBusy else { return }
+        flashError = nil
+        // A device already in the bootloader has no command interface to query: leave the
+        // status empty (the sheet shows the Ultra/Lite recovery choice) rather than erroring.
+        if deviceInDFU { dfuStatus = nil; return }
+        do { dfuStatus = try await activeBridge().dfuCheck(); lastError = nil }
+        catch { lastError = "\(error)" }
+    }
+
+    /// Flash firmware over DFU (v1 is download-only: the daemon fetches the official
+    /// model-specific asset). `model` is nil in normal mode (read off the device) and
+    /// "ultra"/"lite" only when recovering a device stuck in DFU whose model cannot be read.
+    /// The daemon validates the download (app-only, hash) before writing anything and refuses
+    /// a mid-write cancel, so this is a commit-once action. The device reboots into the
+    /// bootloader and back; `flashing` pauses the status monitor across that so it does not
+    /// mistake the reboot for an unplug.
+    func flashFirmware(model: String?) async {
+        guard capabilities.dfu, !swapping, !deviceBusy else { return }
+        flashing = true
+        flashDone = false
+        flashError = nil
+        flashStage = nil
+        flashPercent = nil
+        lastError = nil
+        let onProgress: @Sendable (String?, Int?) -> Void = { [weak self] stage, pct in
+            Task { @MainActor in
+                if let stage { self?.flashStage = stage }
+                if let pct { self?.flashPercent = pct }
+            }
+        }
+        do {
+            let r = try await activeBridge().dfuFlash(model: model, onProgress: onProgress)
+            if r.cancelled == true {
+                flashStage = nil
+            } else if r.flashed {
+                flashStage = "done"
+                flashPercent = 100
+                flashDone = true
+            }
+        } catch {
+            // Show the failure INSIDE the sheet with the retry path (a failed flash usually
+            // leaves the device in the bootloader), not only the root banner behind the modal.
+            flashError = "\(error)"
+        }
+        flashing = false
     }
 
     // ---- file dumps --------------------------------------------------------

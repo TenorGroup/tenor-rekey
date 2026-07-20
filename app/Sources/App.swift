@@ -1,7 +1,20 @@
 import SwiftUI
+import AppKit
+
+/// App delegate carrying the quit guard: while a firmware flash is writing, quitting must
+/// not tear the app (and the flasher subprocess) down mid-write, which can brick the
+/// device. The shell installs `terminationGuard`; it warns and cancels the quit while a
+/// flash is in progress, and otherwise allows it.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    static var terminationGuard: @MainActor () -> NSApplication.TerminateReply = { .terminateNow }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated { AppDelegate.terminationGuard() }
+    }
+}
 
 @main
 struct TenorRekeyApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
     @State private var theme = Theme()
     @State private var l10n = L10n()

@@ -46,9 +46,21 @@ enum DeviceRegistry {
         usbMatch: USBMatch(vid: 0x6868, pid: nil, transport: .serial),
         capabilities: .chameleonUltra)
 
+    /// A Chameleon sitting in the Nordic bootloader (re-enumerated to VID 0x1915). It
+    /// has no command interface (the daemon's `info` cannot query it), but recognising it
+    /// as a Chameleon-in-DFU keeps the firmware/flash action reachable so a stuck or
+    /// manually-B-buttoned device can be flash-recovered after relaunch, instead of
+    /// silently launching into the X7 fallback with DFU hidden. Same daemon (chameleon_d.py).
+    static let chameleonDFU = DeviceDescriptor(
+        id: "chameleon-dfu", family: "chameleon-dfu", displayName: "Chameleon (DFU)",
+        daemonScript: "chameleon_d.py", probeSubdir: nil,
+        usbMatch: USBMatch(vid: 0x1915, pid: 0x521f, transport: .serial),
+        capabilities: .chameleonDFU)
+
     /// Every family the app can drive, in match priority order (X7 first, so a
-    /// machine with both plugged in keeps driving the X7 until the user unplugs it).
-    static let all: [DeviceDescriptor] = [x7, chameleonUltra]
+    /// machine with both plugged in keeps driving the X7 until the user unplugs it; the
+    /// DFU match is last, only relevant when a Chameleon is stuck in the bootloader).
+    static let all: [DeviceDescriptor] = [x7, chameleonUltra, chameleonDFU]
 
     /// The descriptor to use when nothing is detected: the X7, so a bare machine
     /// starts the X7 daemon and shows "reader offline" exactly as the single-device

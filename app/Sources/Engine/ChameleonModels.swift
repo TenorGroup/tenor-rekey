@@ -41,6 +41,29 @@ struct SlotsResult: Codable, Sendable {
     let slots: [ChameleonSlot]
 }
 
+/// dfu_check result: the running firmware (app version + git) and the newest published
+/// release tag, so the flashing view can show "update available". `latest` / `note` are
+/// optional - an offline release fetch leaves latest nil and puts the reason in note.
+struct DfuStatus: Codable, Sendable, Equatable {
+    let model: String
+    let current: String        // "major.minor" app version
+    let git: String            // git description, e.g. "v2.0.0-3-gdeadbee"
+    let asset: String          // the app-only asset picked for this model
+    let latest: String?        // newest release tag, or nil if the fetch failed
+    let updateAvailable: Bool
+    let note: String?          // why the release fetch failed (offline), if any
+}
+
+/// dfu_flash result: whether the image was flashed (or the op was cancelled before any
+/// write). `tag` is the release flashed when the source was "latest".
+struct DfuFlashResult: Codable, Sendable {
+    let flashed: Bool
+    let tag: String?
+    let port: String?
+    let hash: String?
+    let cancelled: Bool?
+}
+
 /// emu_read result: the active slot's HF emulator memory as a block-index -> hex map.
 struct EmuReadResult: Codable, Sendable {
     let blocks: [String: String]
