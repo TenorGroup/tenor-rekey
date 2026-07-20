@@ -334,6 +334,15 @@ class FakeChameleon:
         self.written[block] = bytes(block_data)
         return True
 
+    # ---- reader-mode raw 14a transceive (base = a NON-gen1a card) ----
+    # The base card is not a gen1a magic card: the 7-bit 0x40 backdoor wakeup gets no ACK,
+    # so the daemon's _gen1a_unlock returns False and it uses the authed block-0 path. The
+    # Gen1aFake subclass overrides this to model the gen1a backdoor. FakeUltralight has its
+    # own hf14a_raw for the UL/NTAG page reads (an unrelated command surface).
+    def hf14a_raw(self, options, resp_timeout_ms=100, data=None, bitlen=None):
+        self._require_reader()
+        return b""
+
     # ---- LF (125 kHz): EM410x + HID Prox read / T5577 write / EM410x emulate ----
     # Return the SAME parsed shapes the real decorated methods return; raise the exact
     # LF_TAG_NO_FOUND status string on an empty field (so the daemon's no-tag test matches
@@ -473,6 +482,61 @@ class MidWriteSwapFake(FakeChameleon):
     """A magic-clone target that is swapped AFTER the first physical block write: its uid
     flips once a block lands, so the per-write uid pin must catch it before the next block
     and abort. Scans/reads (preflight) do not flip it, so preflight completes normally."""
+    def mf1_write_one_block(self, block, type_value, key, block_data):
+        ok = super().mf1_write_one_block(block, type_value, key, block_data)
+        self.uid = b"\x09\x09\x09\x09"
+        return ok
+
+
+class Gen1aFake(FakeChameleon):
+    """A gen1a (Chinese UID) magic card. It ACKs the 7-bit 0x40 + 0x43 backdoor and accepts
+    a raw block-0 write ONLY through it; a normal crypto1-authed write to block 0 is refused
+    (as on a real gen1a-only card, whose manufacturer block no auth can touch). Every hf14a_raw
+    frame is logged so a test can assert the 0x40 (7-bit) then 0x43 unlock preceded the block-0
+    write. Data sectors still auth normally (default FF keymap), so the authed data / trailer
+    writes work exactly like any card."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.raw_log = []          # (cmd_bytes, bitlen) of every hf14a_raw, in order
+        self.unlocked = False
+        self._pending_block = None
+
+    def hf14a_raw(self, options, resp_timeout_ms=100, data=None, bitlen=None):
+        self._require_reader()
+        cmd = bytes(data or b"")
+        self.raw_log.append((cmd, bitlen))
+        if cmd == b"\x00":                          # reset: drop the backdoor state
+            self.unlocked = False
+            self._pending_block = None
+            return b""
+        if cmd == b"\x40" and bitlen == 7:          # 7-bit backdoor wakeup
+            self.unlocked = True
+            return b"\x0a"
+        if cmd == b"\x43":
+            return b"\x0a" if self.unlocked else b""
+        if not self.unlocked:
+            return b""                              # any other frame needs the backdoor open
+        if len(cmd) == 2 and cmd[0] == 0xA0:        # write command: remember the target block
+            self._pending_block = cmd[1]
+            return b"\x0a"
+        if self._pending_block is not None:         # the 16-byte data frame -> commit
+            self.written[self._pending_block] = bytes(cmd)
+            self._pending_block = None
+            return b"\x0a"
+        return b""
+
+    # a gen1a-only card: an AUTHED write to block 0 is refused (only the backdoor works)
+    def mf1_write_one_block(self, block, type_value, key, block_data):
+        if block == 0:
+            self._require_reader()
+            raise UnexpectedResponseError("HF tag auth fail")
+        return super().mf1_write_one_block(block, type_value, key, block_data)
+
+
+class WriteMfdSwapFake(FakeChameleon):
+    """A re-key (write_mfd) target swapped AFTER the first physical block write: its uid flips
+    once a block lands, so the per-write uid pin must catch it before the next block and abort.
+    Scans/reads (the validate + first pin) do not flip it, so the first write goes through."""
     def mf1_write_one_block(self, block, type_value, key, block_data):
         ok = super().mf1_write_one_block(block, type_value, key, block_data)
         self.uid = b"\x09\x09\x09\x09"
@@ -1466,6 +1530,175 @@ def test_cham_magic_write_trailer_keys(check):
           tr is not None and tr[10:16] == bytes.fromhex(K), tr.hex() if tr else "not written")
     check("magic_write keeps the substituted trailer access bytes writable (ff0780)",
           tr is not None and tr[6:9] == bytes.fromhex("ff0780"), tr.hex() if tr else "not written")
+
+
+# --------------------------------------------------------------------------
+# 27. gen1a clone: the 7-bit 0x40/0x43 backdoor writes the uid block a normal
+#     authed write can never touch, and block 0 is written LAST (after the authed
+#     data/trailer writes) so the per-block uid pin holds for the whole clone.
+# --------------------------------------------------------------------------
+def test_cham_magic_write_gen1a(check):
+    fake = Gen1aFake(uid=b"\xaa\xbb\xcc\xdd", reader_mode=False)
+    d = cham_daemon(fake)
+    emitted = []
+    d.emit = lambda o: emitted.append(o)
+    r = d.magic_write({"blocks": _dump_1k(), "trailers": True, "uid": True,
+                       "target_uid": "aa bb cc dd"})
+    check("gen1a clone ensures reader mode before cloning", fake.reader_mode is True)
+    check("gen1a clone writes every block of a 1K including the uid block (64)",
+          r["present"] is True and r["wrote"] == 64 and r["failed"] == [], str(r))
+    check("gen1a clone writes block 0 via the backdoor - NOT via an authed write",
+          fake.written.get(0) == bytes.fromhex(_dump_1k()["0"])
+          and all(b != 0 for (b, _kt, _k) in fake.writes),
+          "block 0 authed=%s" % [w for w in fake.writes if w[0] == 0])
+    # the raw 7-bit 0x40 then 0x43 backdoor wakeup must be issued, and BEFORE the raw
+    # 0xA0 block-0 write frame
+    idx40 = next((i for i, (cmd, bl) in enumerate(fake.raw_log)
+                  if cmd == b"\x40" and bl == 7), None)
+    idx43 = next((i for i, (cmd, bl) in enumerate(fake.raw_log) if cmd == b"\x43"), None)
+    idxA0 = next((i for i, (cmd, bl) in enumerate(fake.raw_log)
+                  if len(cmd) == 2 and cmd[0] == 0xA0), None)
+    check("gen1a issues the raw 7-bit 0x40 then 0x43 unlock before the block-0 write",
+          idx40 is not None and idx43 is not None and idxA0 is not None
+          and idx40 < idx43 < idxA0,
+          str([(c.hex(), b) for (c, b) in fake.raw_log[:8]]))
+    prog = [e for e in emitted if e.get("method") == "magic_write"]
+    check("gen1a clone streams one progress event per written block (64), all ok",
+          len(prog) == 64 and all(e["ok"] for e in prog)
+          and prog[-1]["block"] == 0, "%d events, last=%s" % (len(prog), prog[-1] if prog else None))
+
+    # a gen1a card with uid OFF never touches block 0, and needs no backdoor
+    f2 = Gen1aFake(uid=b"\xaa\xbb\xcc\xdd")
+    d2 = cham_daemon(f2)
+    d2.emit = lambda o: None
+    r2 = d2.magic_write({"blocks": _dump_1k(), "trailers": True, "uid": False,
+                         "target_uid": "aa bb cc dd"})
+    check("gen1a clone with uid off writes all 63 non-block-0 blocks and never runs the backdoor",
+          r2["wrote"] == 63 and 0 not in f2.written and f2.raw_log == [], str(r2["wrote"]))
+
+
+# --------------------------------------------------------------------------
+# 28. write_mfd: re-key a REAL (non-magic) card with KNOWN keys. Mirrors x7d
+#     write_mfd's anti-brick guards; distinct from magic_write (which forces a
+#     writable ff0780 trailer). Data + trailers, no block 0 on a real card.
+# --------------------------------------------------------------------------
+def _rekey_1k(keyA=FF, keyB=FF):
+    """A deterministic 1K image whose 16 trailers carry a VALID factory-access trailer
+    (keyA + ff078069 + keyB), so write_mfd's access-bits / trailer-lockout guards pass and
+    the trailer write path is exercised."""
+    d = {str(b): (bytes([b]) + bytes(range(1, 16))).hex() for b in range(64)}
+    for s in range(16):
+        d[str(s * 4 + 3)] = keyA + ACCESS + keyB
+    return d
+
+
+def test_cham_write_mfd(check):
+    keys = {str(s): ["A", FF] for s in range(16)}
+    fake = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd", reader_mode=False)
+    d = cham_daemon(fake)
+    emitted = []
+    d.emit = lambda o: emitted.append(o)
+    r = d.write_mfd({"blocks": _rekey_1k(), "keys": keys, "trailers": True, "uid": False,
+                     "target_uid": "aa bb cc dd"})
+    check("write_mfd ensures reader mode before the re-key", fake.reader_mode is True)
+    check("write_mfd writes every non-block-0 block of a 1K with the known keys (uid off)",
+          r["present"] is True and r["wrote"] == 63 and r["failed"] == [], str(r))
+    check("write_mfd never writes block 0 on a real card when uid is off", 0 not in fake.written)
+    check("write_mfd auths KeyB-first then KeyA (a data block is written)",
+          fake.written.get(1) == bytes.fromhex(_rekey_1k()["1"]), str(fake.written.get(1)))
+    prog = [e for e in emitted if e.get("method") == "write_mfd"]
+    check("write_mfd streams one progress event per written block (63), all ok",
+          len(prog) == 63 and all(e["ok"] for e in prog), "%d events" % len(prog))
+
+    # target_uid is REQUIRED (a re-key onto a real card is never a silent write)
+    f2 = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd")
+    d2 = cham_daemon(f2)
+    d2.emit = lambda o: None
+    err = d2.handle({"id": 1, "method": "write_mfd",
+                     "params": {"blocks": _rekey_1k(), "keys": keys}})
+    check("write_mfd requires target_uid (error envelope, nothing written)",
+          "error" in err and "target_uid" in err["error"] and f2.written == {}, str(err))
+
+    # wrong card on the reader -> refuse, write nothing
+    f3 = FakeChameleon(uid=b"\x11\x22\x33\x44")
+    d3 = cham_daemon(f3)
+    d3.emit = lambda o: None
+    r3 = d3.write_mfd({"blocks": _rekey_1k(), "keys": keys, "target_uid": "aa bb cc dd"})
+    check("write_mfd refuses when the card on the reader is not the authorised one",
+          r3["wrote"] == 0 and "card changed" in (r3["error"] or "") and f3.written == {}, str(r3))
+
+
+# --------------------------------------------------------------------------
+# 29. write_mfd guards: mid-write swap abort, trailer-lockout refused, masked-zero
+#     key substituted, and a no-key sector failing cleanly.
+# --------------------------------------------------------------------------
+def test_cham_write_mfd_guards(check):
+    keys = {str(s): ["A", FF] for s in range(16)}
+
+    # (a) mid-write swap: the per-write uid pin must abort with no further writes
+    swap = WriteMfdSwapFake(uid=b"\xaa\xbb\xcc\xdd")
+    d = cham_daemon(swap)
+    events = []
+    d.emit = lambda o: events.append(o)
+    r = d.write_mfd({"blocks": _rekey_1k(), "keys": keys, "trailers": False, "uid": False,
+                     "target_uid": "aa bb cc dd"})
+    check("write_mfd aborts when the card is swapped mid-write (re-pins uid per block)",
+          "card changed" in (r["error"] or "") and r["wrote"] == 1 and len(swap.written) == 1,
+          "wrote %d" % len(swap.written))
+
+    # (b) a trailer whose access bits would LOCK the sector's keys forever is REFUSED
+    LOCK = FF + "778788" + "69" + FF                # valid access bits, but group-3 = keys locked
+    dump = _rekey_1k()
+    dump["3"] = LOCK
+    fl = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd")
+    dl = cham_daemon(fl)
+    lock_events = []
+    dl.emit = lambda o: lock_events.append(o)
+    rl = dl.write_mfd({"blocks": {"3": LOCK}, "keys": keys, "trailers": True, "uid": False,
+                       "target_uid": "aa bb cc dd"})
+    check("write_mfd REFUSES a trailer that would lock the sector's keys (never bricks it)",
+          rl["wrote"] == 0 and 3 in (rl["failed"] or []) and 3 not in fl.written, str(rl))
+    check("write_mfd reports the trailer-lockout reason on the refused block",
+          any(e.get("block") == 3 and e.get("unsafe") == "trailer-lockout" for e in lock_events),
+          str(lock_events))
+
+    # (b2) a trailer with CORRUPT access bits (integrity check fails) is refused too
+    fb = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd")
+    db = cham_daemon(fb)
+    bad_events = []
+    db.emit = lambda o: bad_events.append(o)
+    rb = db.write_mfd({"blocks": {"3": FF + "000000" + "69" + FF}, "keys": keys,
+                       "trailers": True, "uid": False, "target_uid": "aa bb cc dd"})
+    check("write_mfd REFUSES a trailer with corrupt access bits (access-bits guard)",
+          rb["wrote"] == 0 and 3 in (rb["failed"] or []) and 3 not in fb.written
+          and any(e.get("unsafe") == "access-bits" for e in bad_events), str(rb))
+
+    # (c) a masked (000000) trailer key slot is SUBSTITUTED with the known key, not written 000000
+    K = "a0b1c2d3e4f5"
+    km = {(s, kt): FF for s in range(16) for kt in ("A", "B")}
+    km[(0, "A")] = K
+    km[(0, "B")] = K
+    fs = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd", keymap=km)
+    ds = cham_daemon(fs)
+    ds.emit = lambda o: None
+    masked = "000000000000" + "ff078069" + "000000000000"
+    ds.write_mfd({"blocks": {"1": _dump_1k()["1"], "3": masked}, "keys": {"0": ["A", K]},
+                  "trailers": True, "uid": False, "target_uid": "aa bb cc dd"})
+    tr = fs.written.get(3)
+    check("write_mfd substitutes a masked trailer key with the known key (never writes 000000)",
+          tr is not None and tr[0:6] == bytes.fromhex(K) and tr[10:16] == bytes.fromhex(K),
+          tr.hex() if tr else "not written")
+
+    # (d) a sector with NO provided key fails cleanly (no guessed-key write onto a real card)
+    fn = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd")
+    dn = cham_daemon(fn)
+    nk_events = []
+    dn.emit = lambda o: nk_events.append(o)
+    rn = dn.write_mfd({"blocks": {"1": _dump_1k()["1"]}, "keys": {},
+                       "trailers": False, "uid": False, "target_uid": "aa bb cc dd"})
+    check("write_mfd fails a no-key sector cleanly (block failed, nothing written, no crash)",
+          rn["wrote"] == 0 and rn["failed"] == [1] and rn["error"] is None and fn.written == {},
+          str(rn))
 
 
 # --------------------------------------------------------------------------
@@ -2677,6 +2910,7 @@ TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_slot_set_type_lf_scope,
          test_cham_magic_write, test_cham_magic_write_guards,
          test_cham_magic_write_midswap, test_cham_magic_write_trailer_keys,
+         test_cham_magic_write_gen1a, test_cham_write_mfd, test_cham_write_mfd_guards,
          test_cham_dfu_asset, test_cham_dfu_norm_model, test_cham_dfu_port_discovery,
          test_cham_dfu_enter_bootloader, test_cham_dfu_validate,
          test_cham_dfu_check, test_cham_dfu_flash_runner, test_cham_dfu_flasher_resolve,

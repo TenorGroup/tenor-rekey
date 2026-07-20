@@ -14,6 +14,10 @@ struct CloneSheet: View {
     // The uid-write warning still shows, so a non-magic card is not a silent trap.
     @State private var trailers = true
     @State private var uid = true
+    // Target kind (Chameleon only): a MAGIC card (clone, block 0 writable) vs a REAL card
+    // you already hold the keys to (re-key via write_mfd, block 0 factory-locked). On the X7
+    // this is never shown - it has only the write_mfd path.
+    @State private var realCard = false
     @State private var confirm = false
     // The batch use (one master onto many blanks) keeps the sheet open: after a write
     // the user seats the next blank and writes again without reopening. `batchConfirmed`
@@ -73,10 +77,17 @@ struct CloneSheet: View {
     /// The idle state: write options + the cancel / write buttons.
     private var editState: some View {
         VStack(alignment: .leading, spacing: 18) {
+            // On a Chameleon the target can be a magic card (clone) OR a real card you own
+            // the keys to (re-key). The X7 has only the write_mfd path, so it is not shown.
+            if model.capabilities.emulate { targetKindPicker }
             VStack(alignment: .leading, spacing: 12) {
                 option(l.t("write_trailers"), hint: l.t("write_trailers_hint"), isOn: $trailers)
-                option(l.t("write_uid"), hint: l.t("write_uid_hint"), isOn: $uid)
-                if uid { guardedZone }
+                // A real card's block 0 (uid) is factory-locked, so uid-write is offered only
+                // for a magic-card clone; re-keying never touches block 0.
+                if !realCard {
+                    option(l.t("write_uid"), hint: l.t("write_uid_hint"), isOn: $uid)
+                    if uid { guardedZone }
+                }
             }
             HStack {
                 Spacer()
@@ -174,12 +185,33 @@ struct CloneSheet: View {
             .strokeBorder(theme.p.textTertiary, style: StrokeStyle(lineWidth: 1, dash: [3, 2])))
     }
 
+    /// The magic-card (clone) vs real-card (re-key) target selector, shown only on a
+    /// Chameleon. Switching to a real card forces uid-write off (block 0 is factory-locked)
+    /// and resets the batch confirmation, so the irreversible-write dialog re-prompts for the
+    /// new target kind.
+    private var targetKindPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("", selection: $realCard) {
+                Text(l.t("target_magic")).tag(false)
+                Text(l.t("target_real")).tag(true)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .onChange(of: realCard) { _, now in
+                if now { uid = false }
+                batchConfirmed = false
+            }
+            Text(l.t(realCard ? "target_real_hint" : "target_magic_hint"))
+                .font(l.sans(10)).foregroundStyle(theme.p.textTertiary)
+        }
+    }
+
     /// Run the clone pinned to the authorized card and stay open on its result (do not
     /// dismiss); the model resets the per-block glyphs when the next card is placed, so
     /// the batch stays clean.
     private func doWrite(authorized: String?) {
         Task {
-            await model.clone(trailers: trailers, uid: uid, authorizedUID: authorized)
+            await model.clone(trailers: trailers, uid: uid, authorizedUID: authorized, realCard: realCard)
             wrote = true
         }
     }

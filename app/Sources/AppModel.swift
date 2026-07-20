@@ -708,7 +708,12 @@ final class AppModel {
     /// accepted the confirm. The card can be swapped by the live monitor while a confirm
     /// dialog is open, so we execute ONLY if the card on the reader still equals that
     /// authorization - never write to a card whose uid differs from the one shown.
-    func clone(trailers: Bool, uid: Bool, authorizedUID: String?) async {
+    ///
+    /// `realCard` re-keys a REAL (non-magic) card the owner already holds the keys to: on a
+    /// Chameleon it routes to `write_mfd` (known-key auth + the anti-brick trailer guards)
+    /// instead of the magic-card `magic_write`. The X7 already has no magic path, so it always
+    /// uses write_mfd and the flag is a no-op there.
+    func clone(trailers: Bool, uid: Bool, authorizedUID: String?, realCard: Bool = false) async {
         // Never clone while a swap is in flight, another device op owns the reader, or
         // the device is emulating (a reader-mode write would break the emulation).
         guard !swapping, !deviceBusy, !emulating else { return }
@@ -736,11 +741,12 @@ final class AppModel {
             }
         }
         do {
-            // Capability-driven route: a Chameleon clones onto a magic card via
-            // `magic_write`; the X7 keeps its existing `write_mfd` path untouched. Both
-            // return the same WriteResult, so the outcome handling below is shared.
+            // Capability-driven route: a Chameleon clones onto a MAGIC card via `magic_write`,
+            // or re-keys a REAL card (realCard) via `write_mfd`; the X7 has no magic path and
+            // always uses write_mfd. All three return the same WriteResult, so the outcome
+            // handling below is shared.
             let r: WriteResult
-            if capabilities.emulate {
+            if capabilities.emulate && !realCard {
                 r = try await activeBridge().magicWrite(
                     blocks: src.blockParams, keys: src.keyParams, trailers: trailers, uid: uid,
                     targetUID: target, onBlock: onBlock)

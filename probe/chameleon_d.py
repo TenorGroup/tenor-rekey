@@ -179,6 +179,43 @@ def trailer_block(s):
     return first_block(s) + blocks_in_sector(s) - 1
 
 
+def _sector_of(b):
+    return b // 4 if b < 128 else 32 + (b - 128) // 16
+
+
+def access_bits_valid(trailer):
+    """True if a MIFARE Classic trailer's access bytes (6, 7, 8) pass the standard
+    inverted-complement integrity check. A trailer whose access bytes are corrupt must
+    NEVER be written: the wrong condition bits can lock a sector permanently (no key can
+    rewrite the trailer again). Kept local (like the geometry helpers) so this daemon does
+    not pull in the X7 hidapi stack; mirrors x7lib.access_bits_valid EXACTLY. Layout:
+    byte6 low nibble = ~C1, high = ~C2; byte7 low = ~C3, high = C1; byte8 low = C2, high = C3."""
+    if len(trailer) < 9:
+        return False
+    b6, b7, b8 = trailer[6], trailer[7], trailer[8]
+    bit = lambda v, n: (v >> n) & 1
+    for i in range(4):
+        c1, c2, c3 = bit(b7, 4 + i), bit(b8, i), bit(b8, 4 + i)
+        if bit(b6, i) == c1 or bit(b6, 4 + i) == c2 or bit(b7, i) == c3:
+            return False
+    return True
+
+
+def trailer_locks_keys(trailer):
+    """True if a trailer's access bits leave the sector in a state where NEITHER key can
+    ever rewrite the trailer again (keys permanently frozen). Writing such a trailer onto a
+    normal card bricks the sector, so the re-key write path refuses it. The trailer group
+    (group 3) C1C2C3 in {010, 110, 101, 111} = "keys locked" / "fully locked". The factory
+    trailer (ff 07 80) is group-3 001 = "a writes keys+access", so it is not affected.
+    Mirrors x7lib.trailer_locks_keys EXACTLY."""
+    if len(trailer) < 9:
+        return True                              # can't tell -> treat as unsafe
+    b7, b8 = trailer[7], trailer[8]
+    bit = lambda v, n: (v >> n) & 1
+    c = (bit(b7, 7), bit(b8, 3), bit(b8, 7))     # group 3 = bits index 4+3, 3, 4+3
+    return c in {(0, 1, 0), (1, 1, 0), (1, 0, 1), (1, 1, 1)}
+
+
 def card_kind(sak, atqa):
     """NTAG/Ultralight report SAK 0x00 AND ATQA 0x0044; a magic/blank Classic also
     reports SAK 0x00 but ATQA 0x0004. atqa: 2 bytes or int."""
@@ -465,7 +502,7 @@ class Daemon:
                "decode", "read_ntag", "cancel",
                "slot_set_type", "slot_enable", "slot_nick", "slot_save",
                "emulate_mode", "emulate_load", "emulate_load_ntag", "emu_read",
-               "magic_write",
+               "magic_write", "write_mfd",
                "lf_scan", "lf_write", "lf_emu",
                "dfu_check", "dfu_flash")
 
@@ -1139,6 +1176,13 @@ class Daemon:
             sub = (bytes.fromhex(dk[1]) if (isinstance(dk, list) and len(dk) == 2
                    and _valid_key_hex(dk[1])) else bytes.fromhex("ffffffffffff"))
             for b in todo[s]:
+                # Block 0 (the uid block) is written LAST, below: writing it changes the
+                # card's uid (both the gen1a backdoor and a gen2/CUID authed write do), so
+                # doing it after every other block keeps the per-block target pin valid for
+                # the whole clone - a block-0-first write would flip the uid and make every
+                # later re-pin read "card changed".
+                if b == 0:
+                    continue
                 # Re-pin the target immediately before each write: a card swapped in mid-
                 # clone (even one with compatible keys) must never receive the rest.
                 if self._current_uid_norm(c) != target:
@@ -1166,6 +1210,26 @@ class Daemon:
                     wrote += 1
                 else:
                     failed.append(b)
+
+        # Block 0 LAST. Try the gen1a 7-bit 0x40/0x43 backdoor first (it only engages on a
+        # real gen1a card, whose manufacturer/uid block NO authed write can touch); a
+        # gen2/CUID card falls through to the normal authed write. The per-block uid pin is
+        # re-checked here too - the card must still be the target before the uid is changed.
+        if write_uid and blocks.get("0"):
+            if self._current_uid_norm(c) != target:
+                return {"present": True, "wrote": wrote, "failed": failed,
+                        "error": "card changed, not written"}
+            raw = bytes.fromhex(blocks["0"].replace(" ", ""))
+            if len(raw) != 16:
+                failed.append(0)
+            else:
+                ok = self._write_block0(c, raw, dump_keys, sector_keys.get(0, {}))
+                self.emit({"event": "progress", "method": "magic_write",
+                           "block": 0, "ok": ok, "unsafe": None if ok else "write-refused"})
+                if ok:
+                    wrote += 1
+                else:
+                    failed.append(0)
         return {"present": True, "wrote": wrote, "failed": failed, "error": None}
 
     def _current_uid_norm(self, c):
@@ -1222,6 +1286,224 @@ class Daemon:
             except UnexpectedResponseError:
                 continue
         return False
+
+    # ---- gen1a magic-card backdoor (block 0 / uid block) -----------------------
+    # A "gen1a" (Chinese UID) magic card answers a 7-bit 0x40 wakeup then 0x43, entering a
+    # backdoor state where block 0 - the manufacturer/uid block that NO crypto1-authed write
+    # can ever touch - is writable via a raw 0xA0 <block> + data frame. This only ADDS a way
+    # to write block 0; the data / trailer writes still go through the authed path with all
+    # its guards. Mirrors the reference GUI gen1 write helper (send14ARaw 0x40 bitlen 7, then
+    # 0x43, then raw 0xA0 write) and the CLI gen1a clone. A card that is NOT gen1a never ACKs
+    # the wakeup (0x0a), so the probe is a safe no-op on a gen2/normal card.
+    _GEN1A_ACK = 0x0A
+
+    @staticmethod
+    def _raw_opts(append_crc=1, auto_select=1, keep_rf_field=0, check_response_crc=1):
+        """A reader-mode 14a-raw option dict, starting from the reference send14ARaw defaults
+        (rf field on, wait for a response) and overriding only the flags the gen1a sequence
+        varies. Keys match hf14a_raw's CStruct fields."""
+        return {"activate_rf_field": 1, "wait_response": 1, "append_crc": append_crc,
+                "auto_select": auto_select, "keep_rf_field": keep_rf_field,
+                "check_response_crc": check_response_crc}
+
+    def _gen1a_unlock(self, c):
+        """Issue the gen1a 7-bit 0x40 + 0x43 backdoor wakeup, leaving the RF field up. Returns
+        True only when the card ACKs BOTH (0x0a), i.e. it is a gen1a magic card. Any transport
+        hiccup / non-ACK -> False (the caller then uses the normal authed path). Mirrors the
+        reference gen1 isMagic sequence (reset, then 0x40 as 7 bits, then 0x43)."""
+        try:                                         # reset is best-effort (its reply is ignored)
+            c.hf14a_raw(options=self._raw_opts(), resp_timeout_ms=100, data=[0x00])
+        except (UnexpectedResponseError, TimeoutError, ValueError):
+            pass
+        try:
+            r1 = bytes(c.hf14a_raw(options=self._raw_opts(append_crc=0, auto_select=0,
+                                                          keep_rf_field=1, check_response_crc=0),
+                                   resp_timeout_ms=100, data=[0x40], bitlen=7))
+            if not r1 or r1[0] != self._GEN1A_ACK:
+                return False
+            r2 = bytes(c.hf14a_raw(options=self._raw_opts(append_crc=0, auto_select=0,
+                                                          keep_rf_field=1, check_response_crc=0),
+                                   resp_timeout_ms=100, data=[0x43]))
+            return bool(r2) and r2[0] == self._GEN1A_ACK
+        except (UnexpectedResponseError, TimeoutError, ValueError):
+            return False
+
+    def _gen1a_write_block(self, c, block, data):
+        """Write one block via the gen1a backdoor (no auth): unlock, then raw 0xA0 <block>
+        followed by the 16 data bytes. Returns True on the card's 0x0a ACK. Returns False
+        IMMEDIATELY when the card is not gen1a (the unlock never ACKs), so a gen2/normal card
+        is not probed five times before the caller falls back to the authed write; a genuine
+        gen1a card whose write transiently fails is retried a few times (mirrors the reference)."""
+        for _ in range(5):
+            try:
+                if not self._gen1a_unlock(c):
+                    return False                     # not a gen1a card: let the caller auth-write
+                # write command 0xA0 <block> (append CRC, keep field); its reply is not gated
+                c.hf14a_raw(options=self._raw_opts(auto_select=0, keep_rf_field=1,
+                                                   check_response_crc=0),
+                            resp_timeout_ms=100, data=[0xA0, block])
+                out = bytes(c.hf14a_raw(options=self._raw_opts(auto_select=0, keep_rf_field=1,
+                                                              check_response_crc=0),
+                                        resp_timeout_ms=100, data=list(data)))
+                if out and out[0] == self._GEN1A_ACK:
+                    return True
+            except (UnexpectedResponseError, TimeoutError, ValueError):
+                pass
+        return False
+
+    def _write_block0(self, c, data, dump_keys, preflight):
+        """Write block 0 (the manufacturer/uid block). Try the gen1a 7-bit backdoor first (it
+        only engages on a real gen1a card, whose block 0 no authed write can touch); otherwise
+        fall back to a normal authed write for a gen2/CUID card. The authed fallback tries, in
+        order, the dump's sector-0 key (the sector's key once its trailer has been written),
+        the preflight key (if the trailer was not written), then factory FF - each as KeyB
+        then KeyA. Block 0 is written LAST, so by here sector 0's trailer may already carry the
+        dump's key; trying both covers the trailer-written and trailer-skipped cases."""
+        if self._gen1a_write_block(c, 0, data):
+            return True
+        cands = []
+
+        def add(k):
+            k = (k or "").lower()
+            if _valid_key_hex(k) and k not in cands:
+                cands.append(k)
+
+        dk = dump_keys.get("0")
+        if isinstance(dk, list) and len(dk) == 2:
+            add(dk[1])
+        for kt in ("B", "A"):
+            add(preflight.get(kt))
+        add("ffffffffffff")
+        for kh in cands:
+            if self._magic_write_block(c, 0, {"B": kh, "A": kh}, data):
+                return True
+        return False
+
+    # ---- re-key a REAL (non-magic) card: known-key write_mfd -------------------
+
+    def write_mfd(self, p):
+        """Re-key a REAL (non-magic) MIFARE Classic card: write the given blocks onto the card
+        on the reader using the caller's KNOWN sector keys. This is the destructive counterpart
+        to magic_write for a card the owner already holds the keys to (magic_write is for blank
+        magic cards, and resets every trailer's access bytes to a writable ff0780; write_mfd
+        writes the trailer's access bytes AS GIVEN, so it needs the extra brick guards below).
+
+        Mirrors x7d.write_mfd's anti-brick guards EXACTLY:
+        - `target_uid` is REQUIRED and re-verified before EVERY block write, so a card swapped
+          in mid-write (even one with compatible keys) never receives the rest.
+        - a trailer whose access bytes are corrupt (access_bits_valid) or that would lock the
+          sector's keys forever (trailer_locks_keys) is REFUSED - never written - so a sector
+          can never be bricked.
+        - a zeroed (masked) trailer key slot is substituted with the sector's known key (or
+          factory FF), never written as 000000.
+        - only blocks present in the dump are written (a hole is never a fabricated zero block);
+          a block that is not exactly 16 bytes is recorded failed, never half-written.
+        - each block is authed KeyB-first then KeyA (mf1_write_one_block auths+writes atomically),
+          and a per-block failure is reported with its reason. A sector with no provided key
+          fails cleanly (no key to auth), it is never silently written with a guessed key.
+        Returns the x7d write shape ({present, wrote, failed, error})."""
+        c = self._connect(p.get("port"))
+        self._ensure_reader(c)
+        write_trailers = bool(p.get("trailers", False))
+        write_uid = bool(p.get("uid", False))
+        blocks = p.get("blocks") or {}
+        keys = {int(s): v for s, v in (p.get("keys") or {}).items()}
+
+        # target_uid is REQUIRED: the re-key is pinned to the exact card the user authorised,
+        # for the WHOLE write - not merely checked once up front (mirrors magic_write / x7d).
+        target = (p.get("target_uid") or "").replace(" ", "").lower()
+        if not target:
+            raise RuntimeError("write_mfd requires target_uid")
+
+        try:
+            tags = c.hf14a_scan()
+        except UnexpectedResponseError:
+            return {"present": False}
+        if not tags:
+            return {"present": False}
+        if hx(tags[0]["uid"]).replace(" ", "") != target:
+            return {"present": True, "wrote": 0, "failed": [],
+                    "error": "card changed, not written"}
+
+        # Validate payloads up front: a block that is not exactly 16 bytes is never sent (a
+        # short/long write would half-write the card); record it failed for full accounting.
+        plan, failed = {}, []
+        for b_str, v in blocks.items():
+            if not v:
+                continue
+            b = int(b_str)
+            try:
+                raw = bytes.fromhex(v.replace(" ", ""))
+            except ValueError:
+                failed.append(b)
+                continue
+            if len(raw) == 16:
+                plan[b] = raw
+            else:
+                failed.append(b)
+
+        wrote = 0
+        for b in sorted(plan):
+            if b == 0 and not write_uid:
+                continue
+            s = _sector_of(b)
+            tb = trailer_block(s)
+            is_trailer = (b == tb)
+            if is_trailer and not write_trailers:
+                continue
+            # Re-pin the target before EVERY write: a card swapped in mid-write must never
+            # receive the rest (mirrors x7d write_mfd's per-block target check).
+            if self._current_uid_norm(c) != target:
+                return {"present": True, "wrote": wrote, "failed": failed,
+                        "error": "card changed, not written"}
+            k = keys.get(s)
+            data = plan[b]
+            if is_trailer:
+                # A trailer that is corrupt OR that locks its own keys can brick the sector
+                # forever - never write either. And never write a 000000 key slot: substitute
+                # the sector's known key, or factory FF if it is unknown. Mirrors x7d write_mfd.
+                if not access_bits_valid(data):
+                    failed.append(b)
+                    self.emit({"event": "progress", "method": "write_mfd",
+                               "block": b, "ok": False, "unsafe": "access-bits"})
+                    continue
+                if trailer_locks_keys(data):
+                    failed.append(b)
+                    self.emit({"event": "progress", "method": "write_mfd",
+                               "block": b, "ok": False, "unsafe": "trailer-lockout"})
+                    continue
+                sub = (bytes.fromhex(k[1]) if (isinstance(k, list) and len(k) == 2
+                       and _valid_key_hex(k[1])) else bytes.fromhex("ffffffffffff"))
+                d = bytearray(data)
+                if d[0:6] == bytes(6):
+                    d[0:6] = sub
+                if d[10:16] == bytes(6):
+                    d[10:16] = sub
+                data = bytes(d)
+            # Auth with the sector's KNOWN key (KeyB first, KeyA fallback) and write. A sector
+            # with no provided key has no candidates -> a clean per-block failure, never a
+            # guessed-key write onto a real card.
+            found = self._known_write_keys(k)
+            ok = self._magic_write_block(c, b, found, data)
+            self.emit({"event": "progress", "method": "write_mfd",
+                       "block": b, "ok": ok, "unsafe": None if ok else "write-refused"})
+            if ok:
+                wrote += 1
+            else:
+                failed.append(b)
+        return {"present": True, "wrote": wrote, "failed": failed, "error": None}
+
+    @staticmethod
+    def _known_write_keys(k):
+        """The {kt: keyhex} auth candidates for a re-key write from a sector's KNOWN key
+        (`[kt, keyhex]` from a prior decode). The key value is tried as BOTH KeyB and KeyA
+        (KeyB first, matching the clone path) so a card keyed on either slot authenticates.
+        An absent / malformed key yields an empty dict, so the block fails cleanly rather than
+        being written with a guessed key."""
+        if isinstance(k, list) and len(k) == 2 and _valid_key_hex(k[1]):
+            kh = k[1].lower()
+            return {"B": kh, "A": kh}
+        return {}
 
     # ---- firmware update (Nordic Secure DFU, app-only, brick-safe) ----------
     # The port / serial / subprocess / network seams are small overridable methods so
