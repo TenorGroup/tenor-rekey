@@ -134,6 +134,7 @@ private struct SlotDetail: View {
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
     @State private var nick = ""
+    @State private var clearSense: String?
 
     private var busy: Bool { model.slotBusy }
 
@@ -146,6 +147,8 @@ private struct SlotDetail: View {
                              enabled: !busy) {
                     Task { await model.enableSlot(slot.index, sense: "hf", enabled: !slot.hf.enabled) }
                 }
+                ActionButton(title: l.t("clear_hf"), icon: "trash",
+                             enabled: !busy && slot.hf.type != "UNDEFINED") { clearSense = "hf" }
                 if slot.hfIsClassic {
                     ActionButton(title: l.t("open_content"), icon: "square.grid.3x3",
                                  enabled: !busy) { Task { await model.openSlotContent(slot.index) } }
@@ -199,6 +202,8 @@ private struct SlotDetail: View {
                                  enabled: !busy) {
                         Task { await model.enableSlot(slot.index, sense: "lf", enabled: !slot.lf.enabled) }
                     }
+                    ActionButton(title: l.t("clear_lf"), icon: "trash",
+                                 enabled: !busy && slot.lf.type != "UNDEFINED") { clearSense = "lf" }
                     Spacer()
                 }
             }
@@ -206,6 +211,18 @@ private struct SlotDetail: View {
         .padding(.horizontal, 24).padding(.vertical, 14)
         .background(theme.p.panel)
         .task(id: slot.index) { nick = slot.hf.nick }
+        .confirmationDialog(l.t("clear_field_q"),
+                            isPresented: Binding(get: { clearSense != nil },
+                                                 set: { if !$0 { clearSense = nil } }),
+                            titleVisibility: .visible) {
+            Button(l.t("clear_field"), role: .destructive) {
+                if let sense = clearSense { Task { await model.clearSlotField(slot.index, sense: sense) } }
+                clearSense = nil
+            }
+            Button(l.t("cancel"), role: .cancel) { clearSense = nil }
+        } message: {
+            Text(l.t("clear_field_msg"))
+        }
     }
 
     private func rename() {

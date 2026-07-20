@@ -366,6 +366,10 @@ actor DeviceBridge {
     func slotEnable(slot: Int, sense: String, enabled: Bool) async throws {
         _ = try await request("slot_enable", params: SlotEnableParam(slot: slot, sense: sense, enabled: enabled), as: SlotEnableResult.self)
     }
+    /// Clear (reset) a slot's HF or LF field, discarding that field's emulated content.
+    func slotClear(slot: Int, sense: String) async throws {
+        _ = try await request("slot_clear", params: SlotClearParam(slot: slot, sense: sense), as: SlotClearResult.self)
+    }
     /// Rename a slot (`name` non-nil) or read its nick (`name` nil).
     @discardableResult
     func slotNick(slot: Int, sense: String, name: String?) async throws -> String {
@@ -472,6 +476,7 @@ actor DeviceBridge {
     private struct SlotParam: Encodable { let slot: Int }
     private struct SlotTypeParam: Encodable { let slot: Int; let type: String }
     private struct SlotEnableParam: Encodable { let slot: Int; let sense: String; let enabled: Bool }
+    private struct SlotClearParam: Encodable { let slot: Int; let sense: String }
     private struct SlotNickParam: Encodable { let slot: Int; let sense: String; let name: String? }
     private struct EmulateModeParam: Encodable { let reader: Bool }
     private struct EmulateLoadParam: Encodable { let blocks: [String: String] }
@@ -488,6 +493,7 @@ actor DeviceBridge {
     }
     private struct SlotSelectResult: Decodable { let slot: Int }
     private struct SlotEnableResult: Decodable { let slot: Int; let sense: String; let enabled: Bool }
+    private struct SlotClearResult: Decodable { let slot: Int; let sense: String; let cleared: Bool }
     private struct SavedResult: Decodable { let saved: Bool }
     private struct EmulateModeResult: Decodable { let reader: Bool }
     private struct EmulateLoadResult: Decodable { let blocks: Int; let loaded: Bool }

@@ -83,6 +83,7 @@ class FakeChameleon:
         self.type_sets = []               # (slot0, TagSpecificType) from set_slot_tag_type
         self.default_sets = []            # (slot0, TagSpecificType) from set_slot_data_default
         self.enable_sets = []             # (slot0, TagSenseType, bool) from set_slot_enable
+        self.sense_deletes = []           # (slot0, TagSenseType) from delete_slot_sense_type
         self.nick_store = {}              # (slot0, TagSenseType) -> nick
         self.saved = 0                    # slot_data_config_save call count
         self.emu = {}                     # block -> 16 bytes (HF emulator memory)
@@ -251,6 +252,10 @@ class FakeChameleon:
     def _slot0(slot_number):
         return int(slot_number) - 1               # SlotNumber (1..8) -> 0-based
 
+    @staticmethod
+    def _sense_key(sense_type):
+        return "lf" if sense_type == TagSenseType.LF else "hf"
+
     def set_slot_tag_type(self, slot_number, tag_type):
         self.type_sets.append((self._slot0(slot_number), tag_type))
 
@@ -258,7 +263,16 @@ class FakeChameleon:
         self.default_sets.append((self._slot0(slot_number), tag_type))
 
     def set_slot_enable(self, slot_number, sense_type, enabled):
-        self.enable_sets.append((self._slot0(slot_number), sense_type, bool(enabled)))
+        slot0 = self._slot0(slot_number)
+        self.enable_sets.append((slot0, sense_type, bool(enabled)))
+        self.enabled[slot0][self._sense_key(sense_type)] = 1 if enabled else 0
+
+    def delete_slot_sense_type(self, slot_number, sense_type):
+        slot0 = self._slot0(slot_number)
+        self.sense_deletes.append((slot0, sense_type))
+        key = self._sense_key(sense_type)
+        self.slot_info[slot0][key] = 0            # a cleared field reads UNDEFINED
+        self.enabled[slot0][key] = 0              # and disabled
 
     def set_slot_tag_nick(self, slot_number, sense_type, name):
         self.nick_store[(self._slot0(slot_number), sense_type)] = name
@@ -1175,6 +1189,64 @@ def test_cham_slot_config(check):
     check("slot_nick get on an unset slot -> '' (not an error)", rge["nick"] == "", str(rge))
     rs = d.slot_save({})
     check("slot_save persists config to flash", rs["saved"] is True and fake.saved == 1)
+
+
+# --------------------------------------------------------------------------
+# 19b. slot_enable toggles HF vs LF independently (per-field).
+# --------------------------------------------------------------------------
+def test_cham_slot_enable_independent(check):
+    slot_info = [{"hf": int(TagSpecificType.MIFARE_1024), "lf": int(TagSpecificType.EM410X)}
+                 for _ in range(8)]
+    enabled = [{"hf": 0, "lf": 0} for _ in range(8)]
+    fake = FakeChameleon(slot_info=slot_info, enabled=enabled)
+    d = cham_daemon(fake)
+    d.slot_enable({"slot": 4, "sense": "hf", "enabled": True})
+    s1 = d.slots_list({})["slots"]
+    check("slot_enable HF toggles ONLY the HF field (LF untouched)",
+          s1[4]["hf"]["enabled"] is True and s1[4]["lf"]["enabled"] is False, str(s1[4]))
+    d.slot_enable({"slot": 4, "sense": "lf", "enabled": True})
+    s2 = d.slots_list({})["slots"]
+    check("slot_enable LF toggles the LF field independently (HF stays on)",
+          s2[4]["hf"]["enabled"] is True and s2[4]["lf"]["enabled"] is True, str(s2[4]))
+    check("set_slot_enable saw HF then LF as distinct sense types",
+          fake.enable_sets == [(4, TagSenseType.HF, True), (4, TagSenseType.LF, True)],
+          str(fake.enable_sets))
+    d.slot_enable({"slot": 4, "sense": "hf", "enabled": False})
+    s3 = d.slots_list({})["slots"]
+    check("disabling HF leaves LF enabled",
+          s3[4]["hf"]["enabled"] is False and s3[4]["lf"]["enabled"] is True, str(s3[4]))
+
+
+# --------------------------------------------------------------------------
+# 19c. slot_clear: delete_slot_sense_type resets one field, the other untouched.
+# --------------------------------------------------------------------------
+def test_cham_slot_clear(check):
+    slot_info = [{"hf": 0, "lf": 0} for _ in range(8)]
+    slot_info[2] = {"hf": int(TagSpecificType.MIFARE_1024), "lf": int(TagSpecificType.EM410X)}
+    enabled = [{"hf": 0, "lf": 0} for _ in range(8)]
+    enabled[2] = {"hf": 1, "lf": 1}
+    fake = FakeChameleon(slot_info=slot_info, enabled=enabled)
+    d = cham_daemon(fake)
+    r = d.slot_clear({"slot": 2, "sense": "lf"})
+    check("slot_clear reports the cleared slot + sense",
+          r["slot"] == 2 and r["sense"] == "lf" and r["cleared"] is True, str(r))
+    check("slot_clear calls delete_slot_sense_type for the right slot + sense",
+          fake.sense_deletes == [(2, TagSenseType.LF)], str(fake.sense_deletes))
+    slots = d.slots_list({})["slots"]
+    check("slots_list reflects the cleared LF field (UNDEFINED / disabled)",
+          slots[2]["lf"]["type"] == "UNDEFINED" and slots[2]["lf"]["enabled"] is False,
+          str(slots[2]["lf"]))
+    check("clearing LF leaves the HF field of the same slot untouched",
+          slots[2]["hf"]["type"] == "MIFARE_1024" and slots[2]["hf"]["enabled"] is True,
+          str(slots[2]["hf"]))
+    d.slot_clear({"slot": 2, "sense": "hf"})
+    check("slot_clear HF targets TagSenseType.HF",
+          fake.sense_deletes == [(2, TagSenseType.LF), (2, TagSenseType.HF)],
+          str(fake.sense_deletes))
+    slots2 = d.slots_list({})["slots"]
+    check("slot_clear on HF resets the HF field to UNDEFINED / disabled",
+          slots2[2]["hf"]["type"] == "UNDEFINED" and slots2[2]["hf"]["enabled"] is False,
+          str(slots2[2]["hf"]))
 
 
 # --------------------------------------------------------------------------
@@ -2904,7 +2976,8 @@ TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_read_ntag, test_cham_read_ntag_locked, test_cham_read_ntag_unknown_size,
          test_cham_read_ntag_raw_safety, test_cham_decode_ntag_route,
          test_cham_decode_blank_classic_regression,
-         test_cham_slot_config, test_cham_emulate_mode, test_cham_emulate_load,
+         test_cham_slot_config, test_cham_slot_enable_independent, test_cham_slot_clear,
+         test_cham_emulate_mode, test_cham_emulate_load,
          test_cham_emulate_load_ntag, test_cham_emulate_load_ntag_gap,
          test_cham_emu_read, test_cham_lf_scan, test_cham_lf_write, test_cham_lf_emu,
          test_cham_slot_set_type_lf_scope,

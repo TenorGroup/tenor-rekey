@@ -186,6 +186,11 @@ final class L10n {
         "set_lf_type":     ["vi": "đổi loại lf", "en": "set lf type", "zh": "设置 lf 类型", "ja": "lf 種類を設定"],
         "enable_lf":       ["vi": "bật lf", "en": "enable lf", "zh": "启用 lf", "ja": "lf を有効化"],
         "disable_lf":      ["vi": "tắt lf", "en": "disable lf", "zh": "禁用 lf", "ja": "lf を無効化"],
+        "clear_hf":        ["vi": "xóa hf", "en": "clear hf", "zh": "清除 hf", "ja": "hf を消去"],
+        "clear_lf":        ["vi": "xóa lf", "en": "clear lf", "zh": "清除 lf", "ja": "lf を消去"],
+        "clear_field":     ["vi": "xóa trường", "en": "clear field", "zh": "清除字段", "ja": "フィールドを消去"],
+        "clear_field_q":   ["vi": "xóa trường này của khe?", "en": "clear this field of the slot?", "zh": "清除卡槽的此字段？", "ja": "スロットのこのフィールドを消去しますか？"],
+        "clear_field_msg": ["vi": "bỏ nội dung giả lập của trường trên thiết bị, không ảnh hưởng thẻ vật lý.", "en": "discards the field's emulated content on the device; it does not affect a physical card.", "zh": "清除设备上该字段的模拟内容，不影响实体卡。", "ja": "デバイス上のフィールドのエミュレート内容を破棄します。実体カードには影響しません。"],
         // ---- LF 125 kHz: em410x + hid prox read / t5577 write / em410x emulate (P6) ----
         "lf_panel":        ["vi": "thẻ lf (125 khz)", "en": "lf (125 khz)", "zh": "lf 标签 (125 khz)", "ja": "lf タグ (125 khz)"],
         "lf_hint":         ["vi": "đọc / ghi / giả lập thẻ lf 125 khz (em410x, hid prox)", "en": "read / write / emulate 125 khz lf tags (em410x, hid prox)", "zh": "读取 / 写入 / 模拟 125 khz lf 标签（em410x、hid prox）", "ja": "125 khz lf タグ（em410x, hid prox）の読取 / 書込 / エミュレート"],

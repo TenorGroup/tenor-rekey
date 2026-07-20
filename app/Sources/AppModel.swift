@@ -896,6 +896,11 @@ final class AppModel {
         await slotOp { try await $0.slotEnable(slot: i, sense: sense, enabled: enabled) }
     }
 
+    /// Clear (reset) a slot's HF or LF field, discarding its emulated content.
+    func clearSlotField(_ i: Int, sense: String) async {
+        await slotOp { try await $0.slotClear(slot: i, sense: sense) }
+    }
+
     /// Set a slot's emulated tag type (+ seed its default data).
     func setSlotType(_ i: Int, type: String) async {
         await slotOp { try await $0.slotSetType(slot: i, type: type) }

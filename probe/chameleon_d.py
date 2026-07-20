@@ -500,7 +500,7 @@ _DEAD = (OSError, NotOpenException, OpenFailException)
 class Daemon:
     METHODS = ("info", "poll", "slots_list", "slot_select", "mf_read_block",
                "decode", "read_ntag", "cancel",
-               "slot_set_type", "slot_enable", "slot_nick", "slot_save",
+               "slot_set_type", "slot_enable", "slot_clear", "slot_nick", "slot_save",
                "emulate_mode", "emulate_load", "emulate_load_ntag", "emu_read",
                "magic_write", "write_mfd",
                "lf_scan", "lf_write", "lf_emu",
@@ -815,6 +815,17 @@ class Daemon:
         enabled = bool(p["enabled"])
         c.set_slot_enable(SlotNumber.from_fw(slot), _sense(sense), enabled)
         return {"slot": slot, "sense": sense, "enabled": enabled}
+
+    def slot_clear(self, p):
+        """Clear (reset) a slot's HF or LF field (delete_slot_sense_type): the field's
+        emulated content is wiped, so it reads UNDEFINED / disabled on the next
+        slots_list. `slot` 0-based, `sense` 'hf'/'lf'. This discards the slot's emulated
+        data on the device; it never touches a physical card."""
+        c = self._connect(p.get("port"))
+        slot = int(p["slot"])
+        sense = str(p.get("sense", "hf")).lower()
+        c.delete_slot_sense_type(SlotNumber.from_fw(slot), _sense(sense))
+        return {"slot": slot, "sense": sense, "cleared": True}
 
     def slot_nick(self, p):
         """Get or set a slot's nickname. With `name` -> set_slot_tag_nick; without ->
