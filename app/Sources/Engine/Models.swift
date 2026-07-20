@@ -6,6 +6,13 @@ struct DeviceInfo: Codable, Equatable {
     let model: String
     let serial: String
     let hw: String
+    /// Device family the daemon reports ("x7" / "chameleon-ultra" / "chameleon-lite").
+    /// Optional so an older daemon that omits it decodes to nil rather than failing.
+    var family: String? = nil
+    /// The device's capability manifest, used to gate device-specific UI. Optional
+    /// so a daemon that predates the manifest decodes to nil; the shell then falls
+    /// back to the active descriptor's static capabilities.
+    var capabilities: DeviceCapabilities? = nil
 }
 
 struct PollResult: Codable, Equatable {

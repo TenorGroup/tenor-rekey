@@ -3,8 +3,8 @@ import Observation
 import AppKit
 
 /// Observable app state. The decoded / loaded image is the DOCUMENT; the card on the
-/// reader is a separate live device state. Heavy work stays on the X7Engine actor;
-/// this holds @MainActor UI state only.
+/// reader is a separate live device state. Heavy work stays on the device bridge
+/// actor; this holds @MainActor UI state only.
 @MainActor
 @Observable
 final class AppModel {
@@ -44,7 +44,45 @@ final class AppModel {
     var apduLog: [ApduEntry] = []
     var apduBusy = false
 
-    private let engine = X7Engine()
+    /// The active device bridge, chosen by the registry at connect and swapped on
+    /// hot-plug. Created lazily for `descriptor` (the daemon itself starts on its
+    /// first request), so there is no bridge before the first connect.
+    private var bridge: DeviceBridge?
+    /// The descriptor of the device the bridge currently drives. X7 by default, so a
+    /// bare machine (or one where detection has not run yet) behaves exactly as the
+    /// single-device build did; a detected Chameleon swaps it.
+    private var descriptor: DeviceDescriptor = DeviceRegistry.fallback
+    /// A device swap (or reconnect that changes the device) is tearing down the old
+    /// daemon and bringing up the new one.
+    ///
+    /// INVARIANT: no device op (decode / clone / format / apdu) or reconnect may run
+    /// while `swapping` is true, and the old bridge is unreachable the instant it is
+    /// set (the swap detaches `bridge` synchronously before its first await). This is
+    /// what makes a hot-swap atomic from the UI's point of view: an op started during
+    /// the teardown await cannot grab the just-terminated bridge or the stale card.
+    private var swapping = false
+
+    /// A device op already owns the reader. Reconnect / swap must not replace the
+    /// bridge under one, and a second op must not start while one runs.
+    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy }
+
+    /// The active bridge, created lazily for the current descriptor. A prior bridge
+    /// for a different device is torn down explicitly on the swap path (which nils
+    /// `bridge` before the descriptor changes), so this only ever creates the bridge
+    /// that matches - it never silently orphans a running daemon.
+    private func activeBridge() -> DeviceBridge {
+        if let b = bridge, b.descriptor.id == descriptor.id { return b }
+        let b = DeviceBridge(descriptor: descriptor)
+        bridge = b
+        return b
+    }
+
+    /// The connected device's capability manifest, read by the shell to gate
+    /// device-specific UI. Prefers the daemon's declared manifest; falls back to the
+    /// active descriptor's static defaults before `info` lands or when a daemon
+    /// predates the manifest.
+    var capabilities: DeviceCapabilities { info?.capabilities ?? descriptor.capabilities }
+
     /// The user's editable keys (Settings > Dictionaries), tried before the
     /// daemon's large built-in dictionary.
     let keyStore = KeyStore()
@@ -75,13 +113,34 @@ final class AppModel {
         s.replacingOccurrences(of: " ", with: "").lowercased()
     }
 
-    /// Start the daemon + read device info, then look for a card (connect at launch,
-    /// not lazily).
+    /// Detect the connected device, then start its daemon + read device info and look
+    /// for a card (connect at launch, not lazily). With no device detected we fall
+    /// back to the X7 so a bare machine shows "reader offline" exactly as before.
+    ///
+    /// Refuses while a swap is in flight or a device op owns the reader, so a Settings
+    /// reconnect can never replace the bridge under a running decode / clone. When the
+    /// detected device differs from the current one it routes through `swapDevice` so
+    /// the old daemon is torn down (never silently orphaned) under the swap guard.
     func connect() async {
+        guard !swapping, !deviceBusy else { return }
+        let found = DeviceRegistry.detect() ?? DeviceRegistry.fallback
+        if bridge != nil, found.id != descriptor.id {
+            await swapDevice(to: found)
+            return
+        }
+        descriptor = found
+        await openCurrentDevice()
+    }
+
+    /// Bring up the daemon for the active `descriptor`: read device info + key counts,
+    /// then sample the reader. Shared by the first connect and a hot-swap, so both
+    /// paths land the same state (info, capabilities via `info`, reader/card status).
+    private func openCurrentDevice() async {
+        let b = activeBridge()
         do {
-            info = try await engine.info()
-            builtinKeyCount = (try? await engine.builtinKeyCount()) ?? 0
-            learnedKeyCount = (try? await engine.learnedKeyCount()) ?? 0
+            info = try await b.info()
+            builtinKeyCount = (try? await b.builtinKeyCount()) ?? 0
+            learnedKeyCount = (try? await b.learnedKeyCount()) ?? 0
             readerOnline = true
             lastError = nil
             await refreshStatus()
@@ -94,12 +153,12 @@ final class AppModel {
     /// Re-read how many keys the daemon has learned (Settings shows this; it grows
     /// as decodes recover keys).
     func refreshLearnedCount() async {
-        learnedKeyCount = (try? await engine.learnedKeyCount()) ?? learnedKeyCount
+        learnedKeyCount = (try? await activeBridge().learnedKeyCount()) ?? learnedKeyCount
     }
 
     /// Forget every learned key. The cache reranks decodes; clearing it resets that.
     func clearLearnedKeys() async {
-        try? await engine.clearLearnedKeys()
+        try? await activeBridge().clearLearnedKeys()
         await refreshLearnedCount()
     }
 
@@ -109,9 +168,41 @@ final class AppModel {
     func monitor() async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(1.5))
-            if decoding || cloning || formatting || apduBusy { continue }
+            if deviceBusy || swapping { continue }
+            // Hot-swap: if a different device is now the best USB match (the old one
+            // was unplugged and another plugged in), tear down the current daemon and
+            // bring the new one up before the next status sample. Detection is a cheap
+            // IORegistry scan. With only the X7 involved, detect() keeps returning the
+            // same descriptor, so this path is inert and the poll below is unchanged.
+            if let found = DeviceRegistry.detect(), found.id != descriptor.id {
+                await swapDevice(to: found)
+                continue
+            }
             await refreshStatus()
         }
+    }
+
+    /// Replace the active device with a freshly detected one. Every synchronous state
+    /// change happens BEFORE the first await, so the teardown await (a MainActor
+    /// reentrancy point) cannot expose the old bridge or the stale card to a decode /
+    /// clone / reconnect started in that window: the swap guard is up and `bridge` is
+    /// already nil. Only reader-bound state is cleared; the writable document is
+    /// device-independent and is deliberately kept across the swap.
+    private func swapDevice(to found: DeviceDescriptor) async {
+        guard !swapping else { return }
+        swapping = true
+        defer { swapping = false }              // released however this returns
+        let old = bridge
+        bridge = nil                            // detach: no path can obtain the old bridge now
+        descriptor = found
+        withAnimation(.easeInOut(duration: 0.3)) {
+            readerOnline = false
+            info = nil
+            card = nil
+            clearCardBound()
+        }
+        await old?.shutdown()                   // bounded terminate + drain of the old daemon
+        await openCurrentDevice()               // creates + brings up the new bridge
     }
 
     /// Consecutive polls that saw the reader but no card; a seated card that blips
@@ -122,13 +213,13 @@ final class AppModel {
     /// replug (back online + refetch device info), and card placed / removed.
     private func refreshStatus() async {
         do {
-            let p = try await engine.poll(tries: 8)
+            let p = try await activeBridge().poll(tries: 8)
             if p.reader == false {           // reader unplugged: reflect it at once
                 applyReaderGone()
                 return
             }
             readerOnline = true
-            if info == nil { info = try? await engine.info() }   // refetch until it lands
+            if info == nil { info = try? await activeBridge().info() }   // refetch until it lands
             // NOTE: do not clear lastError here - the 1.5s poll would wipe a clone /
             // decode / format error banner before the user could read it. Operations
             // clear it when they start; the banner also has a dismiss button.
@@ -187,7 +278,10 @@ final class AppModel {
 
     func decode() async {
         let startUID = card?.uid
-        guard !decoding else { return }
+        // Refuse while a swap is tearing the device down, or another device op already
+        // owns the reader (deviceBusy includes `decoding`, so this also blocks a
+        // double-decode). Serialized, never racing the bridge.
+        guard !swapping, !deviceBusy else { return }
         decoding = true
         decodeCancelled = false
         decodeProgress = nil
@@ -203,7 +297,7 @@ final class AppModel {
         do {
             if card?.isNTAG == true {
                 // NTAG / Ultralight: a read-only page view, not a writable document.
-                let r = try await engine.readNTAG()
+                let r = try await activeBridge().readNTAG()
                 let pgs = Self.buildPages(r)
                 withAnimation(.easeInOut(duration: 0.3)) { pages = pgs; source = nil }
             } else {
@@ -213,7 +307,7 @@ final class AppModel {
                 withAnimation(.easeInOut(duration: 0.3)) {
                     sectors = Self.pendingSectors(count: count)
                 }
-                let r = try await engine.decode(userKeys: keyStore.keys,
+                let r = try await activeBridge().decode(userKeys: keyStore.keys,
                     onProgress: { [weak self] ev in Task { @MainActor in self?.applyDecodeEvent(ev) } })
                 if let startUID, Self.normUID(r.uid) != Self.normUID(startUID) {
                     lastError = "card changed during decode"
@@ -258,7 +352,7 @@ final class AppModel {
     func cancelDecode() async {
         guard decoding else { return }
         decodeCancelled = true
-        await engine.cancel()
+        await activeBridge().cancel()
     }
 
     /// Fold a decode progress event into `decodeProgress`. The daemon emits a
@@ -394,7 +488,8 @@ final class AppModel {
     /// Write the explicit source dump onto the card on the reader. Data blocks
     /// only by default; trailers (keys/access) and block 0 (uid) are opt-in.
     func clone(trailers: Bool, uid: Bool) async {
-        guard !cloning else { return }
+        // Never clone while a swap is in flight or another device op owns the reader.
+        guard !swapping, !deviceBusy else { return }
         guard let src = cloneSource else {
             lastError = "no clone source"
             return
@@ -406,7 +501,7 @@ final class AppModel {
         // if a different card slid onto the reader before it acquired one.
         let target = card?.uid
         do {
-            let r = try await engine.writeMFD(
+            let r = try await activeBridge().writeMFD(
                 blocks: src.blockParams, keys: src.keyParams, trailers: trailers, uid: uid,
                 targetUID: target,
                 onBlock: { [weak self] b, ok in
@@ -434,13 +529,14 @@ final class AppModel {
     /// card. Destructive, so the UI gates it behind a confirm. On success the document
     /// is dropped - the card is blank now, and its old image should not linger.
     func format() async {
-        guard canFormat, !formatting else { return }
+        // Never format while a swap is in flight or another device op owns the reader.
+        guard canFormat, !swapping, !deviceBusy else { return }
         formatting = true
         cloneResults = [:]
         lastError = nil
         let target = card?.uid
         do {
-            let r = try await engine.formatCard(keys: source?.keyParams ?? [:], targetUID: target)
+            let r = try await activeBridge().formatCard(keys: source?.keyParams ?? [:], targetUID: target)
             if r.present == false {
                 lastError = "no card on reader"
             } else if let e = r.error {
@@ -475,11 +571,12 @@ final class AppModel {
     /// answer (e.g. a MIFARE Classic, not ISO14443-4), and no card present.
     func sendAPDU(_ hex: String) async {
         let clean = hex.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !clean.isEmpty, !apduBusy else { return }
+        // Never send while a swap is in flight or another device op owns the reader.
+        guard !clean.isEmpty, !swapping, !deviceBusy else { return }
         apduBusy = true
         let id = (apduLog.last?.id ?? 0) + 1
         do {
-            let r = try await engine.apdu(clean)
+            let r = try await activeBridge().apdu(clean)
             if !r.present {
                 apduLog.append(ApduEntry(id: id, tx: clean, rx: nil, info: "apdu_no_card"))
             } else if let resp = r.resp {

@@ -1,13 +1,16 @@
 import Foundation
 
-/// Talks to the verified Python engine (probe/x7d.py) over newline-delimited
-/// JSON on a child-process pipe. The actor owns the process, correlates each
-/// request id with a continuation, and routes progress events separately.
+/// Talks to a verified Python daemon (probe/<daemonScript>) over newline-delimited
+/// JSON on a child-process pipe. The actor owns the process, correlates each request
+/// id with a continuation, and routes progress events separately. It is device
+/// neutral: the daemon to spawn, and the probe subdir it lives in, come from a
+/// `DeviceDescriptor`, so the same transport drives the X7 (x7d.py) and the
+/// Chameleon (chameleon_d.py) - both speak the identical contract.
 ///
-/// Architecture (2026-06-19): A-first hybrid. This bridge is deliberately thin
-/// and the daemon contract is narrow so the engine can later be replaced by a
-/// native Swift + vendored-C implementation without touching the UI.
-actor X7Engine {
+/// Architecture (2026-06-19): A-first hybrid. This bridge is deliberately thin and
+/// the daemon contract is narrow so the engine can later be replaced by a native
+/// Swift + vendored-C implementation without touching the UI.
+actor DeviceBridge {
     enum EngineError: Error, CustomStringConvertible {
         case daemon(String)
         case badResponse
@@ -18,6 +21,11 @@ actor X7Engine {
             }
         }
     }
+
+    /// The device this bridge drives. Immutable + Sendable, so callers on other
+    /// actors can read it without hopping onto this actor (used to tell whether a
+    /// live bridge already matches the detected device before spawning a new one).
+    nonisolated let descriptor: DeviceDescriptor
 
     private let python: URL
     private let workDir: URL
@@ -33,32 +41,41 @@ actor X7Engine {
     /// disables other actions); id-less progress events are routed here.
     private var eventSink: (@Sendable (EngineEvent) -> Void)?
 
-    init() {
-        let p = Self.resolvePaths()
+    init(descriptor: DeviceDescriptor) {
+        self.descriptor = descriptor
+        let p = Self.resolvePaths(for: descriptor)
         self.python = p.python
-        self.workDir = p.probeDir
-        self.script = p.probeDir.appendingPathComponent("x7d.py")
+        self.workDir = p.workDir
+        self.script = p.script
     }
 
-    /// Resolve the python interpreter + probe engine, preferring the copies
-    /// vendored inside the packaged .app (Contents/Resources/python + /probe),
-    /// then environment overrides (X7_PYTHON / X7_PROBE_DIR), then the dev
-    /// checkout. Both a shipped app and a dev build work with no configuration.
+    /// Resolve the python interpreter + daemon script, preferring the copies
+    /// vendored inside the packaged .app (Contents/Resources/python + /probe), then
+    /// environment overrides (X7_PYTHON / X7_PROBE_DIR), then the dev checkout. Both
+    /// a shipped app and a dev build work with no configuration. The working dir is
+    /// always the probe root so the daemons' shared imports (x7lib, learned_keys,
+    /// the vendored chameleon package) resolve regardless of which script is spawned.
     /// libhidapi is found by x7hid itself (a bundle-relative candidate inside the
     /// .app, brew outside), so we never touch the child's environment here.
-    static func resolvePaths() -> (python: URL, probeDir: URL) {
+    static func resolvePaths(for descriptor: DeviceDescriptor) -> (python: URL, workDir: URL, script: URL) {
         let fm = FileManager.default
         let res = Bundle.main.resourceURL ?? Bundle.main.bundleURL
         let bundledPython = res.appendingPathComponent("python/bin/python3")
         let bundledProbe = res.appendingPathComponent("probe")
+        let bundledScript = scriptURL(probeRoot: bundledProbe, descriptor: descriptor)
         if fm.fileExists(atPath: bundledPython.path),
-           fm.fileExists(atPath: bundledProbe.appendingPathComponent("x7d.py").path) {
-            return (bundledPython, bundledProbe)
+           fm.fileExists(atPath: bundledScript.path) {
+            return (bundledPython, bundledProbe, bundledScript)
         }
         let env = ProcessInfo.processInfo.environment
         let python = URL(fileURLWithPath: env["X7_PYTHON"] ?? "/usr/bin/python3")
         let probe = URL(fileURLWithPath: env["X7_PROBE_DIR"] ?? "/Users/tuan/Claude/Tenor/tenor-rekey/probe")
-        return (python, probe)
+        return (python, probe, scriptURL(probeRoot: probe, descriptor: descriptor))
+    }
+
+    private static func scriptURL(probeRoot: URL, descriptor: DeviceDescriptor) -> URL {
+        let dir = descriptor.probeSubdir.map { probeRoot.appendingPathComponent($0) } ?? probeRoot
+        return dir.appendingPathComponent(descriptor.daemonScript)
     }
 
     private func startIfNeeded() throws {
@@ -213,6 +230,27 @@ actor X7Engine {
     /// decode (a card whose keys are not in the dictionary walks the whole list).
     func cancel() {
         process?.terminate()
+    }
+    /// Tear the daemon down (device hot-swap / app teardown) completion-safely: signal
+    /// the child, wait a bounded interval for it to actually exit, then synchronously
+    /// fail every pending continuation and cancel the pipe readers. We do NOT rely on
+    /// the async terminationHandler alone: by the time this returns no stale stdout
+    /// line can resolve a continuation and no request is left dangling. A fresh bridge
+    /// for the newly detected device respawns the right daemon on its next request.
+    func shutdown() async {
+        guard let p = process else { died(); return }
+        p.terminate()                                   // SIGTERM
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while p.isRunning, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        if p.isRunning { p.interrupt() }                // still alive: one more signal
+        // Our side is torn down regardless of whether the child has fully exited yet:
+        // died() cancels the readability handlers, fails every pending request, and
+        // drops the handles. It is idempotent with the terminationHandler's later
+        // died() call (a second run finds nil handles + empty pending), so there is
+        // no double-resume.
+        died()
     }
     /// Size of the daemon's built-in dictionary (for the Settings "+N built-in" line).
     func builtinKeyCount() async throws -> Int {

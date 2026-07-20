@@ -180,11 +180,15 @@ private struct ActionBar: View {
             // offered when the card on the reader IS the one this document came from.
             ActionButton(title: l.t("format"), icon: "eraser",
                          enabled: model.canFormat && !busy) { model.formatConfirm = true }
-            // Nested / reader key recovery: the crypto + collection are ready and
-            // the engine method exists, but it is not yet verified live, so the
-            // action stays disabled with a "soon" hint until it is.
-            ActionButton(title: l.t("recover"), icon: "key.radiowaves.forward",
-                         enabled: false, help: l.t("soon")) { }
+            // Nested / reader key recovery: gated on the device declaring key-recovery
+            // attacks (the capability manifest). A reader with attacks (X7, Chameleon)
+            // shows it; a device with none (e.g. a Chameleon Lite) hides it entirely.
+            // The crypto + collection are ready and the engine method exists, but it is
+            // not yet verified live, so it stays disabled with a "soon" hint until it is.
+            if !model.capabilities.attacks.isEmpty {
+                ActionButton(title: l.t("recover"), icon: "key.radiowaves.forward",
+                             enabled: false, help: l.t("soon")) { }
+            }
             Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
             ActionButton(title: l.t("save_dump"), icon: "arrow.down.doc",
                          enabled: model.source != nil) { model.saveDumpDialog() }

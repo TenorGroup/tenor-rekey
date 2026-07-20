@@ -50,6 +50,15 @@ class Daemon:
                "format", "nested_recover", "cancel", "keys_default",
                "keys_builtin_count", "learned_stats", "learned_clear")
 
+    # Static capability manifest returned by info(). The X7 is a plain HF reader: no
+    # slots, no emulation, no LF, no firmware flashing, no sniffing. It recovers keys
+    # by dictionary + nested only. The shell reads this to gate device-specific UI;
+    # chameleon_d emits the same shape, so the shell never special-cases a device.
+    CAPABILITIES = {
+        "slots": 0, "emulate": False, "lf": False, "dfu": False, "sniff": False,
+        "attacks": ["dict", "nested"], "writeModes": [],
+    }
+
     # Consecutive status polls where the reader answered NOTHING (empty reads, no
     # OSError) before the handle is treated as wedged and dropped for a clean re-open.
     WEDGE_THRESHOLD = 3
@@ -96,13 +105,14 @@ class Daemon:
 
     def info(self, p):
         c = self._open()
-        out = {}
+        out = {"family": "x7"}
         for name, op in (("model", 0x68), ("serial", 0x69), ("hw", 0x6C)):
             d, r = c.x.cmd([0xFF, 0x00, op], reads=4, timeout=400)
             raw = r[0] if r else b""
             pl = raw[4:raw[1] - 2] if raw and len(raw) > 1 and raw[1] >= 6 else b""
             s = bytes(pl).split(b"\x00")[0].decode("latin1", "replace")
             out[name] = "".join(ch for ch in s if ch.isprintable())
+        out["capabilities"] = dict(self.CAPABILITIES)
         return out
 
     def poll(self, p):
