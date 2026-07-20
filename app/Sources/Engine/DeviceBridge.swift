@@ -40,6 +40,11 @@ actor DeviceBridge {
     /// Set for the duration of a streaming op (only one runs at a time, the UI
     /// disables other actions); id-less progress events are routed here.
     private var eventSink: (@Sendable (EngineEvent) -> Void)?
+    /// Bumped each time a streaming op (decode / write) starts. A cancel's hard-kill
+    /// fallback captures the generation of the op it is cancelling and terminates only
+    /// if THAT same op is still in flight when the grace window elapses, so it can never
+    /// kill a later, unrelated op that reused the shared daemon.
+    private var opGeneration = 0
 
     init(descriptor: DeviceDescriptor) {
         self.descriptor = descriptor
@@ -217,6 +222,7 @@ actor DeviceBridge {
         // the actor is reentrant - this is the real guard).
         guard eventSink == nil else { throw EngineError.daemon("an operation is already in progress") }
         eventSink = { ev in if ev.method == "decode" { onProgress(ev) } }
+        opGeneration += 1
         defer { eventSink = nil }
         // A decode can legitimately walk the whole dictionary for minutes; the
         // cancel button is the user's control, so give it a long backstop deadline.
@@ -225,11 +231,38 @@ actor DeviceBridge {
         return try await request("decode", params: DecodeParams(user_keys: userKeys), timeout: dl, as: DecodeResult.self)
     }
 
-    /// Abort an in-flight operation by killing the daemon: its termination fails
-    /// the pending request, and the next call respawns it. Used to cancel a long
-    /// decode (a card whose keys are not in the dictionary walks the whole list).
+    /// Cooperatively abort an in-flight streaming op: ask the daemon to stop via its
+    /// `cancel` method (it trips a flag its long loops watch and returns the partial
+    /// result it has gathered so far) INSTEAD of killing the process. Keeping the daemon
+    /// alive preserves its learned-key cache write and needs no respawn. If the op has
+    /// not wound down within a short grace window (a genuinely wedged daemon), fall back
+    /// to terminating it so the pending op fails and the next call respawns.
+    ///
+    /// The daemon handles `cancel` inline (off its worker), so it lands while the op is
+    /// still running; the op's own continuation then resolves with the partial result.
+    /// We do not register a continuation for the cancel line - its id-tagged reply is
+    /// simply dropped by route().
     func cancel() {
-        process?.terminate()
+        guard let p = process else { return }
+        let gen = opGeneration                  // the op we are cancelling
+        let id = nextID; nextID += 1
+        if let data = try? JSONEncoder().encode(Req(id: id, method: "cancel")) {
+            try? stdin?.write(contentsOf: data)
+            try? stdin?.write(contentsOf: Data([0x0A]))
+        }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            await self?.hardCancel(generation: gen, process: p)
+        }
+    }
+
+    /// Hard-kill fallback for a cancel the daemon did not honour: terminate ONLY if the
+    /// SAME op that was cancelled is still in flight after the grace window - same daemon
+    /// (`process === p`), same operation (`opGeneration == gen`, so a later op that
+    /// reused the daemon is never killed), and still streaming (`eventSink != nil`, so an
+    /// op that already wound down is left alone). Any of those failing makes this a no-op.
+    private func hardCancel(generation gen: Int, process p: Process) {
+        if opGeneration == gen, process === p, eventSink != nil { p.terminate() }
     }
     /// Tear the daemon down (device hot-swap / app teardown) completion-safely: signal
     /// the child, wait a bounded interval for it to actually exit, then synchronously
@@ -279,11 +312,14 @@ actor DeviceBridge {
     /// `onBlock` as the daemon writes; the final tally is returned.
     func writeMFD(blocks: [String: String], keys: [String: [String]],
                   trailers: Bool, uid: Bool, targetUID: String?,
-                  onBlock: @escaping @Sendable (Int, Bool) -> Void) async throws -> WriteResult {
+                  onBlock: @escaping @Sendable (Int, Bool, String?) -> Void) async throws -> WriteResult {
         guard eventSink == nil else { throw EngineError.daemon("an operation is already in progress") }
         eventSink = { ev in
-            if ev.method == "write_mfd", let b = ev.block, let ok = ev.ok { onBlock(b, ok) }
+            // `unsafe` carries WHY a trailer was refused (bad access bits / would lock
+            // its own keys), so the UI can name the reason instead of a bare block index.
+            if ev.method == "write_mfd", let b = ev.block, let ok = ev.ok { onBlock(b, ok, ev.unsafe) }
         }
+        opGeneration += 1
         defer { eventSink = nil }
         let params = CloneParams(blocks: blocks, keys: keys, trailers: trailers, uid: uid, target_uid: targetUID)
         return try await request("write_mfd", params: params, timeout: .seconds(300), as: WriteResult.self)

@@ -84,7 +84,7 @@ final class L10n {
         "decoding":      ["vi": "đang giải mã…", "en": "decoding…", "zh": "解码中…", "ja": "デコード中…"],
         "trying_keys":   ["vi": "thử khóa", "en": "trying keys", "zh": "尝试密钥", "ja": "鍵を試行"],
         "no_keys_title": ["vi": "không tìm thấy khóa", "en": "no keys found", "zh": "未找到密钥", "ja": "鍵が見つかりません"],
-        "no_keys_msg":   ["vi": "thẻ này dùng khóa không có trong từ điển. nếu bạn có khóa của thẻ, thêm ở cài đặt (từ điển khóa) rồi giải mã lại.", "en": "this card uses a key that is not in the dictionary. if you have this card's key, add it in settings (key dictionary) and decode again.", "zh": "此卡使用的密钥不在字典中。如果您有该卡的密钥，请在设置（密钥字典）中添加后重新解码。", "ja": "このカードの鍵は辞書にありません。鍵をお持ちの場合は、設定（鍵辞書）で追加して再度デコードしてください。"],
+        "no_keys_msg":   ["vi": "không tìm được khóa nào trong từ điển cho thẻ này. nếu bạn có khóa, thêm ở cài đặt (từ điển khóa) rồi giải mã lại. nếu không có khóa thì bản này chưa đọc được thẻ - chưa hỗ trợ dò khóa cho thẻ hoàn toàn lạ.", "en": "no key in the dictionary matched this card. if you have a key, add it in settings (key dictionary) and decode again. without a key, this build cannot read the card yet - key recovery for a fully unknown card is not available.", "zh": "字典中没有匹配此卡的密钥。如果您有密钥，请在设置（密钥字典）中添加后重新解码。若没有密钥，此版本暂时无法读取该卡 - 尚不支持对完全未知卡的密钥恢复。", "ja": "辞書内にこのカードと一致する鍵がありませんでした。鍵をお持ちなら設定（鍵辞書）で追加して再度デコードしてください。鍵がない場合、このビルドではまだ読み取れません - 全く未知のカードの鍵復元は未対応です。"],
         "not_decoded":   ["vi": "chưa giải", "en": "not decoded", "zh": "未解码", "ja": "未デコード"],
         "waiting_card":  ["vi": "đang chờ thẻ", "en": "waiting for card", "zh": "等待卡片", "ja": "カードを待機中"],
         "reader_offline":["vi": "chưa có đầu đọc", "en": "reader offline", "zh": "读卡器离线", "ja": "リーダー オフライン"],
@@ -151,5 +151,14 @@ final class L10n {
         "prov_dictionary": ["vi": "từ điển", "en": "dictionary", "zh": "字典", "ja": "辞書"],
         "prov_nested":     ["vi": "bẻ nested", "en": "nested-cracked", "zh": "嵌套破解", "ja": "ネスト解読"],
         "prov_unknown":    ["vi": "chưa biết", "en": "unknown", "zh": "未知", "ja": "不明"],
+        "read_anyway":     ["vi": "cứ đọc thử", "en": "read anyway", "zh": "仍然读取", "ja": "それでも読み取る"],
+        "looking_card":    ["vi": "đang tìm thẻ…", "en": "looking for card…", "zh": "正在寻找卡片…", "ja": "カードを探しています…"],
+        "writing":         ["vi": "đang ghi…", "en": "writing…", "zh": "写入中…", "ja": "書き込み中…"],
+        "clone_done":      ["vi": "đã ghi xong", "en": "clone complete", "zh": "克隆完成", "ja": "複製完了"],
+        "place_next":      ["vi": "đặt thẻ trắng tiếp theo rồi ghi lần nữa", "en": "place the next blank, then write again", "zh": "放入下一张空白卡，然后再次写入", "ja": "次の空白カードを置いて、もう一度書き込む"],
+        "write_another":   ["vi": "ghi thẻ khác", "en": "write another", "zh": "写入下一张", "ja": "続けて書き込む"],
+        "done":            ["vi": "xong", "en": "done", "zh": "完成", "ja": "完了"],
+        "assumed":         ["vi": "suy đoán", "en": "assumed", "zh": "推测", "ja": "推定"],
+        "assumed_warning": ["vi": "một số khóa được suy đoán (chép từ khóa còn lại), không phải đọc được. nếu đầu đọc thật xác thực bằng khóa đó, bản sao có thể bị từ chối.", "en": "some keys are assumed (copied from the other slot), not read. if the real reader authenticates with that key, the clone may be rejected.", "zh": "部分密钥是推测得出的（从另一槽复制），并非读取所得。若真实读卡器用该密钥验证，克隆卡可能被拒。", "ja": "一部の鍵は読み取りではなく推定（もう一方から複製）です。実機がその鍵で認証する場合、複製は拒否される可能性があります。"],
     ]
 }

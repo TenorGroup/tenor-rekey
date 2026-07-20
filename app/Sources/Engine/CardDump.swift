@@ -13,11 +13,18 @@ struct CardDump: Equatable, Sendable {
     var uid: String                 // display form (may carry spaces, as in .keys.json)
     var sak: Int
     var sectorCount: Int
-    var blocks: [Int: String]       // block index -> 32-char hex
+    /// Block index -> 32-char hex. Holds ONLY blocks that were genuinely read: an
+    /// unread block is absent, never a fabricated zero. This is what a clone writes
+    /// from (`blockParams`), so an unread block is skipped, not overwritten with zeros.
+    var blocks: [Int: String]
     var keys: [Int: SectorKey]      // sector -> key
     var name: String                // file stem, or a live-decode label
+    /// Sectors whose OTHER key slot was mirrored from the recovered one (not read):
+    /// sector -> the assumed slot ("A" / "B"). Surfaced so a clone can warn the user.
+    var assumedKeys: [Int: String] = [:]
 
-    /// Build from a live daemon decode.
+    /// Build from a live daemon decode. Only non-null blocks are kept, so an unread
+    /// block stays absent (never a zero the daemon would then clone over real data).
     static func from(_ r: DecodeResult, name: String) -> CardDump {
         var blocks: [Int: String] = [:]
         for (k, v) in r.blocks {
@@ -27,8 +34,12 @@ struct CardDump: Equatable, Sendable {
         for (k, v) in r.keys {
             if let v, v.count == 2, let i = Int(k) { keys[i] = SectorKey(type: v[0], hex: v[1]) }
         }
+        var assumed: [Int: String] = [:]
+        for (k, v) in (r.assumed_keys ?? [:]) {
+            if let i = Int(k) { assumed[i] = v }
+        }
         return CardDump(uid: r.uid, sak: r.sak, sectorCount: r.sectors,
-                        blocks: blocks, keys: keys, name: name)
+                        blocks: blocks, keys: keys, name: name, assumedKeys: assumed)
     }
 
     // ---- serialization (matches x7tool.save_mfd) ---------------------------
@@ -44,14 +55,21 @@ struct CardDump: Equatable, Sendable {
         return buf
     }
 
-    /// Sidecar: {"uid", "sak", "keys": {sector: [kt, key] | null}}.
+    /// Sidecar: {"uid", "sak", "keys": {sector: [kt, key] | null}, "present": [block…]}.
+    /// `present` records which blocks were genuinely read, so reopening the dump can
+    /// tell an unread block from a real zero and never clone a fabricated zero block.
+    /// `assumed` (optional) flags sectors whose OTHER key slot was mirrored, not read.
     func keysJSON() throws -> Data {
         var keysDict: [String: Any] = [:]
         for s in 0..<sectorCount {
             if let k = keys[s] { keysDict[String(s)] = [k.type, k.hex] }
             else { keysDict[String(s)] = NSNull() }
         }
-        let obj: [String: Any] = ["uid": uid, "sak": sak, "keys": keysDict]
+        var obj: [String: Any] = ["uid": uid, "sak": sak, "keys": keysDict,
+                                  "present": blocks.keys.sorted()]
+        if !assumedKeys.isEmpty {
+            obj["assumed"] = assumedKeys.reduce(into: [String: String]()) { $0[String($1.key)] = $1.value }
+        }
         return try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
     }
 
@@ -69,6 +87,12 @@ struct CardDump: Equatable, Sendable {
         var uid = ""
         var sak = data.count > 1024 ? 0x18 : 0x08
         var keys: [Int: SectorKey] = [:]
+        var assumedKeys: [Int: String] = [:]
+        // Which blocks the sidecar says were genuinely read. nil = no presence metadata
+        // (a legacy .mfd or an external nfcPro dump, assumed complete), in which case we
+        // keep every block as before. When present, we keep ONLY those blocks so an
+        // unread block stays absent and a clone never writes a fabricated zero over it.
+        var present: Set<Int>? = nil
         if let sjson = try? Data(contentsOf: sidecar), sjson.count <= 256 * 1024,
            let obj = try? JSONSerialization.jsonObject(with: sjson) as? [String: Any] {
             if let u = obj["uid"] as? String { uid = u }
@@ -85,9 +109,18 @@ struct CardDump: Equatable, Sendable {
                     }
                 }
             }
+            if let pres = obj["present"] as? [Any] {
+                present = Set(pres.compactMap { ($0 as? NSNumber)?.intValue })
+            }
+            if let asd = obj["assumed"] as? [String: Any] {
+                for (k, v) in asd {
+                    if let i = Int(k), let kt = v as? String, kt == "A" || kt == "B" { assumedKeys[i] = kt }
+                }
+            }
         }
         var blocks: [Int: String] = [:]
         for b in 0..<(data.count / 16) {
+            if let present, !present.contains(b) { continue }   // unread: leave absent, do not clone
             blocks[b] = data.subdata(in: b * 16 ..< b * 16 + 16).hexCompact
         }
         // No sidecar (e.g. a Windows nfcPro .dump): recover the uid + keys straight
@@ -108,7 +141,7 @@ struct CardDump: Equatable, Sendable {
         }
         let stem = url.deletingPathExtension().lastPathComponent
         return CardDump(uid: uid, sak: sak, sectorCount: sectorsForSak(sak),
-                        blocks: blocks, keys: keys, name: stem)
+                        blocks: blocks, keys: keys, name: stem, assumedKeys: assumedKeys)
     }
 
     /// Source -> daemon params (string-keyed, the x7d.py write_mfd contract).

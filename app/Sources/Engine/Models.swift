@@ -45,6 +45,15 @@ struct DecodeResult: Codable, Equatable {
     let recovered: Int
     let attempts: Int?                  // auth attempts the scan spent
     let exhausted: Bool?               // true if the scan budget ran out before a full search
+    /// True when the walk stopped on a cooperative cancel rather than finishing; the
+    /// blocks/keys below are then whatever partial image was gathered so far. Optional
+    /// so an older daemon that omits it decodes to nil.
+    let cancelled: Bool?
+    /// Sectors whose OTHER key slot (A or B) was not readable and was mirrored from the
+    /// recovered slot: sector-index string -> the assumed slot ("A" / "B"). The mirrored
+    /// value is a guess, not a read key. Optional (older daemons omit it). JSON key is
+    /// `assumed_keys`, matching the daemon contract (like `walk_total` on EngineEvent).
+    let assumed_keys: [String: String]?
     let blocks: [String: String?]      // block index -> hex, or null if unreadable
     let keys: [String: [String]?]      // sector -> [keytype, keyhex], or null
 }
@@ -116,6 +125,7 @@ struct EngineEvent: Decodable, Sendable {
     let phase: String?        // decode walk phase: "hot" (common/hotel) or "dict"
     let attempts: Int?        // decode: cumulative auth attempts spent in the walk
     let walk_total: Int?      // decode: adaptive remaining-work estimate (shrinks)
+    let unsafe: String?       // write_mfd: why a trailer was refused ("access-bits" / "trailer-lockout")
 }
 
 /// How a sector's key was obtained - drives the provenance dot.
@@ -172,6 +182,9 @@ struct SectorVM: Identifiable, Equatable {
     var status: SectorStatus = .found
     var searchTried: Int? = nil
     var searchTotal: Int? = nil
+    /// The trailer key slot ("A" / "B") that was mirrored from the recovered slot
+    /// rather than read (its real value is a guess). nil when both slots are genuine.
+    var assumedSlot: String? = nil
 
     var id: Int { index }
     var hasKey: Bool { keyHex != nil }

@@ -50,6 +50,12 @@ struct SectorInspector: View {
                         .font(l.sans(9)).foregroundStyle(theme.p.textTertiary)
                     Text(kh).font(Typeface.mono(12))
                         .foregroundStyle(theme.p.accent).textSelection(.enabled)
+                    // The OTHER key slot could not be read and was mirrored from this
+                    // one: flag it as a guess, so a clone that writes trailers is honest.
+                    if let slot = s.assumedSlot {
+                        Text("\(l.t("key")) \(slot.lowercased()) · \(l.t("assumed"))")
+                            .font(l.sans(9)).foregroundStyle(theme.p.textPrimary)
+                    }
                 }
             }
         }

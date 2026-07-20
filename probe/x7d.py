@@ -370,6 +370,35 @@ class Daemon:
             return {"present": True, "formatted": 0, "failed": [],
                     "error": "the card on the reader is not the one shown"}
         keys = {int(s): v for s, v in (p.get("keys") or {}).items()}
+        # Preflight: dry-run auth EVERY sector with the key we will use BEFORE erasing
+        # anything. Without this a mixed-key card (some sectors on FF, some on custom
+        # keys) would erase the FF sectors and then fail the rest - a half-wipe that
+        # loses data irrecoverably. If any sector cannot be authed, abort with a clear
+        # message and write nothing. An all-FF (blank / factory) card passes every
+        # sector, so formatting a card WITHOUT a prior decode still works.
+        for s in range(sector_count(i["sak"])):
+            if self._cancel.is_set():
+                return {"present": True, "formatted": 0, "failed": [], "cancelled": True}
+            tb = trailer_block(s)
+            k = keys.get(s)
+            kk = k[1] if k else "ffffffffffff"
+            kts = [k[0], "A", "B"] if k else ["A", "B"]
+            authed = False
+            for kt in kts:
+                for _ in range(3):
+                    if not c.poll():
+                        continue
+                    if c.uid != target:        # a different card arrived mid-preflight
+                        return {"present": True, "formatted": 0, "failed": [],
+                                "error": "the card on the reader is not the one shown"}
+                    if c.auth(tb, kk, kt):
+                        authed = True
+                        break
+                if authed:
+                    break
+            if not authed:
+                return {"present": True, "formatted": 0, "failed": [],
+                        "error": "this card has custom keys - decode it first to format"}
         zero = bytes(16)
         ok, fail, swapped, cancelled = 0, [], False, False
         for s in range(sector_count(i["sak"])):

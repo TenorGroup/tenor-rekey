@@ -498,6 +498,28 @@ def test_daemon_format():
 
 
 # --------------------------------------------------------------------------
+# 6b. format auth preflight: a mixed-key card must abort BEFORE erasing anything
+# (never half-wipe), while an all-FF card still formats.
+# --------------------------------------------------------------------------
+def test_daemon_format_preflight():
+    # sector 5 carries a custom key; formatting with FF-only keys (no document) cannot
+    # auth it, so the preflight must refuse and write NOTHING (no half-wipe of 0..4).
+    km = {s: ("A", "ffffffffffff") for s in range(16)}
+    km[5] = ("A", "a0b1c2d3e4f5")
+    c = FakeCard(keymap=km)
+    d = daemon_with(c); d.emit = lambda o: None
+    res = d.format({"keys": {}})
+    check("format preflight refuses a mixed-key card", "error" in res and res.get("formatted") == 0)
+    check("format preflight writes nothing on abort", c.writes == [])
+
+    # an all-FF (blank/factory) card still passes the preflight and formats with no doc.
+    c2 = FakeCard(keymap={s: ("A", "ffffffffffff") for s in range(16)})
+    d2 = daemon_with(c2); d2.emit = lambda o: None
+    res2 = d2.format({"keys": {}})
+    check("format preflight passes an all-FF card", res2.get("failed") == [] and c2.writes)
+
+
+# --------------------------------------------------------------------------
 # 7. daemon read_ntag + apdu + no-card guards.
 # --------------------------------------------------------------------------
 def test_daemon_ntag_apdu():
@@ -1079,6 +1101,7 @@ if __name__ == "__main__":
     test_access_bits_valid()
     test_card_kind()
     test_daemon_format()
+    test_daemon_format_preflight()
     test_daemon_ntag_apdu()
     test_read_ntag_wrap()
     test_daemon_dispatch()

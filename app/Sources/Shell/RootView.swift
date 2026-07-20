@@ -30,9 +30,15 @@ struct RootView: View {
                 CloneSheet().environment(model).environment(theme).environment(l10n)
             }
             .confirmationDialog(l10n.t("format_q"), isPresented: $model.formatConfirm, titleVisibility: .visible) {
-                Button(l10n.t("format"), role: .destructive) { Task { await model.format() } }
+                // Pinned to the uid snapshot taken when the dialog opened, so a card
+                // swapped in while it is open is never the one wiped.
+                Button(l10n.t("format"), role: .destructive) {
+                    Task { await model.format(authorizedUID: model.pendingFormatUID) }
+                }
                 Button(l10n.t("cancel"), role: .cancel) {}
-            } message: { Text(l10n.t("format_msg")) }
+            } message: {
+                Text(l10n.t("format_msg") + (model.pendingFormatUID.map { "\n\n\(l10n.t("card_on_reader")): \($0)" } ?? ""))
+            }
             .task { await model.connect(); await model.monitor() }
     }
 }
@@ -169,26 +175,21 @@ private struct ActionBar: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            // Enabled whenever the reader is online, not only once the snappy status
+            // poll has detected a card: the decode does its own patient coupling, so a
+            // seated-but-undetected card is no longer a dead button (see AppModel.decode).
             ActionButton(title: l.t(ntag ? "read" : "decode"), icon: "square.grid.3x3",
-                         prominent: true, enabled: model.card != nil && !busy) { Task { await model.decode() } }
+                         prominent: true, enabled: model.readerOnline && !busy) { Task { await model.decode() } }
             // Write lights up as soon as there is a document to write; it does NOT
             // require a card on the reader (the target is asked for at write time in
             // the sheet), so lifting the source card to place a blank never darkens it.
             ActionButton(title: l.t("write"), icon: "square.and.arrow.down.on.square",
                          enabled: model.cloneSource != nil && !busy) { model.cloneSheet = true }
-            // Format is destructive and auths with the document's keys, so it is only
-            // offered when the card on the reader IS the one this document came from.
+            // Format is destructive but offered for ANY present card (a blank / unknown
+            // card can be wiped with factory keys, no prior decode required); the daemon
+            // keeps the anti-brick guards. Gated only on a card being present + a confirm.
             ActionButton(title: l.t("format"), icon: "eraser",
-                         enabled: model.canFormat && !busy) { model.formatConfirm = true }
-            // Nested / reader key recovery: gated on the device declaring key-recovery
-            // attacks (the capability manifest). A reader with attacks (X7, Chameleon)
-            // shows it; a device with none (e.g. a Chameleon Lite) hides it entirely.
-            // The crypto + collection are ready and the engine method exists, but it is
-            // not yet verified live, so it stays disabled with a "soon" hint until it is.
-            if !model.capabilities.attacks.isEmpty {
-                ActionButton(title: l.t("recover"), icon: "key.radiowaves.forward",
-                             enabled: false, help: l.t("soon")) { }
-            }
+                         enabled: model.card != nil && !busy) { model.requestFormat() }
             Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
             ActionButton(title: l.t("save_dump"), icon: "arrow.down.doc",
                          enabled: model.source != nil) { model.saveDumpDialog() }
@@ -197,7 +198,7 @@ private struct ActionBar: View {
             Spacer()
             if model.decoding {
                 if let p = model.decodeProgress {
-                    Text(decodeStatusLine(p, l))
+                    Text(decodeStatusLine(p, resolved: model.resolvedSectors, elapsed: model.decodeElapsed, l))
                         .font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
                 } else {
                     ProgressView().controlSize(.small)
@@ -405,7 +406,8 @@ private struct PreDecode: View {
                 // walk starts). No determinate bar, so nothing can jump backward.
                 ProgressView().controlSize(.small)
                 if let p = model.decodeProgress {
-                    Text(decodeStatusLine(p, l)).font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
+                    Text(decodeStatusLine(p, resolved: model.resolvedSectors, elapsed: model.decodeElapsed, l))
+                        .font(Typeface.mono(11)).foregroundStyle(theme.p.textSecondary)
                 } else {
                     Text(l.t("decoding")).font(l.sans(12)).foregroundStyle(theme.p.textSecondary)
                 }
@@ -430,13 +432,14 @@ private struct PreDecode: View {
 /// reports honest cumulative auth attempts against the adaptive remaining-work total
 /// (which shrinks as sectors resolve), so it never looks frozen.
 @MainActor
-func decodeStatusLine(_ p: DecodeProgress, _ l: L10n) -> String {
-    // Just the running auth count, no denominator: the total is sectors x dictionary
-    // (tens of thousands) but the walk is time-bounded and gives up long before that,
-    // so a "N/huge" fraction read as if the decode quit at a few percent. The
-    // indeterminate bar already signals that work is ongoing.
+func decodeStatusLine(_ p: DecodeProgress, resolved: Int, elapsed: Int, _ l: L10n) -> String {
+    // The raw auth count has no meaningful denominator (sectors x dictionary is tens of
+    // thousands and the walk gives up long before that, so "N/huge" reads as if it quit
+    // at a few percent). Pair it instead with two honest, bounded, forward-moving
+    // readouts: resolved sectors out of the total, and elapsed seconds. The card's
+    // memory map fills in live too, so the walk never reads as frozen.
     if let a = p.attempts {
-        return "\(l.t("trying_keys")) \(a)"
+        return "\(l.t("trying_keys")) \(a) · \(resolved)/\(p.total) \(l.t("sectors")) · \(elapsed)s"
     }
     return "\(l.t("sector")) \(min(p.sector + 1, p.total))/\(p.total)"
 }
@@ -492,6 +495,16 @@ private struct EmptyState: View {
                 }
                 Text(model.readerOnline ? (model.info?.model.lowercased() ?? l.t("reader_online")) : l.t("reader_offline"))
                     .font(Typeface.mono(10)).foregroundStyle(theme.p.textTertiary)
+            }
+            // A seated card can miss the snappy status poll (see AppModel.decode): give
+            // an explicit "read anyway" that runs the op's own patient coupling, so a
+            // card physically on the reader is never a silent dead-end.
+            if model.readerOnline {
+                Button { Task { await model.decode() } } label: {
+                    Text(l.t("read_anyway")).font(l.sans(11))
+                }
+                .buttonStyle(.plain).foregroundStyle(theme.p.accent)
+                .disabled(model.decoding)
             }
             Spacer()
         }

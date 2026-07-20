@@ -17,6 +17,10 @@ final class AppModel {
     var selectedBlock: Int?             // selected absolute block, for the quick-look
     var decoding = false
     var decodeProgress: DecodeProgress?      // live sector / key-walk progress
+    /// When the running decode started, for an honest elapsed-time readout (the walk
+    /// has a fixed wall-clock budget, so elapsed seconds is bounded, forward-moving
+    /// feedback where the raw auth counter has no meaningful denominator).
+    var decodeStart: Date?
     /// A decode finished but recovered NO key: the card's keys are not in the
     /// dictionary. Shown as an honest "no keys" result instead of a fake empty grid.
     var noKeysFound = false
@@ -36,7 +40,14 @@ final class AppModel {
     /// Per-block write outcome from the last/in-flight clone (block -> ok). Tied to a
     /// specific target card, so it resets when the card on the reader changes.
     var cloneResults: [Int: Bool] = [:]
+    /// Per-block reason a write was refused (block -> daemon reason), so a failed clone
+    /// can be summarised in card terms (sector + cause) instead of raw block numbers.
+    var cloneFailReasons: [Int: String] = [:]
     var formatConfirm = false
+    /// The uid snapshot taken when the format confirmation is PRESENTED, so the write is
+    /// pinned to the card the user actually authorized (the monitor can swap `card`
+    /// while the dialog is open). Shown in the dialog and re-checked before erasing.
+    var pendingFormatUID: String?
     var formatting = false
 
     /// apdu console.
@@ -250,6 +261,7 @@ final class AppModel {
     /// reader. Shared by the swap, removal, and reader-gone paths so they cannot drift.
     private func clearCardBound() {
         cloneResults = [:]
+        cloneFailReasons = [:]
         pages = []
         noKeysFound = false
     }
@@ -259,7 +271,7 @@ final class AppModel {
     func clearDocument() {
         withAnimation(.easeInOut(duration: 0.3)) {
             source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
-            cloneResults = [:]; noKeysFound = false
+            cloneResults = [:]; cloneFailReasons = [:]; noKeysFound = false
         }
     }
 
@@ -277,7 +289,6 @@ final class AppModel {
     }
 
     func decode() async {
-        let startUID = card?.uid
         // Refuse while a swap is tearing the device down, or another device op already
         // owns the reader (deviceBusy includes `decoding`, so this also blocks a
         // double-decode). Serialized, never racing the bridge.
@@ -285,41 +296,77 @@ final class AppModel {
         decoding = true
         decodeCancelled = false
         decodeProgress = nil
+        decodeStart = Date()
         lastError = nil
         cloneResults = [:]
-        // A fresh decode REPLACES the working document, so drop it up front: the
-        // canvas then follows the card being read, and a decode that fails does not
-        // leave the previous image's header sitting over a half-filled grid.
-        withAnimation(.easeInOut(duration: 0.3)) {
-            source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
-            noKeysFound = false
+        cloneFailReasons = [:]
+        // Couple the card under the op's OWN patient retry: the snappy 1.5s status poll
+        // (tries=8) can miss a card that is physically seated but slow to first-contact,
+        // while a full poll finds it. So a decode is not gated on the status poll having
+        // detected the card yet - if `card` is not set, poll now with the full retry.
+        var live = card
+        if live?.present != true {
+            live = try? await activeBridge().poll(tries: 25)
+            if let l = live, l.present {
+                withAnimation(.easeInOut(duration: 0.3)) { card = l }
+            }
         }
+        guard let live, live.present else {
+            // Nothing coupled: surface it instead of silently spinning, and DO NOT drop
+            // the held working document (nothing new was read to replace it with).
+            lastError = "no card on reader"
+            finishDecode()
+            return
+        }
+        let startUID = live.uid
+        // The working DOCUMENT is deliberately NOT dropped up front: a decode that finds
+        // no keys, hits a changed card, or is cancelled must leave the held, unsaved
+        // image intact - only a genuine new result replaces it (see restoreDocument).
+        withAnimation(.easeInOut(duration: 0.3)) { selectedBlock = nil; noKeysFound = false }
         do {
-            if card?.isNTAG == true {
+            if live.isNTAG {
                 // NTAG / Ultralight: a read-only page view, not a writable document.
                 let r = try await activeBridge().readNTAG()
-                let pgs = Self.buildPages(r)
-                withAnimation(.easeInOut(duration: 0.3)) { pages = pgs; source = nil }
+                if r.present == false {
+                    lastError = "no card on reader"
+                    restoreDocument()
+                } else if let s = startUID, let ru = r.uid, Self.normUID(ru) != Self.normUID(s) {
+                    lastError = "card changed during read"
+                    restoreDocument()
+                } else {
+                    let pgs = Self.buildPages(r)
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        pages = pgs; source = nil; sectors = []; selected = nil
+                    }
+                }
             } else {
                 // show the whole grid right away (all pending) so sectors fill in
                 // live as each one is searched, instead of a blank wait.
-                let count = card?.sak.map { sectorsForSak($0) } ?? 16
+                let count = live.sak.map { sectorsForSak($0) } ?? 16
                 withAnimation(.easeInOut(duration: 0.3)) {
-                    sectors = Self.pendingSectors(count: count)
+                    sectors = Self.pendingSectors(count: count); pages = []; selected = nil
                 }
                 let r = try await activeBridge().decode(userKeys: keyStore.keys,
                     onProgress: { [weak self] ev in Task { @MainActor in self?.applyDecodeEvent(ev) } })
-                if let startUID, Self.normUID(r.uid) != Self.normUID(startUID) {
+                if let s = startUID, Self.normUID(r.uid) != Self.normUID(s) {
                     lastError = "card changed during decode"
-                    withAnimation(.easeInOut(duration: 0.3)) { sectors = []; source = nil }
+                    restoreDocument()
                 } else if r.recovered == 0 {
-                    // No key in the dictionary within the scan budget. Never turn an
-                    // all-unread card into a clone-ready document (its blocks would be
-                    // zeros); show an honest "no keys" result pointing at recovery.
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
-                        sectors = []; pages = []; selected = nil; source = nil
-                        noKeysFound = true
+                    // A no-RESULT decode must NEVER drop a held, unsaved document - not
+                    // even when the read card shares its uid (cloned access cards commonly
+                    // do). Keep the image whenever one is held; only when nothing is held
+                    // do we show the honest no-keys result (or a clean slate on a cancel).
+                    if source != nil {
+                        if r.cancelled != true { lastError = "no keys found on the card; the document is unchanged" }
+                        restoreDocument()
+                    } else if r.cancelled == true {
+                        withAnimation(.easeInOut(duration: 0.3)) { sectors = []; pages = []; selected = nil }
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            card = PollResult(present: true, uid: r.uid, atqa: r.atqa, sak: r.sak)
+                            sectors = []; pages = []; selected = nil
+                            noKeysFound = true
+                        }
                     }
                 } else {
                     let vms = Self.buildSectors(r)
@@ -334,26 +381,55 @@ final class AppModel {
                 }
             }
         } catch {
-            // a user cancel kills the daemon, which surfaces as a thrown error - not
-            // something to show as a failure. Either way, do not leave a half-filled
-            // grid or a stale image behind.
+            // A hard-kill cancel (the fallback when cooperative cancel does not land)
+            // surfaces as a thrown error, not a real failure. Either way, restore the
+            // held document rather than leaving a half-filled grid or dropping it.
             if !decodeCancelled { lastError = "\(error)" }
-            withAnimation(.easeInOut(duration: 0.3)) {
-                sectors = []; pages = []; selected = nil; source = nil
-            }
+            restoreDocument()
         }
+        finishDecode()
+    }
+
+    private func finishDecode() {
         decoding = false
         decodeCancelled = false
         decodeProgress = nil
+        decodeStart = nil
     }
 
-    /// Stop a long decode. Kills the daemon (the only way to interrupt a
-    /// synchronous dictionary walk mid-flight); the monitor / next op respawns it.
+    /// Put the canvas back on the held working document (its sector grid), or empty it
+    /// when nothing is held. Used when a decode produced no new result (no card, card
+    /// changed, no keys against a held image, or a cancel) so an unsaved image is never
+    /// left dropped or hidden behind a failed read.
+    private func restoreDocument() {
+        withAnimation(.easeInOut(duration: 0.3)) {
+            if let s = source {
+                sectors = Self.buildSectors(fromDump: s)
+                pages = []
+                selected = sectors.first(where: { $0.hasKey })?.index ?? sectors.first?.index
+            } else {
+                sectors = []; pages = []; selected = nil
+            }
+        }
+    }
+
+    /// Stop a long decode cooperatively: the daemon trips its cancel flag and returns
+    /// the partial image it has gathered (which decode() then shows or discards), so we
+    /// no longer kill the daemon on every cancel. A hard-kill fallback inside the bridge
+    /// covers a wedged daemon that does not honour the cancel in time.
     func cancelDecode() async {
         guard decoding else { return }
         decodeCancelled = true
         await activeBridge().cancel()
     }
+
+    /// Resolved-sector count (sectors whose key was found), an honest, monotonic
+    /// secondary progress readout alongside the raw auth counter.
+    var resolvedSectors: Int { sectors.filter { $0.status == .found }.count }
+
+    /// Whole seconds elapsed in the running decode: bounded, forward-moving feedback
+    /// where the auth counter has no meaningful denominator. 0 when not decoding.
+    var decodeElapsed: Int { decodeStart.map { max(0, Int(Date().timeIntervalSince($0))) } ?? 0 }
 
     /// Fold a decode progress event into `decodeProgress`. The daemon emits a
     /// sector-boundary event (carries `total` = sector count) and a dictionary-walk
@@ -414,7 +490,8 @@ final class AppModel {
                 : (kh == "ffffffffffff" ? .dictionary : .nonDefault)
             let blocks = blockNumbers(ofSector: s).map { b in (r.blocks[String(b)] ?? nil) ?? "?" }
             return SectorVM(index: s, keyType: kt, keyHex: kh, provenance: prov, blocks: blocks,
-                            status: kh == nil ? .failed : .found)
+                            status: kh == nil ? .failed : .found,
+                            assumedSlot: r.assumed_keys?[String(s)])
         }
     }
 
@@ -430,7 +507,8 @@ final class AppModel {
                 : (kh == "ffffffffffff" ? .dictionary : .nonDefault)
             let blocks = blockNumbers(ofSector: s).map { b in d.blocks[b].map(spacedHex) ?? "?" }
             return SectorVM(index: s, keyType: k?.type, keyHex: kh, provenance: prov, blocks: blocks,
-                            status: kh == nil ? .failed : .found)
+                            status: kh == nil ? .failed : .found,
+                            assumedSlot: d.assumedKeys[s])
         }
     }
 
@@ -487,36 +565,48 @@ final class AppModel {
 
     /// Write the explicit source dump onto the card on the reader. Data blocks
     /// only by default; trailers (keys/access) and block 0 (uid) are opt-in.
-    func clone(trailers: Bool, uid: Bool) async {
+    ///
+    /// `authorizedUID` is the uid the user saw and authorized when they pressed write /
+    /// accepted the confirm. The card can be swapped by the live monitor while a confirm
+    /// dialog is open, so we execute ONLY if the card on the reader still equals that
+    /// authorization - never write to a card whose uid differs from the one shown.
+    func clone(trailers: Bool, uid: Bool, authorizedUID: String?) async {
         // Never clone while a swap is in flight or another device op owns the reader.
         guard !swapping, !deviceBusy else { return }
         guard let src = cloneSource else {
             lastError = "no clone source"
             return
         }
+        // The authorization is bound to a specific card: if the card went absent or a
+        // different one was seated (e.g. while the confirm dialog was open), the write
+        // is not authorized for whatever is on the reader now. Abort rather than wipe it.
+        guard let auth = authorizedUID, let target = card?.uid,
+              Self.normUID(target) == Self.normUID(auth) else {
+            lastError = "card changed, not written"
+            return
+        }
         cloning = true
         cloneResults = [:]
+        cloneFailReasons = [:]
         lastError = nil
-        // Pin the write to the card the sheet just showed the user; the daemon refuses
-        // if a different card slid onto the reader before it acquired one.
-        let target = card?.uid
         do {
             let r = try await activeBridge().writeMFD(
                 blocks: src.blockParams, keys: src.keyParams, trailers: trailers, uid: uid,
                 targetUID: target,
-                onBlock: { [weak self] b, ok in
+                onBlock: { [weak self] b, ok, reason in
                     Task { @MainActor in
                         withAnimation(.easeOut(duration: 0.16)) { self?.cloneResults[b] = ok }
+                        if let reason { self?.cloneFailReasons[b] = reason }
                     }
                 })
             // Per-block glyphs in the grid/inspector are the primary failure surface;
-            // lastError is the summary shown in the status banner.
+            // lastError is the summary shown in the status banner, phrased in card terms.
             if r.present == false {
                 lastError = "no card on reader"
             } else if let e = r.error {
                 lastError = e
             } else if let failed = r.failed, !failed.isEmpty {
-                lastError = "\(failed.count) block(s) failed to write: \(failed)"
+                lastError = Self.cloneFailureSummary(failed, reasons: cloneFailReasons)
             }
         } catch {
             lastError = "\(error)"
@@ -524,19 +614,38 @@ final class AppModel {
         cloning = false
     }
 
-    /// Factory-reset the card on the reader (zero data + factory trailer). Auths with
-    /// the document's recovered keys; `canFormat` guarantees that document is this very
-    /// card. Destructive, so the UI gates it behind a confirm. On success the document
-    /// is dropped - the card is blank now, and its old image should not linger.
-    func format() async {
+    /// Snapshot the current card uid and open the format confirmation. The snapshot is
+    /// what the dialog shows and what the erase is pinned to, so a card swapped in while
+    /// the dialog is open is never the one wiped.
+    func requestFormat() {
+        pendingFormatUID = card?.uid
+        formatConfirm = true
+    }
+
+    /// Factory-reset the card on the reader (zero data + factory trailer). Offered for
+    /// ANY present card, not only the one just decoded: auth uses the document's
+    /// recovered keys when the document IS this card, otherwise a factory-key (FF) wipe,
+    /// which is what a blank or freshly-issued card needs. Destructive, so the UI gates
+    /// it behind a confirm. The anti-brick guards (trailer written last, per-card uid
+    /// pin) stay in the daemon; a card whose keys are unknown simply fails, never bricks.
+    func format(authorizedUID: String?) async {
         // Never format while a swap is in flight or another device op owns the reader.
-        guard canFormat, !swapping, !deviceBusy else { return }
+        guard !swapping, !deviceBusy else { return }
+        // Bound to the card the user authorized in the confirm dialog: if it was swapped
+        // or lifted while the dialog was open, do not erase whatever is on the reader now.
+        guard let auth = authorizedUID, let target = card?.uid,
+              Self.normUID(target) == Self.normUID(auth) else {
+            lastError = "card changed, not written"
+            return
+        }
         formatting = true
         cloneResults = [:]
         lastError = nil
-        let target = card?.uid
+        // Only the document's keys help when it IS this card; an unrelated / absent
+        // document contributes nothing, so fall back to a factory-key wipe attempt.
+        let keys = canFormat ? (source?.keyParams ?? [:]) : [:]
         do {
-            let r = try await activeBridge().formatCard(keys: source?.keyParams ?? [:], targetUID: target)
+            let r = try await activeBridge().formatCard(keys: keys, targetUID: target)
             if r.present == false {
                 lastError = "no card on reader"
             } else if let e = r.error {
@@ -544,13 +653,11 @@ final class AppModel {
             } else if let failed = r.failed, !failed.isEmpty {
                 // A partial or fully failed format did NOT blank the card, so keep the
                 // document: it may still be the only copy of the image.
-                lastError = "\(failed.count) block(s) could not be formatted: \(failed)"
-            } else {
-                // Clean format: the card is factory now, so drop its stale image.
-                withAnimation(.easeInOut(duration: 0.3)) {
-                    source = nil; sectors = []; pages = []; selected = nil; selectedBlock = nil
-                }
+                lastError = Self.formatFailureSummary(failed)
             }
+            // On a clean format the document is kept (not dropped): its uid is unchanged
+            // (block 0 is left intact), so it stays available to erase/re-issue the next
+            // identical card without decoding each one again.
         } catch {
             lastError = "\(error)"
         }
@@ -562,6 +669,29 @@ final class AppModel {
         let results = blockNumbers(ofSector: s).compactMap { cloneResults[$0] }
         if results.isEmpty { return .none }
         return results.contains(false) ? .failed : .ok
+    }
+
+    /// Which sector an absolute block belongs to (4K big-sector layout aware).
+    static func sectorOf(_ block: Int) -> Int { block < 128 ? block / 4 : 32 + (block - 128) / 16 }
+
+    /// A clone failure summary in card terms: name the sector and, for a refused
+    /// trailer, WHY (the daemon already computed it), instead of raw block indices.
+    static func cloneFailureSummary(_ failed: [Int], reasons: [Int: String]) -> String {
+        let parts: [String] = failed.sorted().map { b in
+            let s = sectorOf(b)
+            switch reasons[b] {
+            case "access-bits":    return "sector \(s) trailer refused: unsafe access bits"
+            case "trailer-lockout": return "sector \(s) trailer refused: would lock its own keys"
+            default:               return "sector \(s) block \(b)"
+            }
+        }
+        return "write failed - " + parts.joined(separator: "; ")
+    }
+
+    /// A format failure summary in card terms (which sectors could not be wiped).
+    static func formatFailureSummary(_ failed: [Int]) -> String {
+        let sectors = Set(failed.map { sectorOf($0) }).sorted().map(String.init).joined(separator: ", ")
+        return "format failed - sector(s) \(sectors) could not be wiped"
     }
 
     // ---- apdu --------------------------------------------------------------
@@ -635,7 +765,7 @@ final class AppModel {
                 pages = []
                 selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
                 selectedBlock = nil
-                cloneResults = [:]
+                cloneResults = [:]; cloneFailReasons = [:]
             }
             NSDocumentController.shared.noteNewRecentDocumentURL(url)
             lastError = nil

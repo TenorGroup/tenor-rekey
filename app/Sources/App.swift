@@ -28,7 +28,7 @@ struct TenorRekeyApp: App {
             CommandMenu(l10n.t("card")) {
                 Button(l10n.t("decode")) { Task { await model.decode() } }
                     .keyboardShortcut("r")
-                    .disabled(model.card == nil || model.decoding)
+                    .disabled(!model.readerOnline || model.decoding)
                 Button(l10n.t("clone")) { model.cloneSheet = true }
                     .disabled(model.cloneSource == nil || model.cloning || model.decoding || model.formatting)
                 Divider()
