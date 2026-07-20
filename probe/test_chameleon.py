@@ -20,6 +20,7 @@ import os
 import io
 import sys
 import json
+import struct
 import zipfile
 import hashlib
 import tempfile
@@ -53,7 +54,7 @@ class FakeChameleon:
                  uid=b"\xaa\xbb\xcc\xdd", atqa=b"\x04\x00", sak=b"\x08", ats=b"",
                  present=True, keymap=None, blockdata=None,
                  slot_info=None, enabled=None, nicks=None, active=0,
-                 reader_mode=False, prng=None):
+                 reader_mode=False, prng=None, hard_body=None):
         self.model, self.app, self.git, self.chip = model, app, git, chip
         self.uid, self.atqa, self.sak, self.ats = uid, atqa, sak, ats
         self.present = present
@@ -61,6 +62,10 @@ class FakeChameleon:
         # daemon's attack stage skips cleanly, as on a card with no detectable
         # vulnerability). Set 0/1/2 (STATIC/WEAK/HARD) to enable the acquire methods.
         self.prng = prng
+        # Raw encrypted-nonce blob mf1_hard_nested_acquire hands back (pm3 pair layout:
+        # per 9 bytes nt_enc1 BE, nt_enc2 BE, packed-par). The injected fake cracker turns
+        # it into a key here; the real cracker is proven separately in chameleon_crack.
+        self.hard_body = b"" if hard_body is None else hard_body
         self.acquired = []                # names of acquire/detect calls, in order
         # default: an all-FF MIFARE Classic 1K (both keys FF on every sector)
         self.keymap = keymap if keymap is not None else {
@@ -205,6 +210,15 @@ class FakeChameleon:
         return (MifareClassicDarksideStatus.OK,
                 {"uid": self._uid_int(), "nt1": 1, "par": 0, "ks1": 0, "nr": 2, "ar": 3})
 
+    def mf1_hard_nested_acquire(self, slow, block_known, type_known, key_known,
+                                block_target, type_target):
+        self._require_reader()
+        self.acquired.append("hard_nested_acquire")
+        # record the anchor args so a test can prove the KNOWN key drives the acquire
+        self.hard_args = (bool(slow), block_known, int(type_known), key_known.hex(),
+                          block_target, int(type_target))
+        return self.hard_body
+
     def mf1_auth_one_key_block(self, block, type_value, key):
         self._require_reader()
         kt = "A" if int(type_value) == 0x60 else "B"
@@ -292,6 +306,49 @@ class FakeCrack:
         return [self.key], True
 
 
+class FakeHardCrack:
+    """Stand-in cracker with the hardnested surface: advertises the built binary via
+    available() and returns a canned candidate from the acquired nonce blob, so the
+    hardnested decode chain (available -> acquire -> crack -> verify -> feed back) is
+    testable without the real C binary. `has` gates which binaries available() reports
+    (so a test can flip hardnested off). Its darkside reports no foothold, so a no-dict
+    hard card has no anchor key. The real crackers are proven by chameleon_crack."""
+    def __init__(self, key, has=("hardnested",)):
+        self.key = key
+        self.has = set(has)
+        self.calls = []
+        self.bodies = []              # each raw nonce body passed to hardnested()
+        self.uids = []                # each uid passed to hardnested()
+        self.timeouts = []            # each budget-derived timeout passed to hardnested()
+
+    def available(self, name):
+        return name in self.has
+
+    def hardnested(self, uid, sector, key_type, body, timeout=None):
+        self.calls.append("hardnested")
+        self.uids.append(uid)
+        self.bodies.append(bytes(body))
+        self.timeouts.append(timeout)
+        return [self.key], True
+
+    def darkside(self, uid, items):
+        self.calls.append("darkside")
+        return [], False              # no zero-key foothold: leaves a hard card anchorless
+
+
+def _hard_nonce_body(pairs=256):
+    """A firmware-shaped hardnested blob: `pairs` 9-byte records (nt_enc1 BE, nt_enc2 BE,
+    packed-par). The nt_enc2 MSB (byte 4 of each record) walks 0..pairs-1, so 256 pairs
+    give the full 256-value MSB distribution and the daemon's acquire loop stops in one
+    run. The bytes are opaque to the FAKE cracker (it returns the planted key regardless);
+    the real crack is proven in chameleon_crack's forward-sim."""
+    body = bytearray()
+    for i in range(pairs):
+        body += struct.pack(">II", 0x01020304, ((i & 0xFF) << 24) | 0x00abcd)
+        body.append(0x00)
+    return bytes(body)
+
+
 class SwapFake(FakeChameleon):
     """A card that is swapped mid-decode: after `swap_after` scans it reports a
     different uid, so the daemon's card-identity guard must abort."""
@@ -320,8 +377,11 @@ class MidWriteSwapFake(FakeChameleon):
         return ok
 
 
-def cham_daemon(fake, learned=None):
-    d = chameleon_d.Daemon(learned=learned)
+def cham_daemon(fake, learned=None, cracker=None):
+    # cracker defaults to None so the capability manifest + attack stage are DETERMINISTIC
+    # regardless of which real cracker binaries happen to be built on the test machine;
+    # attack tests inject an explicit fake cracker (here or via d.crack).
+    d = chameleon_d.Daemon(learned=learned, cracker=cracker)
     d.cmd = fake
     d.com = object()
     d._connect = lambda port=None: fake
@@ -745,6 +805,106 @@ def test_cham_attack_budget_guard(check):
     check("an already-expired budget stops the attack stage before any acquire",
           cancelled is True and fake.acquired == [] and sk == {},
           str((cancelled, fake.acquired)))
+
+
+# --------------------------------------------------------------------------
+# 18a. decode hardnested chain: 1 dict key + hard PRNG -> hardnested opens the rest.
+#      Drives the wired chain end to end against the FAKE cracker (available -> acquire
+#      -> crack -> verify -> feed back); the REAL crack is proven in chameleon_crack.
+# --------------------------------------------------------------------------
+def test_cham_decode_hardnested_chain(check):
+    K = "0f1e2d3c4b5a"                    # not in the shipped dictionary
+    km = {(s, kt): K for s in range(16) for kt in ("A", "B")}
+    km[(0, "A")] = FF                     # sector 0 opens on the dict; 1..15 need hardnested
+    km[(0, "B")] = FF
+    learned, path = _fresh_learned()
+    fake = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd", keymap=km,
+                         prng=MifareClassicPrngType.HARD, hard_body=_hard_nonce_body(256))
+    crack = FakeHardCrack(K)
+    d = cham_daemon(fake, learned=learned, cracker=crack)
+    events = []
+    d.emit = lambda o: events.append(o)
+    r = d.decode({})
+    check("hardnested-chain: one dict key + hard PRNG recovers all 16 sectors",
+          r["recovered"] == 16, str(r["recovered"]))
+    check("hardnested-chain: routes through the hardnested acquire path (not nested/darkside)",
+          "hard_nested_acquire" in fake.acquired
+          and "nested_acquire" not in fake.acquired
+          and "darkside_acquire" not in fake.acquired, str(fake.acquired))
+    check("hardnested-chain: the known dict key anchors the on-device acquire (block 3 KeyA FF, target block 7)",
+          fake.hard_args[3] == FF and fake.hard_args[1] == 3 and fake.hard_args[4] == 7,
+          str(getattr(fake, "hard_args", None)))
+    check("hardnested-chain: 256 unique MSBs stop acquisition in a single run",
+          fake.acquired.count("hard_nested_acquire") == 1, str(fake.acquired))
+    check("hardnested-chain: the acquired nonce blob + card uid flow to the host cracker",
+          crack.calls == ["hardnested"] and crack.uids == [0xaabbccdd]
+          and crack.bodies == [fake.hard_body], str((crack.calls, crack.uids)))
+    check("hardnested-chain: the crack subprocess is bounded by the remaining budget",
+          isinstance(crack.timeouts[0], int) and crack.timeouts[0] > 0, str(crack.timeouts))
+    check("hardnested-chain: the cracked key is verified on-card (resolves as the working KeyA)",
+          r["keys"]["1"] == ["A", K], str(r["keys"].get("1")))
+    check("hardnested-chain: the verified key is fed back and opens every remaining sector",
+          all(r["keys"][str(s)] == ["A", K] for s in range(1, 16)) and r["exhausted"] is False,
+          str(r["keys"].get("9")))
+    attempt = [e for e in events if e.get("stage") == "hardnested" and "known_block" in e]
+    check("hardnested-chain: emits a hardnested progress event for the attempt (not 'unsupported')",
+          len(attempt) == 1 and attempt[0]["known_block"] == 3
+          and not any(e.get("stage") == "hardnested" and e.get("supported") is False for e in events),
+          str(attempt))
+    os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# 18b. decode hardnested with NO known key: hardnested cannot start (needs an anchor),
+#      so it reports unresolved and never crashes (darkside found no foothold).
+# --------------------------------------------------------------------------
+def test_cham_decode_hardnested_no_anchor(check):
+    K = "0f1e2d3c4b5a"
+    km = {(s, kt): K for s in range(16) for kt in ("A", "B")}   # nothing in the dict
+    learned, path = _fresh_learned()
+    fake = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd", keymap=km,
+                         prng=MifareClassicPrngType.HARD, hard_body=_hard_nonce_body(256))
+    crack = FakeHardCrack(K)              # darkside finds no foothold -> no anchor key
+    d = cham_daemon(fake, learned=learned, cracker=crack)
+    events = []
+    d.emit = lambda o: events.append(o)
+    r = d.decode({})
+    check("hardnested-no-anchor: a hard card with no known key recovers nothing (no crash)",
+          r["recovered"] == 0 and r["exhausted"] is True, str((r["recovered"], r["exhausted"])))
+    check("hardnested-no-anchor: darkside was tried for a foothold but hardnested never started",
+          "darkside_acquire" in fake.acquired
+          and "hard_nested_acquire" not in fake.acquired
+          and "hardnested" not in crack.calls, str((fake.acquired[:1], crack.calls)))
+    check("hardnested-no-anchor: reports the hardnested stage as unsupported (unresolved)",
+          any(e.get("stage") == "hardnested" and e.get("supported") is False for e in events),
+          "no unsupported-hardnested progress event")
+    os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# 18c. capability manifest: hardnested is advertised iff the cracker binary is available.
+# --------------------------------------------------------------------------
+def test_cham_capability_hardnested(check):
+    BASE = ["dict", "nested", "staticNested", "darkside"]
+    avail = FakeHardCrack("a1b2c3d4e5f6")             # available("hardnested") -> True
+    caps = cham_daemon(FakeChameleon(model=0), cracker=avail).info({})["capabilities"]
+    check("capabilities advertises hardnested when the cracker binary is available",
+          caps["attacks"] == BASE + ["hardnested"], str(caps["attacks"]))
+
+    unavail = FakeHardCrack("a1b2c3d4e5f6", has=())   # available("hardnested") -> False
+    caps2 = cham_daemon(FakeChameleon(model=0), cracker=unavail).info({})["capabilities"]
+    check("capabilities omits hardnested when the cracker binary is not built",
+          caps2["attacks"] == BASE, str(caps2["attacks"]))
+
+    # no cracker at all (host tools absent) -> the base attack surface, no hardnested
+    caps3 = cham_daemon(FakeChameleon(model=0), cracker=None).info({})["capabilities"]
+    check("capabilities falls back to the base attacks when no cracker is present",
+          caps3["attacks"] == BASE, str(caps3["attacks"]))
+
+    # Lite has no reader front-end: no attacks even when hardnested is available
+    capsL = cham_daemon(FakeChameleon(model=1), cracker=avail).info({})["capabilities"]
+    check("a Lite advertises no attacks even when the hardnested binary is available",
+          capsL["attacks"] == [], str(capsL["attacks"]))
 
 
 def _dump_1k():
@@ -1967,6 +2127,8 @@ TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_decode_nested_chain, test_cham_decode_darkside_chain,
          test_cham_decode_static_chain, test_cham_decode_hard_prng,
          test_cham_decode_cancel, test_cham_attack_budget_guard,
+         test_cham_decode_hardnested_chain, test_cham_decode_hardnested_no_anchor,
+         test_cham_capability_hardnested,
          test_cham_slot_config, test_cham_emulate_mode, test_cham_emulate_load,
          test_cham_emu_read, test_cham_magic_write, test_cham_magic_write_guards,
          test_cham_magic_write_midswap, test_cham_magic_write_trailer_keys,

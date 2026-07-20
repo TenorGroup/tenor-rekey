@@ -116,6 +116,14 @@ DARKSIDE_MAX_ROUNDS = 24
 DARKSIDE_SYNC_MAX = 30                    # firmware sync attempts per round (CLI default)
 DARKSIDE_TARGET_BLOCK = 3                # sector 0 trailer, KeyA - the autopwn foothold
 
+# Hardnested (hard-PRNG / MFC Ev1) collects encrypted nonces on-device until the full
+# 256-value nt_enc first-byte (MSB) distribution is seen - the coverage the host cracker
+# needs. Each acquire is slow, so the loop is bounded by this run cap AND the wall-clock
+# budget + cooperative cancel (mirrors the CLI's max_runs, but the budget is the real
+# guard). The crack subprocess is itself capped by the remaining budget.
+HARDNESTED_MAX_RUNS = 200                 # CLI default max_runs
+HARDNESTED_MSB_TARGET = 256               # unique nt_enc MSBs = a complete distribution
+
 # Public, well-known MIFARE Classic default keys (documented defaults, never card
 # secrets - safe in a public repo). The named set comes first so a factory card
 # resolves in the first check-keys chunk; probe's curated dictionary (loaded by
@@ -199,20 +207,27 @@ def _sense(s):
     return TagSenseType.LF if str(s).lower() == "lf" else TagSenseType.HF
 
 
-def _capabilities(model):
+def _capabilities(model, cracker=None):
     """The capability manifest the shell reads to gate panels (SPEC 2.3). Built
     from the device model, not hardcoded: model 0 = Ultra, 1 = Lite. The Lite has
     the same 8 slots + emulation + DFU but no HF reader, so reader-mode attacks do
     not apply (P0 default; confirm the Lite on hardware)."""
+    # hardnested (hard-PRNG / MFC Ev1) IS wired into decode() now, but it can only run
+    # when its host cracker binary is actually built. Advertise it DYNAMICALLY - appended
+    # to the base attacks only when the cracker reports it present - so the shell never
+    # lights up an attack the daemon cannot deliver (mirrors the graceful degrade of the
+    # other crackers). lf + sniff stay FALSE until this daemon exposes an LF method / a
+    # sniffer: advertising them would light up shell panels that do nothing.
+    attacks = ["dict", "nested", "staticNested", "darkside"]
+    if cracker is not None:
+        try:
+            if cracker.available("hardnested"):
+                attacks.append("hardnested")
+        except Exception:                # a cracker with no available() probe: omit it
+            pass
     caps = {
-        # lf + sniff are FALSE until the daemon actually implements them: the device
-        # has the LF hardware and can sniff, but this daemon exposes no LF method and
-        # no sniffer yet, so advertising them would light up shell panels that do
-        # nothing. hardnested is omitted for the same reason - the device supports it
-        # but the host cracker is not wired into decode() yet. Advertise only what the
-        # daemon can deliver; flip each on when it is built.
         "slots": 8, "emulate": True, "lf": False, "dfu": True, "sniff": False,
-        "attacks": ["dict", "nested", "staticNested", "darkside"],
+        "attacks": attacks,
         "writeModes": ["normal", "denied", "deceive", "shadow", "shadowReq"],
     }
     if model != 0:                       # Lite: no reader front-end -> no attacks
@@ -456,7 +471,7 @@ class Daemon:
         name = "Chameleon Ultra" if model == 0 else "Chameleon Lite"
         return {"family": family, "model": name, "serial": chip,
                 "hw": "app %d.%d (%s)" % (major, minor, git),
-                "capabilities": _capabilities(model)}
+                "capabilities": _capabilities(model, self.crack)}
 
     def poll(self, p):
         # `reader` reports whether the Chameleon is connected (vs `present`, a card
@@ -1422,7 +1437,7 @@ class Daemon:
         cancelled = False
         if self.crack is not None and any(s not in sk for s in range(n)):
             attempts, cancelled = self._recover_attacks(
-                c, n, sk, pool, key_bytes, deadline, attempts)
+                c, n, sk, pool, key_bytes, deadline, attempts, target)
 
         blocks, keys_out, recovered = {}, {}, 0
         for s in range(n):
@@ -1487,12 +1502,34 @@ class Daemon:
 
     def _pick_known(self, sk):
         """A (block, keytype, keyhex) already proven on this card, for use as the
-        nested/static-nested KNOWN sector. None if no key is known yet."""
+        nested/static-nested/hardnested KNOWN sector. None if no key is known yet."""
         for s in sorted(sk):
             for kt in ("A", "B"):
                 if kt in sk[s]:
                     return trailer_block(s), kt, sk[s][kt]
         return None
+
+    @staticmethod
+    def _uid4(uid):
+        """The 4-byte uid the pm3 hardnested nonce-file header wants (packed later as a
+        big-endian u32). A 4-byte uid is used as-is; the last 4 bytes of a 7- or 10-byte
+        uid are taken (mirrors the CLI's uid_for_file). An unexpected length raises."""
+        if len(uid) == 4:
+            return bytes(uid)
+        if len(uid) == 7:
+            return bytes(uid[3:7])
+        if len(uid) == 10:
+            return bytes(uid[6:10])
+        raise ValueError("unexpected uid length %d" % len(uid))
+
+    def _crack_available(self, name):
+        """True only when the injected cracker reports the named built binary present, so
+        decode attempts (and advertises) an attack strictly when it can actually run it -
+        else it degrades gracefully rather than failing mid-attack."""
+        try:
+            return self.crack is not None and bool(self.crack.available(name))
+        except Exception:
+            return False
 
     def _verify_candidates(self, c, block, cands, keytypes=("A", "B")):
         """Return the first candidate that authenticates on `block` (crackers emit
@@ -1548,6 +1585,49 @@ class Daemon:
         code = 0x60 if ttype == "A" else 0x61
         return self.crack.staticnested(sn["uid"], code, sn["nts"])
 
+    def _hardnested_recover(self, c, known, target_blk, ttype, uid_int, deadline):
+        """Hard-PRNG (MFC Ev1) hardnested: with a known key anchoring the reader-side
+        auth, acquire the encrypted-nonce blob on-device and crack it host-side. The
+        firmware returns the nonce body ALREADY in the pm3 pair layout (per 9 bytes:
+        nt_enc1 BE, nt_enc2 BE, packed-parity), so the raw bytes stream straight to the
+        cracker (hardnested() prepends the pm3 header via assemble_nonce_bin). Keep
+        acquiring until the full 256-value nt_enc MSB distribution is collected (what the
+        crack needs), bounded by the run cap, the wall-clock deadline and the cooperative
+        cancel; the crack subprocess is itself capped by the remaining budget. Returns
+        candidate keys (verified by the caller); [] if nothing usable was collected."""
+        blk, kt, keyhex = known
+        mkt_known = MfcKeyType.A if kt == "A" else MfcKeyType.B
+        mkt_target = MfcKeyType.A if ttype == "A" else MfcKeyType.B
+        kb = bytes.fromhex(keyhex)
+        body = bytearray()
+        seen = set()
+        for _ in range(HARDNESTED_MAX_RUNS):
+            if self._cancel.is_set() or time.monotonic() > deadline:
+                break
+            chunk = c.mf1_hard_nested_acquire(False, blk, mkt_known, kb, target_blk, mkt_target)
+            if not chunk:
+                continue
+            chunk = bytes(chunk)
+            body += chunk
+            # Each 9-byte record is (nt_enc1 BE, nt_enc2 BE, packed-par); the nt_enc2 MSB
+            # is byte 4. Track unique MSBs so a complete distribution stops acquisition.
+            for off in range(0, len(chunk) - 8, 9):
+                seen.add(chunk[off + 4])
+            if len(seen) >= HARDNESTED_MSB_TARGET:
+                break
+        if not body:
+            return []
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return []                    # budget spent on acquisition; do not start a slow crack
+        ktype = 1 if ttype == "B" else 0    # pm3 header key_type: 0 = KeyA, 1 = KeyB
+        try:
+            cands, _found = self.crack.hardnested(uid_int, target_blk, ktype, bytes(body),
+                                                  timeout=max(1, int(remaining)))
+        except subprocess.TimeoutExpired:
+            return []                    # crack outran the budget: treat as a miss
+        return cands
+
     def _darkside_recover(self, c, deadline):
         """Zero-known-key foothold: acquire darkside leaks on the sector-0 KeyA and
         crack until a candidate authenticates or the budget/rounds run out. Returns
@@ -1573,12 +1653,14 @@ class Daemon:
                 return key, kt
         return None, None
 
-    def _recover_attacks(self, c, n, sk, pool, key_bytes, deadline, attempts):
+    def _recover_attacks(self, c, n, sk, pool, key_bytes, deadline, attempts, uid=None):
         """Drive the attack chain over the sectors the dictionary left unopened.
         Returns (attempts, cancelled). A sector is 'open' once we hold any key for
         it (A or B), which is all decode needs to read + dump it. A mid-attack card
         swap is caught by the per-sector uid guard in the block-read stage (which
-        aborts before any key is learned), so this stage needs no separate guard."""
+        aborts before any key is learned), so this stage needs no separate guard.
+        `uid` (the scanned card uid bytes) is only needed to anchor the hardnested
+        nonce-file header; None disables hardnested."""
         cancelled = False
         # PRNG class decides which nested variant applies; if the device has no
         # reader-mode attacks (Lite) this raises and we skip the whole stage.
@@ -1586,6 +1668,14 @@ class Daemon:
             prng = int(c.mf1_detect_prng())
         except (UnexpectedResponseError,) + _DEAD:
             return attempts, cancelled
+
+        # The pm3 hardnested nonce-file header wants the card uid as a big-endian u32.
+        uid_int = None
+        if uid is not None:
+            try:
+                uid_int = int.from_bytes(self._uid4(uid), "big")
+            except Exception:
+                uid_int = None
 
         def unresolved():
             return [s for s in range(n) if s not in sk]
@@ -1608,11 +1698,25 @@ class Daemon:
             known = self._pick_known(sk)
             target_blk = trailer_block(s)
             if prng == MifareClassicPrngType.HARD:
-                # Hard-PRNG needs the hardnested cracker (not built in P1); report it
-                # and stop - no light attack can open these sectors.
-                self.emit({"event": "progress", "method": "decode",
-                           "stage": "hardnested", "sector": s, "supported": False})
-                break
+                # Hard-PRNG (MFC Ev1): the light attacks cannot open these sectors. The
+                # host hardnested cracker can, but only with (a) its binary built and
+                # (b) a key already known on the card to anchor the reader-side auth. If
+                # either is missing, report it and stop - no light attack can substitute.
+                if uid_int is None or known is None or not self._crack_available("hardnested"):
+                    self.emit({"event": "progress", "method": "decode",
+                               "stage": "hardnested", "sector": s, "supported": False})
+                    break
+                self.emit({"event": "progress", "method": "decode", "stage": "hardnested",
+                           "sector": s, "known_block": known[0]})
+                try:
+                    cands = self._hardnested_recover(c, known, target_blk, "A",
+                                                     uid_int, deadline)
+                except UnexpectedResponseError:
+                    cands = []                   # acquisition faulted: treat as a miss
+                key, _kt = self._verify_candidates(c, target_blk, cands, ("A", "B"))
+                if key:
+                    attempts += self._absorb_key(c, n, sk, pool, key_bytes, key)
+                continue                         # next unresolved sector (budget-bounded)
             if known is None:
                 break                            # darkside failed; nothing to nest from
             stage = "nested" if prng == MifareClassicPrngType.WEAK else "staticNested"
