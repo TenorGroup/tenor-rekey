@@ -28,7 +28,7 @@ os.environ.setdefault("X7_LEARNED_PATH",
 
 import chameleon_d
 from chameleon.chameleon_com import ChameleonCom
-from chameleon.chameleon_enum import (Status, SlotNumber, TagSpecificType, MfcKeyType,
+from chameleon.chameleon_enum import (Status, SlotNumber, TagSpecificType, TagSenseType, MfcKeyType,
                                       MifareClassicPrngType, MifareClassicDarksideStatus)
 from chameleon.chameleon_utils import UnexpectedResponseError
 from learned_keys import LearnedKeyCache
@@ -69,6 +69,17 @@ class FakeChameleon:
         self.reader_mode = reader_mode    # starts in TAG mode (the risky default)
         self.mode_sets = []               # every set_device_reader_mode arg
         self.reads = []                   # (block, keytype, keyhex) in order
+        # ---- slot config / emulator / magic surface (P3) ----
+        self.type_sets = []               # (slot0, TagSpecificType) from set_slot_tag_type
+        self.default_sets = []            # (slot0, TagSpecificType) from set_slot_data_default
+        self.enable_sets = []             # (slot0, TagSenseType, bool) from set_slot_enable
+        self.nick_store = {}              # (slot0, TagSenseType) -> nick
+        self.saved = 0                    # slot_data_config_save call count
+        self.emu = {}                     # block -> 16 bytes (HF emulator memory)
+        self.emu_writes = []              # (start_block, block_count) in order
+        self.written = {}                 # block -> 16 bytes (physical card write target)
+        self.writes = []                  # (block, keytype, keyhex) in order
+        self.magic = {"gen1a": None, "gen2": None, "block_anti_coll": None}
 
     # firmware rejects a card op in tag/emulator mode (Status.DEVICE_MODE_ERROR)
     def _require_reader(self):
@@ -196,6 +207,65 @@ class FakeChameleon:
         want = self.keymap.get((self._sector_of(block), kt))
         return want is not None and bytes.fromhex(want) == key
 
+    # ---- slot config (the daemon passes SlotNumber / TagSenseType values) ----
+    @staticmethod
+    def _slot0(slot_number):
+        return int(slot_number) - 1               # SlotNumber (1..8) -> 0-based
+
+    def set_slot_tag_type(self, slot_number, tag_type):
+        self.type_sets.append((self._slot0(slot_number), tag_type))
+
+    def set_slot_data_default(self, slot_number, tag_type):
+        self.default_sets.append((self._slot0(slot_number), tag_type))
+
+    def set_slot_enable(self, slot_number, sense_type, enabled):
+        self.enable_sets.append((self._slot0(slot_number), sense_type, bool(enabled)))
+
+    def set_slot_tag_nick(self, slot_number, sense_type, name):
+        self.nick_store[(self._slot0(slot_number), sense_type)] = name
+
+    def get_slot_tag_nick(self, slot_number, sense_type):
+        key = (self._slot0(slot_number), sense_type)
+        if key not in self.nick_store:            # firmware errors on an unset nick
+            raise UnexpectedResponseError("no nick")
+        return self.nick_store[key]
+
+    def slot_data_config_save(self):
+        self.saved += 1
+
+    # ---- emulator memory ----
+    def mf1_write_emu_block_data(self, block_start, block_data):
+        n = len(block_data) // 16
+        self.emu_writes.append((block_start, n))
+        for i in range(n):
+            self.emu[block_start + i] = bytes(block_data[i * 16:(i + 1) * 16])
+
+    def mf1_read_emu_block_data(self, block_start, block_count):
+        out = bytearray()
+        for i in range(block_count):
+            out += self.emu.get(block_start + i, bytes(16))
+        return bytes(out)
+
+    def mf1_set_block_anti_coll_mode(self, enabled):
+        self.magic["block_anti_coll"] = bool(enabled)
+
+    def mf1_set_gen1a_mode(self, enabled):
+        self.magic["gen1a"] = bool(enabled)
+
+    def mf1_set_gen2_mode(self, enabled):
+        self.magic["gen2"] = bool(enabled)
+
+    # ---- physical-card block write (magic clone target) ----
+    def mf1_write_one_block(self, block, type_value, key, block_data):
+        self._require_reader()
+        kt = "A" if int(type_value) == 0x60 else "B"
+        self.writes.append((block, kt, key.hex()))
+        want = self.keymap.get((self._sector_of(block), kt))
+        if want is None or bytes.fromhex(want) != key:
+            raise UnexpectedResponseError("HF tag auth fail")
+        self.written[block] = bytes(block_data)
+        return True
+
 
 class FakeCrack:
     """Stand-in for chameleon_crack: returns a canned candidate key so the decode
@@ -234,6 +304,16 @@ class SwapFake(FakeChameleon):
         if not self.present:
             raise UnexpectedResponseError("HF tag no found or lost")
         return [{"uid": self.uid, "atqa": self.atqa, "sak": self.sak, "ats": self.ats}]
+
+
+class MidWriteSwapFake(FakeChameleon):
+    """A magic-clone target that is swapped AFTER the first physical block write: its uid
+    flips once a block lands, so the per-write uid pin must catch it before the next block
+    and abort. Scans/reads (preflight) do not flip it, so preflight completes normally."""
+    def mf1_write_one_block(self, block, type_value, key, block_data):
+        ok = super().mf1_write_one_block(block, type_value, key, block_data)
+        self.uid = b"\x09\x09\x09\x09"
+        return ok
 
 
 def cham_daemon(fake, learned=None):
@@ -663,13 +743,230 @@ def test_cham_attack_budget_guard(check):
           str((cancelled, fake.acquired)))
 
 
+def _dump_1k():
+    """A deterministic full 1K image: {block-index: 32-hex}, block b = b || 01..0f."""
+    return {str(b): (bytes([b]) + bytes(range(1, 16))).hex() for b in range(64)}
+
+
+# --------------------------------------------------------------------------
+# 19. slot config: set type (+ default), enable/disable, nick set/get, save.
+# --------------------------------------------------------------------------
+def test_cham_slot_config(check):
+    fake = FakeChameleon()
+    d = cham_daemon(fake)
+    r = d.slot_set_type({"slot": 2, "type": "MIFARE_1024"})
+    check("slot_set_type sets tag type AND seeds default data on the 0-based slot",
+          r["type"] == "MIFARE_1024"
+          and fake.type_sets == [(2, TagSpecificType.MIFARE_1024)]
+          and fake.default_sets == [(2, TagSpecificType.MIFARE_1024)], str(fake.type_sets))
+    # type may also be given as the raw enum value
+    d.slot_set_type({"slot": 0, "type": int(TagSpecificType.EM410X)})
+    check("slot_set_type accepts a numeric tag type",
+          fake.type_sets[-1] == (0, TagSpecificType.EM410X), str(fake.type_sets[-1]))
+    re = d.slot_enable({"slot": 3, "sense": "lf", "enabled": True})
+    check("slot_enable toggles the requested field (sense-typed)",
+          re["enabled"] is True
+          and fake.enable_sets == [(3, TagSenseType.LF, True)], str(fake.enable_sets))
+    rn = d.slot_nick({"slot": 1, "sense": "hf", "name": "front door"})
+    check("slot_nick set writes the nickname", rn["nick"] == "front door")
+    rg = d.slot_nick({"slot": 1, "sense": "hf"})
+    check("slot_nick get reads it back", rg["nick"] == "front door", str(rg))
+    rge = d.slot_nick({"slot": 5, "sense": "hf"})
+    check("slot_nick get on an unset slot -> '' (not an error)", rge["nick"] == "", str(rge))
+    rs = d.slot_save({})
+    check("slot_save persists config to flash", rs["saved"] is True and fake.saved == 1)
+
+
+# --------------------------------------------------------------------------
+# 20. emulate_mode: reader<->tag toggle, and the cached reader flag.
+# --------------------------------------------------------------------------
+def test_cham_emulate_mode(check):
+    fake = FakeChameleon(reader_mode=True)
+    d = cham_daemon(fake)
+    r = d.emulate_mode({"reader": False})
+    check("emulate_mode false switches the device into tag/emulate mode",
+          r["reader"] is False and fake.reader_mode is False
+          and fake.mode_sets[-1] is False, str(fake.mode_sets))
+    check("emulate_mode false clears the cached reader flag so a later reader op re-arms",
+          d._reader_mode is False)
+    r2 = d.emulate_mode({"reader": True})
+    check("emulate_mode true returns to reader mode",
+          r2["reader"] is True and fake.reader_mode is True and d._reader_mode is True)
+
+
+# --------------------------------------------------------------------------
+# 21. emulate_load: chunked emu write over contiguous runs + block-0 anti-coll.
+# --------------------------------------------------------------------------
+def test_cham_emulate_load(check):
+    fake = FakeChameleon()
+    d = cham_daemon(fake)
+    r = d.emulate_load({"blocks": _dump_1k()})
+    check("emulate_load reports the full 1K written (64 blocks) with block 0 present",
+          r["blocks"] == 64 and r["block0"] is True, str(r))
+    check("emulate_load turns on block-0 anti-collision (emulated card presents dump uid)",
+          fake.magic["block_anti_coll"] is True)
+    check("emulate_load chunks a contiguous run into <=8-block writes (64 -> 8 chunks)",
+          len(fake.emu_writes) == 8 and all(n <= 8 for _, n in fake.emu_writes),
+          str(fake.emu_writes))
+    check("emulate_load block 0 in the emulator matches the dump block 0",
+          fake.emu[0] == bytes([0]) + bytes(range(1, 16)), fake.emu.get(0, b"").hex())
+    # a SPARSE dump (a hole at sector 7) loads as separate runs, never a fake zero block
+    sparse = {k: v for k, v in _dump_1k().items() if int(k) not in (28, 29, 30, 31)}
+    f2 = FakeChameleon()
+    d2 = cham_daemon(f2)
+    r2 = d2.emulate_load({"blocks": sparse})
+    check("emulate_load skips a hole (sparse dump) - block 28 never written",
+          r2["blocks"] == 60 and 28 not in f2.emu, str(r2))
+    # block 0 ABSENT: the emulator must NOT derive its identity from a missing block 0
+    noB0 = {k: v for k, v in _dump_1k().items() if int(k) != 0}
+    f3 = FakeChameleon()
+    d3 = cham_daemon(f3)
+    r3 = d3.emulate_load({"blocks": noB0})
+    check("emulate_load reports block 0 absent and does not fabricate it",
+          r3["block0"] is False and r3["blocks"] == 63 and 0 not in f3.emu, str(r3))
+    check("emulate_load leaves block-0 anti-collision OFF when block 0 is absent",
+          f3.magic["block_anti_coll"] is None, str(f3.magic["block_anti_coll"]))
+
+
+# --------------------------------------------------------------------------
+# 22. emu_read: read the active slot's emulator memory back as a block map.
+# --------------------------------------------------------------------------
+def test_cham_emu_read(check):
+    fake = FakeChameleon()
+    d = cham_daemon(fake)
+    d.emulate_load({"blocks": _dump_1k()})
+    r = d.emu_read({"count": 64})
+    check("emu_read returns one hex entry per block for the requested count",
+          r["count"] == 64 and len(r["blocks"]) == 64, str(r["count"]))
+    check("emu_read round-trips the loaded dump byte-identical (block 5)",
+          r["blocks"]["5"].replace(" ", "") == (bytes([5]) + bytes(range(1, 16))).hex(),
+          r["blocks"].get("5"))
+
+
+# --------------------------------------------------------------------------
+# 23. magic_write: clone a dump onto a blank magic card; trailer + block-0 gating.
+# --------------------------------------------------------------------------
+def test_cham_magic_write(check):
+    # default fake = a magic card with FF keys everywhere -> the FF builtin authenticates
+    fake = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd", reader_mode=False)
+    d = cham_daemon(fake)
+    emitted = []
+    d.emit = lambda o: emitted.append(o)
+    r = d.magic_write({"blocks": _dump_1k(), "trailers": True, "uid": True,
+                       "target_uid": "aa bb cc dd"})
+    check("magic_write ensures reader mode before cloning", fake.reader_mode is True)
+    check("magic_write reports the card present and writes every block of a 1K (uid+trailers on)",
+          r["present"] is True and r["wrote"] == 64 and r["failed"] == [], str(r))
+    check("magic_write writes block 0 (uid) when uid is enabled", 0 in fake.written)
+    check("magic_write resets a trailer's access bytes to ff0780 (keeps the tag writable)",
+          fake.written[3][6:9] == bytes.fromhex("ff0780"), fake.written.get(3, b"").hex())
+    prog = [e for e in emitted if e.get("method") == "magic_write"]
+    check("magic_write streams one progress event per written block",
+          len(prog) == 64 and all(e["ok"] for e in prog), "%d events" % len(prog))
+
+    # uid OFF: block 0 is left alone; trailers OFF: the trailer is not written
+    f2 = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd")
+    d2 = cham_daemon(f2)
+    d2.emit = lambda o: None
+    r2 = d2.magic_write({"blocks": _dump_1k(), "trailers": False, "uid": False,
+                         "target_uid": "aa bb cc dd"})
+    # 64 blocks - 16 trailers - block 0 = 47 data blocks written
+    check("magic_write skips block 0 when uid is off, and trailers when trailers is off",
+          0 not in f2.written and 3 not in f2.written and r2["wrote"] == 47, str(r2["wrote"]))
+
+    # target_uid is REQUIRED: omitting it is a contract violation, not a silent write
+    f3 = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd")
+    d3 = cham_daemon(f3)
+    d3.emit = lambda o: None
+    err = d3.handle({"id": 1, "method": "magic_write", "params": {"blocks": _dump_1k()}})
+    check("magic_write requires target_uid (error envelope, nothing written)",
+          "error" in err and "target_uid" in err["error"] and f3.written == {}, str(err))
+
+
+# --------------------------------------------------------------------------
+# 24. magic_write guards: wrong target card, and a sector with no usable key.
+# --------------------------------------------------------------------------
+def test_cham_magic_write_guards(check):
+    # card-pin: the card on the reader differs from the authorised uid -> refuse
+    fake = FakeChameleon(uid=b"\x11\x22\x33\x44")
+    d = cham_daemon(fake)
+    d.emit = lambda o: None
+    r = d.magic_write({"blocks": _dump_1k(), "target_uid": "aa bb cc dd"})
+    check("magic_write refuses when the card on the reader is not the authorised one",
+          r["present"] is True and r["wrote"] == 0 and "card changed" in (r["error"] or ""),
+          str(r))
+    check("magic_write wrote nothing to the wrong card", fake.written == {}, str(fake.written))
+
+    # a sector whose key is not FF / builtin: the all-sector auth preflight must abort
+    # BEFORE any write (never a half-written, mixed-key card), and write NOTHING.
+    km = {(s, kt): FF for s in range(16) for kt in ("A", "B")}
+    km[(5, "A")] = "0f1e2d3c4b5a"          # sector 5 not openable by the defaults
+    km[(5, "B")] = "0f1e2d3c4b5a"
+    f2 = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd", keymap=km)
+    d2 = cham_daemon(f2)
+    events = []
+    d2.emit = lambda o: events.append(o)
+    r2 = d2.magic_write({"blocks": _dump_1k(), "trailers": True, "uid": True,
+                         "target_uid": "aa bb cc dd"})
+    check("magic_write preflight aborts a no-key sector: nothing written, reason names the sector",
+          r2["wrote"] == 0 and "no key for sector 5" in (r2["error"] or "")
+          and f2.written == {}, str(r2))
+    check("magic_write emits no per-block progress when the preflight aborts",
+          not any(e.get("method") == "magic_write" for e in events), "wrote before preflight abort")
+
+
+# --------------------------------------------------------------------------
+# 25. magic_write mid-write swap: the per-write uid pin aborts (CRITICAL regression).
+# --------------------------------------------------------------------------
+def test_cham_magic_write_midswap(check):
+    fake = MidWriteSwapFake(uid=b"\xaa\xbb\xcc\xdd")
+    d = cham_daemon(fake)
+    events = []
+    d.emit = lambda o: events.append(o)
+    r = d.magic_write({"blocks": _dump_1k(), "trailers": True, "uid": True,
+                       "target_uid": "aa bb cc dd"})
+    check("magic_write aborts when the card is swapped mid-write (re-pins uid per block)",
+          "card changed" in (r["error"] or ""), str(r))
+    check("magic_write stops on the swap - only the single pre-swap block was written",
+          len(fake.written) == 1 and r["wrote"] == 1, "wrote %d blocks" % len(fake.written))
+    ok_events = [e for e in events if e.get("ok")]
+    check("magic_write streamed exactly one successful write before aborting",
+          len(ok_events) == 1, "%d ok events" % len(ok_events))
+
+
+# --------------------------------------------------------------------------
+# 26. magic_write trailer key substitution: a zeroed key slot is never written as 000000.
+# --------------------------------------------------------------------------
+def test_cham_magic_write_trailer_keys(check):
+    K = "a0b1c2d3e4f5"                     # the dump's recovered sector-0 key
+    dump = _dump_1k()
+    # sector-0 trailer read back with BOTH key slots zeroed (firmware masks Key A, and a
+    # KeyB-unreadable sector masks Key B too), access ff0780, GPB 69
+    dump["3"] = "000000000000" + "ff078069" + "000000000000"
+    fake = FakeChameleon(uid=b"\xaa\xbb\xcc\xdd")
+    d = cham_daemon(fake)
+    d.emit = lambda o: None
+    d.magic_write({"blocks": dump, "keys": {"0": ["A", K]}, "trailers": True,
+                   "uid": True, "target_uid": "aa bb cc dd"})
+    tr = fake.written.get(3)
+    check("magic_write substitutes a zeroed trailer KeyA with the dump's recovered key",
+          tr is not None and tr[0:6] == bytes.fromhex(K), tr.hex() if tr else "not written")
+    check("magic_write substitutes a zeroed trailer KeyB too (never writes 000000)",
+          tr is not None and tr[10:16] == bytes.fromhex(K), tr.hex() if tr else "not written")
+    check("magic_write keeps the substituted trailer access bytes writable (ff0780)",
+          tr is not None and tr[6:9] == bytes.fromhex("ff0780"), tr.hex() if tr else "not written")
+
+
 TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_read_block, test_cham_decode, test_cham_decode_partial,
          test_cham_decode_nocard, test_cham_decode_swap, test_cham_decode_user_key,
          test_cham_transport_wedge, test_cham_dispatch,
          test_cham_decode_nested_chain, test_cham_decode_darkside_chain,
          test_cham_decode_static_chain, test_cham_decode_hard_prng,
-         test_cham_decode_cancel, test_cham_attack_budget_guard]
+         test_cham_decode_cancel, test_cham_attack_budget_guard,
+         test_cham_slot_config, test_cham_emulate_mode, test_cham_emulate_load,
+         test_cham_emu_read, test_cham_magic_write, test_cham_magic_write_guards,
+         test_cham_magic_write_midswap, test_cham_magic_write_trailer_keys]
 
 
 if __name__ == "__main__":

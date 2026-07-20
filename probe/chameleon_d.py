@@ -26,8 +26,8 @@ import threading
 # bare interpreter - serial/colorama/prompt_toolkit are optional in the package.
 from chameleon.chameleon_com import ChameleonCom, NotOpenException, OpenFailException
 from chameleon.chameleon_cmd import ChameleonCMD
-from chameleon.chameleon_enum import (SlotNumber, TagSpecificType, MfcKeyType, Status,
-                                      MifareClassicPrngType, MifareClassicDarksideStatus)
+from chameleon.chameleon_enum import (SlotNumber, TagSpecificType, TagSenseType, MfcKeyType,
+                                      Status, MifareClassicPrngType, MifareClassicDarksideStatus)
 from chameleon.chameleon_utils import UnexpectedResponseError
 
 # Host-side crackers over the vendored C tools (firmware acquires nonces, host
@@ -129,6 +129,21 @@ def _type_name(t):
         return "UNKNOWN_%d" % t
 
 
+def _resolve_type(t):
+    """A tag type given as an enum NAME ('MIFARE_1024') or an int -> TagSpecificType.
+    Raises (KeyError / ValueError, surfaced as a clean error envelope) on an unknown
+    type rather than guessing one."""
+    if isinstance(t, str):
+        return TagSpecificType[t]
+    return TagSpecificType(int(t))
+
+
+def _sense(s):
+    """The slot field a method targets: 'lf' -> TagSenseType.LF, anything else -> HF
+    (the common case; slot_* callers pass an explicit 'hf'/'lf')."""
+    return TagSenseType.LF if str(s).lower() == "lf" else TagSenseType.HF
+
+
 def _capabilities(model):
     """The capability manifest the shell reads to gate panels (SPEC 2.3). Built
     from the device model, not hardcoded: model 0 = Ultra, 1 = Lite. The Lite has
@@ -156,7 +171,9 @@ _DEAD = (OSError, NotOpenException, OpenFailException)
 
 class Daemon:
     METHODS = ("info", "poll", "slots_list", "slot_select", "mf_read_block",
-               "decode", "cancel")
+               "decode", "cancel",
+               "slot_set_type", "slot_enable", "slot_nick", "slot_save",
+               "emulate_mode", "emulate_load", "emu_read", "magic_write")
 
     # Long ops whose cancel window is armed (the flag cleared) at DISPATCH, so a
     # cancel that lands before the worker starts the op still targets it and a stale
@@ -317,6 +334,294 @@ class Daemon:
         mkt = MfcKeyType.A if kt == "A" else MfcKeyType.B
         data = c.mf1_read_one_block(block, mkt, key)
         return {"block": block, "data": hx(data)}
+
+    # ---- slot library (Chameleon-only; the shell gates on capabilities.slots) --
+
+    def slot_set_type(self, p):
+        """Set a slot's emulated tag type: set_slot_tag_type (RAM) + set_slot_data_default
+        (default data, persisted on the next save). `slot` is 0-based (matches
+        slots_list); `type` is a TagSpecificType name or value."""
+        c = self._connect(p.get("port"))
+        slot = int(p["slot"])
+        tt = _resolve_type(p["type"])
+        sn = SlotNumber.from_fw(slot)
+        c.set_slot_tag_type(sn, tt)
+        c.set_slot_data_default(sn, tt)
+        return {"slot": slot, "type": tt.name}
+
+    def slot_enable(self, p):
+        """Enable / disable a slot's HF or LF field (set_slot_enable). `slot` 0-based,
+        `sense` 'hf'/'lf'."""
+        c = self._connect(p.get("port"))
+        slot = int(p["slot"])
+        sense = str(p.get("sense", "hf")).lower()
+        enabled = bool(p["enabled"])
+        c.set_slot_enable(SlotNumber.from_fw(slot), _sense(sense), enabled)
+        return {"slot": slot, "sense": sense, "enabled": enabled}
+
+    def slot_nick(self, p):
+        """Get or set a slot's nickname. With `name` -> set_slot_tag_nick; without ->
+        get_slot_tag_nick (an unset nick is '' rather than an error)."""
+        c = self._connect(p.get("port"))
+        slot = int(p["slot"])
+        sense = str(p.get("sense", "hf")).lower()
+        st = _sense(sense)
+        sn = SlotNumber.from_fw(slot)
+        name = p.get("name")
+        if name is not None:
+            c.set_slot_tag_nick(sn, st, str(name))
+            nick = str(name)
+        else:
+            try:
+                nick = c.get_slot_tag_nick(sn, st)
+            except UnexpectedResponseError:
+                nick = ""                # no nick stored on this slot/field
+        return {"slot": slot, "sense": sense, "nick": nick}
+
+    def slot_save(self, p):
+        """Persist the current slot configuration + data to flash (slot_data_config_save)."""
+        c = self._connect(p.get("port"))
+        c.slot_data_config_save()
+        return {"saved": True}
+
+    # ---- emulate: reader<->tag toggle, load a dump into a slot, read it back ----
+
+    def emulate_mode(self, p):
+        """Switch the device between reader mode (`reader:true`, scans cards) and
+        tag/emulate mode (`reader:false`, presents the active slot). Keeps the cached
+        reader flag honest so the next reader op (poll/decode) re-arms it correctly."""
+        c = self._connect(p.get("port"))
+        reader = bool(p.get("reader", False))
+        c.set_device_reader_mode(reader)
+        self._reader_mode = reader
+        return {"reader": reader}
+
+    def emulate_load(self, p):
+        """Load a full dump into the ACTIVE slot's HF (MIFARE Classic) emulator. When
+        block 0 IS in the dump, turn on block-0 anti-collision so the emulated card
+        presents the dump's own UID/SAK/ATQA (which live in its block 0); when block 0 is
+        ABSENT we leave the mode off so the emulator keeps its own identity rather than
+        derive it from a zero/stale block 0 (surfaced as `block0: false`). Mirrors the GUI
+        slot-load: chunked mf1_write_emu_block_data over contiguous runs. A sparse dump
+        (unread sectors omitted) loads in runs, so a hole is never written as a fabricated
+        zero block. `blocks`: {block-index: hex}."""
+        c = self._connect(p.get("port"))
+        blocks = p.get("blocks") or {}
+        items = sorted((int(k), bytes.fromhex(v.replace(" ", "")))
+                       for k, v in blocks.items() if v)
+        has_block0 = any(blk == 0 for blk, _ in items)
+        written, run_start, run_buf, prev = 0, None, bytearray(), None
+        for blk, data in items:
+            if prev is None or blk != prev + 1:
+                if run_start is not None:
+                    self._flush_emu(c, run_start, run_buf)
+                run_start, run_buf = blk, bytearray()
+            run_buf += data
+            written += 1
+            prev = blk
+        if run_start is not None:
+            self._flush_emu(c, run_start, run_buf)
+        # Only derive the emulated identity from block 0 when it was actually loaded.
+        if has_block0:
+            c.mf1_set_block_anti_coll_mode(True)
+        return {"blocks": written, "loaded": True, "block0": has_block0}
+
+    @staticmethod
+    def _flush_emu(c, start, buf):
+        """Write one emulator run in <=8-block (128-byte) chunks (the GUI flush size),
+        auto-incrementing from block `start`."""
+        CHUNK = 128
+        for off in range(0, len(buf), CHUNK):
+            c.mf1_write_emu_block_data(start + off // 16, bytes(buf[off:off + CHUNK]))
+
+    def emu_read(self, p):
+        """Read the active slot's HF emulator memory back as a block-index -> hex map
+        (the shell renders it in the existing sector grid). Read in 32-block chunks (the
+        GUI esave size). `count` blocks, default 64 (a 1K image)."""
+        c = self._connect(p.get("port"))
+        count = int(p.get("count") or 64)
+        CHUNK = 32
+        blocks, b = {}, 0
+        while b < count:
+            n = min(CHUNK, count - b)
+            data = c.mf1_read_emu_block_data(b, n)
+            for i in range(n):
+                blocks[str(b + i)] = hx(data[i * 16:(i + 1) * 16])
+            b += n
+        return {"blocks": blocks, "count": count}
+
+    # ---- magic clone: write a dump onto a magic card on the reader --------------
+
+    def magic_write(self, p):
+        """Clone a dump onto a magic (CUID / gen2 / gen1a) card on the reader, mirroring
+        the CLI `hf mf clone` flow. Data blocks always; the trailer only when `trailers`
+        is set (its access bytes reset to the generic ff0780 so the tag stays writable,
+        unless `clone_access`); block 0 only when `uid` is set. `gen` ('gen1a'/'gen2')
+        optionally arms the device's matching magic mode, per SPEC 3.2.
+
+        Safety (mirrors x7d write_mfd / format):
+        - `target_uid` is REQUIRED and the card is re-pinned to it immediately before
+          EVERY block write, so a card swapped in mid-clone (even one with compatible
+          keys) never receives the remaining blocks.
+        - Every touched sector is auth-preflighted BEFORE the first write; if any cannot
+          auth we abort and write nothing, so a mixed-key card is never half-written.
+        - A zeroed trailer key slot is substituted with the dump's recovered key (or
+          factory FF), never written as 000000.
+
+        Per-block outcome streams as progress; the tally returns in the x7d write shape
+        ({present, wrote, failed, error})."""
+        c = self._connect(p.get("port"))
+        self._ensure_reader(c)
+        blocks = p.get("blocks") or {}
+        dump_keys = p.get("keys") or {}
+        extra_keys = [k.lower() for k in (p.get("extra_keys") or []) if _valid_key_hex(k)]
+        write_trailers = bool(p.get("trailers", False))
+        write_uid = bool(p.get("uid", False))
+        clone_access = bool(p.get("clone_access", False))
+        gen = p.get("gen")
+
+        # target_uid is REQUIRED: the clone is pinned to the exact card the user
+        # authorised, for the WHOLE write - not merely checked once up front.
+        target = (p.get("target_uid") or "").replace(" ", "").lower()
+        if not target:
+            raise RuntimeError("magic_write requires target_uid")
+
+        try:
+            tags = c.hf14a_scan()
+        except UnexpectedResponseError:
+            return {"present": False}
+        if not tags:
+            return {"present": False}
+        if hx(tags[0]["uid"]).replace(" ", "") != target:
+            return {"present": True, "wrote": 0, "failed": [],
+                    "error": "card changed, not written"}
+        n = sector_count(tags[0]["sak"][0])
+
+        # The blocks each sector will actually write (data always; block 0 only with uid;
+        # the trailer only with trailers). A sector with nothing to write needs no key.
+        todo = {}
+        for s in range(n):
+            tb = trailer_block(s)
+            bl = [b for b in range(first_block(s), tb + 1)
+                  if not (b == 0 and not write_uid)
+                  and not (b == tb and not write_trailers)
+                  and blocks.get(str(b))]
+            if bl:
+                todo[s] = bl
+
+        # Preflight: find an auth key for EVERY sector that will be touched, re-pinning
+        # the target between sectors, BEFORE the first write. If any cannot auth we abort
+        # and write nothing (never a half-written, mixed-key card). Mirrors x7d format.
+        sector_keys = {}
+        for s in todo:
+            if self._current_uid_norm(c) != target:
+                return {"present": True, "wrote": 0, "failed": [],
+                        "error": "card changed, not written"}
+            found = self._magic_sector_keys(c, s, dump_keys, extra_keys)
+            if not found:
+                return {"present": True, "wrote": 0, "failed": [],
+                        "error": "no key for sector %d - nothing written" % s}
+            sector_keys[s] = found
+
+        # SPEC 3.2 mapping. The reliable clone is the block-write flow below; these are
+        # the device's emulator magic-mode flags, so they are armed only on explicit
+        # request (the default clone leaves them untouched).
+        if gen == "gen1a":
+            c.mf1_set_gen1a_mode(True)
+        elif gen == "gen2":
+            c.mf1_set_gen2_mode(True)
+
+        wrote, failed = 0, []
+        for s in sorted(todo):
+            found = sector_keys[s]
+            tb = trailer_block(s)
+            dk = dump_keys.get(str(s))
+            sub = (bytes.fromhex(dk[1]) if (isinstance(dk, list) and len(dk) == 2
+                   and _valid_key_hex(dk[1])) else bytes.fromhex("ffffffffffff"))
+            for b in todo[s]:
+                # Re-pin the target immediately before each write: a card swapped in mid-
+                # clone (even one with compatible keys) must never receive the rest.
+                if self._current_uid_norm(c) != target:
+                    return {"present": True, "wrote": wrote, "failed": failed,
+                            "error": "card changed, not written"}
+                raw = bytes.fromhex(blocks[str(b)].replace(" ", ""))
+                if len(raw) != 16:
+                    failed.append(b)
+                    continue
+                if b == tb:
+                    d = bytearray(raw)
+                    if not clone_access:
+                        d[6:9] = bytes.fromhex("ff0780")   # keep the tag writable
+                    # Never write a 000000 key slot: substitute the dump's recovered key
+                    # (or factory FF). Mirrors x7lib/x7d trailer handling.
+                    if d[0:6] == bytes(6):
+                        d[0:6] = sub
+                    if d[10:16] == bytes(6):
+                        d[10:16] = sub
+                    raw = bytes(d)
+                ok = self._magic_write_block(c, b, found, raw)
+                self.emit({"event": "progress", "method": "magic_write",
+                           "block": b, "ok": ok, "unsafe": None if ok else "write-refused"})
+                if ok:
+                    wrote += 1
+                else:
+                    failed.append(b)
+        return {"present": True, "wrote": wrote, "failed": failed, "error": None}
+
+    def _current_uid_norm(self, c):
+        """Normalised (space-free, lowercase) uid of the card in the field now, or None
+        when the field is empty. Used to re-pin the target before each clone write."""
+        uid = self._rescan_uid(c)
+        return hx(uid).replace(" ", "") if uid is not None else None
+
+    def _magic_sector_keys(self, c, s, dump_keys, extra):
+        """Find a KeyA and/or KeyB that authenticate the TARGET card's sector s, drawn
+        from the dump's own sector key, the caller's extra keys, then the built-in
+        defaults (FF first, so a blank magic card resolves immediately)."""
+        cands, seen = [], set()
+
+        def add(k):
+            k = (k or "").lower()
+            if _valid_key_hex(k) and k not in seen:
+                cands.append(k)
+                seen.add(k)
+
+        dk = dump_keys.get(str(s))
+        if isinstance(dk, list) and len(dk) == 2:
+            add(dk[1])
+        for k in extra:
+            add(k)
+        for k in BUILTIN_KEYS:
+            add(k)
+        fb = first_block(s)
+        found = {}
+        for keyhex in cands:
+            for kt in ("A", "B"):
+                if kt in found:
+                    continue
+                mkt = MfcKeyType.A if kt == "A" else MfcKeyType.B
+                try:
+                    c.mf1_read_one_block(fb, mkt, bytes.fromhex(keyhex))
+                    found[kt] = keyhex
+                except UnexpectedResponseError:
+                    continue
+            if "A" in found and "B" in found:
+                break
+        return found
+
+    def _magic_write_block(self, c, block, found, data):
+        """Write one block, KeyB first then KeyA (mirrors `hf mf clone`). False when no
+        key authenticates the write."""
+        for kt in ("B", "A"):
+            if kt not in found:
+                continue
+            mkt = MfcKeyType.A if kt == "A" else MfcKeyType.B
+            try:
+                if c.mf1_write_one_block(block, mkt, bytes.fromhex(found[kt]), data):
+                    return True
+            except UnexpectedResponseError:
+                continue
+        return False
 
     # ---- decode: dict-only key recovery + full read (nested/darkside is P1) --
 

@@ -325,8 +325,81 @@ actor DeviceBridge {
         return try await request("write_mfd", params: params, timeout: .seconds(300), as: WriteResult.self)
     }
 
+    // ---- Chameleon-only verbs (the shell calls these only when the connected
+    // device advertises the matching capability; the X7 never does) --------------
+
+    /// The 8-slot library (type / enabled / nick / active per slot).
+    func slotsList() async throws -> [ChameleonSlot] {
+        try await request("slots_list", as: SlotsResult.self).slots
+    }
+    /// Make a slot the active one.
+    func slotSelect(_ slot: Int) async throws {
+        _ = try await request("slot_select", params: SlotParam(slot: slot), as: SlotSelectResult.self)
+    }
+    /// Set a slot's emulated tag type (+ seed its default data).
+    func slotSetType(slot: Int, type: String) async throws {
+        _ = try await request("slot_set_type", params: SlotTypeParam(slot: slot, type: type), as: SlotSelectResult.self)
+    }
+    /// Enable / disable a slot's HF or LF field.
+    func slotEnable(slot: Int, sense: String, enabled: Bool) async throws {
+        _ = try await request("slot_enable", params: SlotEnableParam(slot: slot, sense: sense, enabled: enabled), as: SlotEnableResult.self)
+    }
+    /// Rename a slot (`name` non-nil) or read its nick (`name` nil).
+    @discardableResult
+    func slotNick(slot: Int, sense: String, name: String?) async throws -> String {
+        try await request("slot_nick", params: SlotNickParam(slot: slot, sense: sense, name: name), as: SlotNickResult.self).nick
+    }
+    /// Persist the current slot configuration + data to flash.
+    func slotSave() async throws {
+        _ = try await request("slot_save", as: SavedResult.self)
+    }
+    /// Switch the device between reader mode (true) and tag/emulate mode (false).
+    func emulateMode(reader: Bool) async throws {
+        _ = try await request("emulate_mode", params: EmulateModeParam(reader: reader), as: EmulateModeResult.self)
+    }
+    /// Load a dump into the ACTIVE slot's HF emulator (+ block-0 anti-coll).
+    func emulateLoad(blocks: [String: String]) async throws {
+        _ = try await request("emulate_load", params: EmulateLoadParam(blocks: blocks), timeout: .seconds(120), as: EmulateLoadResult.self)
+    }
+    /// Read the active slot's HF emulator memory back as a block-index -> hex map.
+    func emuRead(count: Int) async throws -> [String: String] {
+        try await request("emu_read", params: EmuReadParam(count: count), timeout: .seconds(120), as: EmuReadResult.self).blocks
+    }
+
+    /// Clone a dump onto a magic card on the reader (the Chameleon's own reader).
+    /// Per-block results stream to `onBlock`; the tally returns in the write shape.
+    /// The X7 write path (writeMFD) is untouched - this is the Chameleon-only route.
+    func magicWrite(blocks: [String: String], keys: [String: [String]],
+                    trailers: Bool, uid: Bool, targetUID: String?,
+                    onBlock: @escaping @Sendable (Int, Bool, String?) -> Void) async throws -> WriteResult {
+        guard eventSink == nil else { throw EngineError.daemon("an operation is already in progress") }
+        eventSink = { ev in
+            if ev.method == "magic_write", let b = ev.block, let ok = ev.ok { onBlock(b, ok, ev.unsafe) }
+        }
+        opGeneration += 1
+        defer { eventSink = nil }
+        let params = MagicParams(blocks: blocks, keys: keys, trailers: trailers, uid: uid, target_uid: targetUID)
+        return try await request("magic_write", params: params, timeout: .seconds(300), as: WriteResult.self)
+    }
+
     private struct Req: Encodable { let id: Int; let method: String }
     private struct ReqP<P: Encodable>: Encodable { let id: Int; let method: String; let params: P }
+    private struct SlotParam: Encodable { let slot: Int }
+    private struct SlotTypeParam: Encodable { let slot: Int; let type: String }
+    private struct SlotEnableParam: Encodable { let slot: Int; let sense: String; let enabled: Bool }
+    private struct SlotNickParam: Encodable { let slot: Int; let sense: String; let name: String? }
+    private struct EmulateModeParam: Encodable { let reader: Bool }
+    private struct EmulateLoadParam: Encodable { let blocks: [String: String] }
+    private struct EmuReadParam: Encodable { let count: Int }
+    private struct MagicParams: Encodable {
+        let blocks: [String: String]; let keys: [String: [String]]
+        let trailers: Bool; let uid: Bool; let target_uid: String?
+    }
+    private struct SlotSelectResult: Decodable { let slot: Int }
+    private struct SlotEnableResult: Decodable { let slot: Int; let sense: String; let enabled: Bool }
+    private struct SavedResult: Decodable { let saved: Bool }
+    private struct EmulateModeResult: Decodable { let reader: Bool }
+    private struct EmulateLoadResult: Decodable { let blocks: Int; let loaded: Bool }
     private struct CloneParams: Encodable {
         let blocks: [String: String]; let keys: [String: [String]]
         let trailers: Bool; let uid: Bool; let target_uid: String?

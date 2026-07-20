@@ -179,22 +179,40 @@ private struct ActionBar: View {
             // poll has detected a card: the decode does its own patient coupling, so a
             // seated-but-undetected card is no longer a dead button (see AppModel.decode).
             ActionButton(title: l.t(ntag ? "read" : "decode"), icon: "square.grid.3x3",
-                         prominent: true, enabled: model.readerOnline && !busy) { Task { await model.decode() } }
+                         prominent: true, enabled: model.readerOnline && !busy && !model.emulating) { Task { await model.decode() } }
             // Write lights up as soon as there is a document to write; it does NOT
             // require a card on the reader (the target is asked for at write time in
             // the sheet), so lifting the source card to place a blank never darkens it.
             ActionButton(title: l.t("write"), icon: "square.and.arrow.down.on.square",
-                         enabled: model.cloneSource != nil && !busy) { model.cloneSheet = true }
+                         enabled: model.cloneSource != nil && !busy && !model.emulating) { model.cloneSheet = true }
             // Format is destructive but offered for ANY present card (a blank / unknown
             // card can be wiped with factory keys, no prior decode required); the daemon
             // keeps the anti-brick guards. Gated only on a card being present + a confirm.
             ActionButton(title: l.t("format"), icon: "eraser",
-                         enabled: model.card != nil && !busy) { model.requestFormat() }
+                         enabled: model.card != nil && !busy && !model.emulating) { model.requestFormat() }
             Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
             ActionButton(title: l.t("save_dump"), icon: "arrow.down.doc",
                          enabled: model.source != nil) { model.saveDumpDialog() }
             ActionButton(title: l.t("open_dump"), icon: "folder", enabled: true) { model.openDumpDialog() }
             ActionButton(title: "apdu", icon: "terminal", on: model.apduOpen, enabled: true) { model.apduOpen.toggle() }
+            // Chameleon-only verbs, gated on the connected device's capabilities: the
+            // slot library, the reader<->emulate toggle, and loading the working
+            // document into a slot for emulation. A plain reader (X7) shows none of them.
+            if model.capabilities.slots > 0 || model.capabilities.emulate {
+                Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
+            }
+            if model.capabilities.slots > 0 {
+                ActionButton(title: l.t("slots"), icon: "square.stack.3d.up", on: model.showSlots,
+                             enabled: !model.slotBusy) {
+                    let willShow = !model.showSlots
+                    withAnimation(.easeInOut(duration: 0.2)) { model.showSlots = willShow }
+                    if willShow { Task { await model.loadSlots() } }
+                }
+            }
+            if model.capabilities.emulate {
+                EmulateToggle()
+                if model.source != nil { LoadToSlotMenu() }
+            }
             Spacer()
             if model.decoding {
                 if let p = model.decodeProgress {
@@ -216,7 +234,7 @@ private struct ActionBar: View {
     }
 }
 
-private struct ActionButton: View {
+struct ActionButton: View {
     let title: String
     let icon: String
     var prominent = false
@@ -255,6 +273,40 @@ private struct ActionButton: View {
     }
 }
 
+/// Load the working document into a Chameleon slot for emulation. A menu of the 8
+/// slots (nicked where known); picking one writes the document into that slot's HF
+/// emulator and saves it. Shown only when a document is held + the device can emulate.
+private struct LoadToSlotMenu: View {
+    @Environment(AppModel.self) private var model
+    @Environment(Theme.self) private var theme
+    @Environment(L10n.self) private var l
+    var body: some View {
+        Menu {
+            ForEach(0..<8, id: \.self) { i in
+                Button(slotMenuLabel(i)) { Task { await model.loadDocumentToSlot(i) } }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "tray.and.arrow.down").font(.system(size: 11))
+                Text(l.t("load_to_slot")).font(l.sans(12, .medium))
+            }
+            .padding(.horizontal, 11).frame(height: 30)
+            .background(RoundedRectangle(cornerRadius: 7).fill(theme.p.tileFill.opacity(0.6)))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(theme.p.tileBorder, lineWidth: 0.5))
+            .foregroundStyle(theme.p.textPrimary)
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .disabled(model.slotBusy)
+    }
+    private func slotMenuLabel(_ i: Int) -> String {
+        let base = "\(l.t("slot")) \(i + 1)"
+        if let s = model.slots.first(where: { $0.index == i }), !s.hf.nick.isEmpty {
+            return "\(base) · \(s.hf.nick)"
+        }
+        return base
+    }
+}
+
 /// Compact "source loaded" tag with a clear button, in the action bar.
 private struct SourceTag: View {
     let src: CardDump
@@ -284,7 +336,11 @@ private struct CanvasView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if !model.sectors.isEmpty || !model.pages.isEmpty {
+            if model.showSlots && model.capabilities.slots > 0 {
+                // Chameleon-only slot library, opened from the action bar. The single
+                // document flow (below) is untouched; this is a separate detail area.
+                SlotLibraryView()
+            } else if !model.sectors.isEmpty || !model.pages.isEmpty {
                 // A document is loaded (decoding, decoded, or an NTAG page dump): show
                 // it. It persists across card swaps, so the working image never
                 // vanishes when the source card is lifted to place a target.

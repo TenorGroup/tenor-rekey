@@ -55,6 +55,22 @@ final class AppModel {
     var apduLog: [ApduEntry] = []
     var apduBusy = false
 
+    // ---- Chameleon slot library + emulation (gated on capabilities) --------
+    /// The 8-slot library, loaded when the slot view opens (empty for a plain reader).
+    var slots: [ChameleonSlot] = []
+    /// The slot highlighted in the library (its actions apply to it) - not the ACTIVE
+    /// slot the device presents.
+    var selectedSlot: Int?
+    /// A slot op (select / type / enable / rename / save / load / open / emulate toggle)
+    /// owns the reader. Folded into `deviceBusy` so no other op races it.
+    var slotBusy = false
+    /// The Chameleon-only slot library is showing instead of the document canvas.
+    var showSlots = false
+    /// The device is in tag/emulate mode (presenting the active slot), not reader mode.
+    /// While true the status monitor stops polling, since a poll would switch the device
+    /// back to reader mode under the emulation.
+    var emulating = false
+
     /// The active device bridge, chosen by the registry at connect and swapped on
     /// hot-plug. Created lazily for `descriptor` (the daemon itself starts on its
     /// first request), so there is no bridge before the first connect.
@@ -74,8 +90,9 @@ final class AppModel {
     private var swapping = false
 
     /// A device op already owns the reader. Reconnect / swap must not replace the
-    /// bridge under one, and a second op must not start while one runs.
-    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy }
+    /// bridge under one, and a second op must not start while one runs. Slot ops are
+    /// included so a slot edit and a decode / clone can never overlap on the reader.
+    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy || slotBusy }
 
     /// The active bridge, created lazily for the current descriptor. A prior bridge
     /// for a different device is torn down explicitly on the swap path (which nils
@@ -180,15 +197,23 @@ final class AppModel {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(1.5))
             if deviceBusy || swapping { continue }
-            // Hot-swap: if a different device is now the best USB match (the old one
-            // was unplugged and another plugged in), tear down the current daemon and
-            // bring the new one up before the next status sample. Detection is a cheap
-            // IORegistry scan. With only the X7 involved, detect() keeps returning the
-            // same descriptor, so this path is inert and the poll below is unchanged.
-            if let found = DeviceRegistry.detect(), found.id != descriptor.id {
-                await swapDevice(to: found)
+            // Hot-swap detection runs even while emulating: unplugging an emulating
+            // Chameleon and attaching another device must still tear down + swap. It is a
+            // cheap IORegistry presence scan (no device I/O), so it is safe in tag mode.
+            // With only the X7 involved, detect() keeps returning the same descriptor, so
+            // this path is inert and the poll below is unchanged.
+            if let found = DeviceRegistry.detect() {
+                if found.id != descriptor.id { await swapDevice(to: found); continue }
+            } else if emulating {
+                // The emulating device was unplugged with nothing to swap to: the card
+                // poll is skipped while emulating, so this is the only place that would
+                // notice it is gone. Reflect it (which also clears the emulate state).
+                applyReaderGone()
                 continue
             }
+            // Only the card POLL is skipped while emulating: a poll forces reader mode,
+            // which would break the emulation.
+            if emulating { continue }
             await refreshStatus()
         }
     }
@@ -211,9 +236,20 @@ final class AppModel {
             info = nil
             card = nil
             clearCardBound()
+            resetChameleonState()
         }
         await old?.shutdown()                   // bounded terminate + drain of the old daemon
         await openCurrentDevice()               // creates + brings up the new bridge
+    }
+
+    /// Drop the Chameleon-scoped slot library + emulation state on a device swap or a
+    /// reader-gone: the next device (or the same one reconnected) reloads its own slots,
+    /// and the slot view / emulate toggle must not persist across a device that has none.
+    private func resetChameleonState() {
+        slots = []
+        selectedSlot = nil
+        showSlots = false
+        emulating = false
     }
 
     /// Consecutive polls that saw the reader but no card; a seated card that blips
@@ -285,14 +321,17 @@ final class AppModel {
             info = nil
             card = nil
             clearCardBound()
+            resetChameleonState()
         }
     }
 
     func decode() async {
         // Refuse while a swap is tearing the device down, or another device op already
         // owns the reader (deviceBusy includes `decoding`, so this also blocks a
-        // double-decode). Serialized, never racing the bridge.
-        guard !swapping, !deviceBusy else { return }
+        // double-decode). Also refuse while emulating: a reader op would force the device
+        // back to reader mode under the emulation, leaving the toggle lying. Serialized,
+        // never racing the bridge.
+        guard !swapping, !deviceBusy, !emulating else { return }
         decoding = true
         decodeCancelled = false
         decodeProgress = nil
@@ -571,8 +610,9 @@ final class AppModel {
     /// dialog is open, so we execute ONLY if the card on the reader still equals that
     /// authorization - never write to a card whose uid differs from the one shown.
     func clone(trailers: Bool, uid: Bool, authorizedUID: String?) async {
-        // Never clone while a swap is in flight or another device op owns the reader.
-        guard !swapping, !deviceBusy else { return }
+        // Never clone while a swap is in flight, another device op owns the reader, or
+        // the device is emulating (a reader-mode write would break the emulation).
+        guard !swapping, !deviceBusy, !emulating else { return }
         guard let src = cloneSource else {
             lastError = "no clone source"
             return
@@ -589,16 +629,27 @@ final class AppModel {
         cloneResults = [:]
         cloneFailReasons = [:]
         lastError = nil
+        // Per-block glyph updates stream the same way for both write paths.
+        let onBlock: @Sendable (Int, Bool, String?) -> Void = { [weak self] b, ok, reason in
+            Task { @MainActor in
+                withAnimation(.easeOut(duration: 0.16)) { self?.cloneResults[b] = ok }
+                if let reason { self?.cloneFailReasons[b] = reason }
+            }
+        }
         do {
-            let r = try await activeBridge().writeMFD(
-                blocks: src.blockParams, keys: src.keyParams, trailers: trailers, uid: uid,
-                targetUID: target,
-                onBlock: { [weak self] b, ok, reason in
-                    Task { @MainActor in
-                        withAnimation(.easeOut(duration: 0.16)) { self?.cloneResults[b] = ok }
-                        if let reason { self?.cloneFailReasons[b] = reason }
-                    }
-                })
+            // Capability-driven route: a Chameleon clones onto a magic card via
+            // `magic_write`; the X7 keeps its existing `write_mfd` path untouched. Both
+            // return the same WriteResult, so the outcome handling below is shared.
+            let r: WriteResult
+            if capabilities.emulate {
+                r = try await activeBridge().magicWrite(
+                    blocks: src.blockParams, keys: src.keyParams, trailers: trailers, uid: uid,
+                    targetUID: target, onBlock: onBlock)
+            } else {
+                r = try await activeBridge().writeMFD(
+                    blocks: src.blockParams, keys: src.keyParams, trailers: trailers, uid: uid,
+                    targetUID: target, onBlock: onBlock)
+            }
             // Per-block glyphs in the grid/inspector are the primary failure surface;
             // lastError is the summary shown in the status banner, phrased in card terms.
             if r.present == false {
@@ -629,8 +680,9 @@ final class AppModel {
     /// it behind a confirm. The anti-brick guards (trailer written last, per-card uid
     /// pin) stay in the daemon; a card whose keys are unknown simply fails, never bricks.
     func format(authorizedUID: String?) async {
-        // Never format while a swap is in flight or another device op owns the reader.
-        guard !swapping, !deviceBusy else { return }
+        // Never format while a swap is in flight, another device op owns the reader, or
+        // the device is emulating (a reader-mode erase would break the emulation).
+        guard !swapping, !deviceBusy, !emulating else { return }
         // Bound to the card the user authorized in the confirm dialog: if it was swapped
         // or lifted while the dialog was open, do not erase whatever is on the reader now.
         guard let auth = authorizedUID, let target = card?.uid,
@@ -701,8 +753,9 @@ final class AppModel {
     /// answer (e.g. a MIFARE Classic, not ISO14443-4), and no card present.
     func sendAPDU(_ hex: String) async {
         let clean = hex.trimmingCharacters(in: .whitespaces).lowercased()
-        // Never send while a swap is in flight or another device op owns the reader.
-        guard !clean.isEmpty, !swapping, !deviceBusy else { return }
+        // Never send while a swap is in flight, another device op owns the reader, or the
+        // device is emulating (an apdu is a reader op that would break the emulation).
+        guard !clean.isEmpty, !swapping, !deviceBusy, !emulating else { return }
         apduBusy = true
         let id = (apduLog.last?.id ?? 0) + 1
         do {
@@ -719,6 +772,115 @@ final class AppModel {
             lastError = "\(error)"
         }
         apduBusy = false
+    }
+
+    // ---- Chameleon slot library + emulation --------------------------------
+
+    /// Load the 8-slot library (opening the slot view or refreshing after an edit).
+    func loadSlots() async {
+        guard capabilities.slots > 0, !swapping, !deviceBusy else { return }
+        do { slots = try await activeBridge().slotsList(); lastError = nil }
+        catch { lastError = "\(error)" }
+    }
+
+    /// Make a slot the active one (the card the device presents / emulates).
+    func selectSlot(_ i: Int) async { await slotOp { try await $0.slotSelect(i) } }
+
+    /// Enable / disable a slot's HF or LF field.
+    func enableSlot(_ i: Int, sense: String, enabled: Bool) async {
+        await slotOp { try await $0.slotEnable(slot: i, sense: sense, enabled: enabled) }
+    }
+
+    /// Set a slot's emulated tag type (+ seed its default data).
+    func setSlotType(_ i: Int, type: String) async {
+        await slotOp { try await $0.slotSetType(slot: i, type: type) }
+    }
+
+    /// Rename a slot's HF field (its primary label in the library).
+    func renameSlot(_ i: Int, sense: String = "hf", name: String) async {
+        await slotOp { _ = try await $0.slotNick(slot: i, sense: sense, name: name) }
+    }
+
+    /// Persist the whole slot configuration + data to flash.
+    func saveSlots() async { await slotOp { try await $0.slotSave() } }
+
+    /// Shared slot-op runner: guards a swap / concurrent op, marks the reader busy, runs
+    /// the op, then reloads the library so the grid reflects the change.
+    private func slotOp(_ op: (DeviceBridge) async throws -> Void) async {
+        guard capabilities.slots > 0, !swapping, !deviceBusy else { return }
+        slotBusy = true
+        do {
+            let b = activeBridge()
+            try await op(b)
+            slots = try await b.slotsList()
+            lastError = nil
+        } catch { lastError = "\(error)" }
+        slotBusy = false
+    }
+
+    /// Read a slot's HF MIFARE Classic emulator content into the working document, so
+    /// the existing sector grid / inspector render it (and it becomes savable / cloneable).
+    /// Returns to the document canvas. Only 1K / 4K HF Classic slots are openable.
+    func openSlotContent(_ i: Int) async {
+        guard capabilities.slots > 0, !swapping, !deviceBusy else { return }
+        guard let slot = slots.first(where: { $0.index == i }), let geo = slot.hfGeometry else {
+            lastError = "slot has no readable MIFARE Classic content"
+            return
+        }
+        slotBusy = true
+        do {
+            let b = activeBridge()
+            try await b.slotSelect(i)
+            let raw = try await b.emuRead(count: geo.count)
+            var map: [Int: String] = [:]
+            for (k, v) in raw { if let blk = Int(k) { map[blk] = v.replacingOccurrences(of: " ", with: "") } }
+            let dump = CardDump.fromBlocks(map, sak: geo.sak, name: "slot \(i + 1)")
+            let vms = Self.buildSectors(fromDump: dump)
+            withAnimation(.easeInOut(duration: 0.3)) {
+                source = dump; sectors = vms; pages = []
+                selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
+                selectedBlock = nil; showSlots = false
+                cloneResults = [:]; cloneFailReasons = [:]; noKeysFound = false
+            }
+            slots = try await b.slotsList()          // the active flag moved to i
+            lastError = nil
+        } catch { lastError = "\(error)" }
+        slotBusy = false
+    }
+
+    /// Load the working document into a chosen slot's HF emulator, so the Chameleon
+    /// emulates that card: select the slot, set its type + enable HF from the dump, load
+    /// the blocks, then save. Needs a held document + an emulation-capable device.
+    func loadDocumentToSlot(_ i: Int) async {
+        guard capabilities.emulate, !swapping, !deviceBusy, let src = source else { return }
+        slotBusy = true
+        let type = src.sak == 0x18 ? "MIFARE_4096" : "MIFARE_1024"
+        do {
+            let b = activeBridge()
+            try await b.slotSelect(i)
+            try await b.slotSetType(slot: i, type: type)
+            try await b.slotEnable(slot: i, sense: "hf", enabled: true)
+            try await b.emulateLoad(blocks: src.blockParams)
+            try await b.slotSave()
+            slots = try await b.slotsList()
+            lastError = nil
+        } catch { lastError = "\(error)" }
+        slotBusy = false
+    }
+
+    /// Flip the device between reader mode and tag/emulate mode. While emulating the
+    /// status monitor stops polling (a poll forces reader mode), so the toggle holds
+    /// until flipped back.
+    func toggleEmulate() async {
+        guard capabilities.emulate, !swapping, !deviceBusy else { return }
+        let target = !emulating
+        slotBusy = true
+        do {
+            try await activeBridge().emulateMode(reader: !target)
+            emulating = target
+            lastError = nil
+        } catch { lastError = "\(error)" }
+        slotBusy = false
     }
 
     // ---- file dumps --------------------------------------------------------

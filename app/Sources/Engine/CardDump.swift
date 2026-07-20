@@ -42,6 +42,27 @@ struct CardDump: Equatable, Sendable {
                         blocks: blocks, keys: keys, name: name, assumedKeys: assumed)
     }
 
+    /// Build from a Chameleon slot's HF emulator memory (emu_read). The block map is
+    /// already compact hex per block; the uid comes from block 0 (bytes 0-3) and each
+    /// sector's key from its trailer (KeyA 0-5, KeyB 10-15, all-zero = not stored), the
+    /// same recovery the raw-image loader uses. `sak` is the slot's known geometry.
+    static func fromBlocks(_ blockMap: [Int: String], sak: Int, name: String) -> CardDump {
+        let sectors = sectorsForSak(sak)
+        var uid = ""
+        if let b0 = blockMap[0], let by = Data(hexString: b0), by.count >= 4 {
+            uid = by.prefix(4).map { String(format: "%02x", $0) }.joined(separator: " ")
+        }
+        var keys: [Int: SectorKey] = [:]
+        for s in 0..<sectors {
+            guard let hex = blockMap[trailerBlock(s)], let by = Data(hexString: hex), by.count == 16 else { continue }
+            let keyA = Data(by.prefix(6)).hexCompact
+            let keyB = Data(by.suffix(6)).hexCompact
+            if keyA != "000000000000" { keys[s] = SectorKey(type: "A", hex: keyA) }
+            else if keyB != "000000000000" { keys[s] = SectorKey(type: "B", hex: keyB) }
+        }
+        return CardDump(uid: uid, sak: sak, sectorCount: sectors, blocks: blockMap, keys: keys, name: name)
+    }
+
     // ---- serialization (matches x7tool.save_mfd) ---------------------------
 
     /// Flat binary image: block index * 16 bytes; missing blocks left as zero.
