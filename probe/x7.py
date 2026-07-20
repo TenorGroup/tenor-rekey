@@ -43,18 +43,36 @@ class X7:
             "trailer": rep[total - 1],
         }
 
+    def _drain(self, limit=64):
+        """Discard any HID frames still queued from a prior timed-out command, so a
+        stale late response can never be mis-read as the next command's answer. Reads
+        non-blocking (timeout 0) until the input queue is empty; `limit` bounds it so
+        a reader that is spewing frames cannot spin here forever."""
+        for _ in range(limit):
+            if not self.dev.read(64, 0):
+                break
+
     def transceive(self, payload, reads=12, timeout=400):
+        # Flush any late frame left over from a prior op BEFORE writing, so it can
+        # never be mis-attributed to this command.
+        self._drain()
+        sent = self.seq
         self.dev.write(self.encode(payload))
         self.seq = (self.seq + 2) & 0xFFFF
-        reports = []
-        # The reader returns exactly one 64-byte response per command, so stop as
-        # soon as it arrives. `reads` bounds how many empty polls we tolerate first.
+        want = sent | 1
+        # The reader echoes the command's seq as seq|1 and answers with exactly one
+        # frame. Read past any frame whose decoded seq does not match this command (a
+        # late/stale response from a timed-out prior op) until our own answer arrives
+        # or the read window is exhausted - this keeps the request/response stream in
+        # sync so a single dropped/late frame cannot desync every later command.
         for _ in range(reads):
             r = self.dev.read(64, timeout)
-            if r:
-                reports.append(r)
-                break
-        return reports
+            if not r:
+                continue
+            dec = self.decode(r)
+            if dec and dec.get("seq") == want:
+                return [r]
+        return []
 
     def cmd(self, payload, **kw):
         """Send payload, return (decoded_first_response, raw_reports)."""

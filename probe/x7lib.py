@@ -33,20 +33,30 @@ HOT_KEYS_N = 24
 
 class _Budget:
     """Wall-clock deadline + auth counter + progress throttle for the dictionary
-    walk. `expired()` fires once the deep walk passes max_seconds, bounding an unknown
+    walk. `timed_out()` fires once the walk passes max_seconds, bounding an unknown
     card's decode (see DEFAULT_SCAN_SECONDS) so it fails fast rather than exhausting
-    the whole dictionary; dump then returns whatever was recovered so far."""
-    def __init__(self, max_seconds=DEFAULT_SCAN_SECONDS):
+    the whole dictionary; dump then returns whatever was recovered so far. An optional
+    `should_cancel` callable lets the shell abort a long op cooperatively; `expired()`
+    (the walk's stop condition) is true on EITHER the deadline or a cancel."""
+    def __init__(self, max_seconds=DEFAULT_SCAN_SECONDS, should_cancel=None):
         self.attempts = 0
         self._start = time.monotonic()
         self._deadline = self._start + max_seconds
         self._last_emit = 0.0
+        self._should_cancel = should_cancel
 
     def tick(self):
         self.attempts += 1
 
-    def expired(self):
+    def timed_out(self):
         return time.monotonic() >= self._deadline
+
+    def cancelled(self):
+        return self._should_cancel is not None and bool(self._should_cancel())
+
+    def expired(self):
+        # The walk stops on the wall-clock watchdog OR a cooperative shell cancel.
+        return self.timed_out() or self.cancelled()
 
     def elapsed(self):
         return time.monotonic() - self._start
@@ -111,7 +121,13 @@ FAST_HEAD = 64
 
 
 def sector_count(sak):
-    return 40 if sak == 0x18 else 16            # 4K vs 1K
+    """MIFARE (Classic + Plus SL2/SL3) sector count from SAK, per NXP AN10833:
+    Mini (0x09)=5, 1K (0x08/0x88/0x28)=16, 2K Classic (0x19)=32, Plus 2K SL2 (0x10)=32,
+    Plus 4K SL2 (0x11)=40, 4K (0x18/0x38)=40. Unknown SAKs default to 1K (16), the
+    safest common geometry. The 4K big-sector layout is handled by blocks_in_sector /
+    first_block / trailer_block, so only the count needs the richer mapping."""
+    return {0x09: 5, 0x08: 16, 0x88: 16, 0x28: 16,
+            0x19: 32, 0x10: 32, 0x11: 40, 0x18: 40, 0x38: 40}.get(sak, 16)
 
 
 def card_kind(sak, atqa):
@@ -195,6 +211,11 @@ class X7Card:
     def poll(self):
         """InListPassiveTarget -> dict(uid, atqa, sak) or None."""
         r = self._pt([0xD4, 0x4A, 0x01, 0x00])
+        # Did the reader answer InListPassiveTarget at all? A healthy reader with NO
+        # card still replies (d5 4b 00); total silence here means a wedged / half-
+        # dropped handle (empty reads, no OSError). The daemon reads this flag to tell
+        # "no card" apart from "reader unresponsive" and recover the dead handle.
+        self.reader_answered = len(r) >= 2 and r[1] == 0x4B
         if len(r) < 8 or r[1] != 0x4B or r[2] != 1:
             return None
         atqa, sak, uidlen = r[4:6], r[6], r[7]
@@ -206,10 +227,16 @@ class X7Card:
 
     def wait_for_card(self, tries=25):
         """Poll until a card couples (coupling can be intermittent on first contact)."""
+        answered = False
         for _ in range(tries):
-            i = self.poll()
+            i = self.poll()                     # sets self.reader_answered for THIS sub-poll
+            answered = answered or getattr(self, "reader_answered", False)
             if i:
                 return i
+        # Latch the aggregate: the reader is alive if ANY sub-poll got a valid d5 4b,
+        # even if the last one happened to time out - so a flaky-but-alive reader is
+        # not mistaken for a wedge on the last-poll value alone.
+        self.reader_answered = answered
         return None
 
     def auth(self, block, key, keytype="A", to=700):
@@ -293,7 +320,7 @@ class X7Card:
         return None
 
     def dump(self, keys=None, progress=None, on_try=None,
-             max_seconds=DEFAULT_SCAN_SECONDS):
+             max_seconds=DEFAULT_SCAN_SECONDS, should_cancel=None):
         """Dump the whole card. Returns blocks/keys/sak/uid + recovered count.
 
         `keys` is the ranked dictionary (the daemon puts the user's keys first, then
@@ -319,8 +346,9 @@ class X7Card:
         target = info["uid"]
         nsec = sector_count(info["sak"])
         blocks, skeys = {}, {}
+        assumed = {}                           # sector -> keytype whose slot was guessed
         found_keys, found_set = [], set()      # proven on THIS card, tried first
-        budget = _Budget(max_seconds)
+        budget = _Budget(max_seconds, should_cancel=should_cancel)
 
         def read_sector(s, found):
             tb = trailer_block(s)
@@ -332,6 +360,8 @@ class X7Card:
             found_keys.insert(0, k)             # promote for the remaining sectors
             other = "B" if kt == "A" else "A"
             for b in range(first_block(s), tb + 1):
+                if budget.cancelled():
+                    break
                 data = None
                 # Some access-bit configs grant a block's READ to only one key
                 # type, so if the found key type cannot read it, retry with the
@@ -350,11 +380,13 @@ class X7Card:
                     if data is not None:
                         break
                 blocks[b] = data
-            # Patch the trailer: a READ returns the used key slot as zero, so fill
-            # it with the recovered key. Also mirror that key into the OTHER slot
-            # when it too read back all-zero (unrecovered) - never leave a 000000
-            # key slot, which a trailer clone would write and could brick a sector.
-            # A slot that read back non-zero (a genuinely readable KeyB) is kept.
+            # Patch the trailer: a READ returns the AUTH key slot as zero, so fill it
+            # with the recovered key (genuine recovery). The OTHER slot is mirrored
+            # only when it too read back all-zero - never leave a 000000 key slot,
+            # which a trailer clone would write and could brick a sector - but that
+            # mirrored value is a GUESS, so flag the sector in `assumed` so a clone /
+            # emulate can surface KeyB (or KeyA) as assumed rather than as fact. A slot
+            # that read back non-zero (a genuinely readable key) is kept and not flagged.
             if blocks.get(tb) is not None:
                 t = bytearray(blocks[tb])
                 kb = bytes.fromhex(k)
@@ -362,10 +394,12 @@ class X7Card:
                     t[0:6] = kb
                     if t[10:16] == bytes(6):
                         t[10:16] = kb
+                        assumed[s] = "B"
                 else:
                     t[10:16] = kb
                     if t[0:6] == bytes(6):
                         t[0:6] = kb
+                        assumed[s] = "A"
                 blocks[tb] = bytes(t)
 
         def resolve(s, found):
@@ -380,14 +414,21 @@ class X7Card:
         # uniform card resolves entirely here (sector 0 finds the key, the rest reuse).
         hot = keys[:HOT_KEYS_N]
         for s in range(nsec):
+            if budget.cancelled():
+                break
             self.poll()
             if self.uid != target:
                 raise RuntimeError("card changed during decode")
             found = None
-            if found_keys:
-                found = self.find_key(trailer_block(s), list(found_keys), budget=None)
+            if found_keys:                                     # reuse: ALWAYS worth trying,
+                found = self.find_key(trailer_block(s),        # so never budget-gated
+                                      list(found_keys), budget=None)
             if found is None:
-                found = self.find_key(trailer_block(s), hot, budget=None)
+                # Budget-gate the hot-set sweep so an unknown card cannot overrun
+                # max_seconds inside PASS A (this used to run budget=None on every
+                # sector, uncounted and uncancellable); the deadline + cancel + attempt
+                # count now cover PASS A too.
+                found = self.find_key(trailer_block(s), hot, budget=budget)
             if found:                                          # only report resolved here;
                 resolve(s, found)                              # the rest are handled in pass B
                 if progress:
@@ -403,6 +444,8 @@ class X7Card:
         for s in range(nsec):
             if s in skeys:
                 continue
+            if budget.cancelled():
+                break
             self.poll()
             if self.uid != target:
                 raise RuntimeError("card changed during decode")
@@ -427,7 +470,8 @@ class X7Card:
         return {"uid": info["uid"], "sak": info["sak"], "atqa": info["atqa"],
                 "blocks": blocks, "keys": skeys, "sectors": nsec,
                 "recovered": recovered, "attempts": budget.attempts,
-                "exhausted": budget.expired()}
+                "exhausted": budget.timed_out(), "cancelled": budget.cancelled(),
+                "assumed_keys": assumed}
 
     def read_ntag(self, max_pages=240):
         """Dump an NTAG21x / Ultralight (SAK 0x00). Returns dict page->4 bytes.

@@ -11,12 +11,16 @@ have their own self-tests, invoked here too.
 
 Exit code 0 = all passed.
 """
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
+import x7
 import x7d
 import x7lib
 import learned_keys
@@ -720,6 +724,346 @@ def test_daemon_learned_cache():
             pass
 
 
+# --------------------------------------------------------------------------
+# 12. x7.transceive: drain stale input + seq-match so one late/dropped frame
+#     cannot desync every later command (finding #5).
+# --------------------------------------------------------------------------
+class _FakeHID:
+    """Scriptable stand-in for x7hid.Device. `stale` frames are already queued in the
+    input buffer before any write (leftovers from a timed-out prior op); frames set in
+    `on_write` are appended to the buffer when write() runs, modelling THIS command's
+    real (possibly late) response arriving during the read window."""
+    def __init__(self, stale=()):
+        self.buf = list(stale)
+        self.on_write = []
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+        self.buf.extend(self.on_write)
+        self.on_write = []
+        return len(data)
+
+    def read(self, size=64, timeout_ms=300):
+        return self.buf.pop(0) if self.buf else b""
+
+    def close(self):
+        pass
+
+
+def _resp(seq, payload=b"\xd5\x4b\x00"):
+    """Build a 64-byte device RESPONSE envelope (02|total|seq16|payload|cksum|FD)."""
+    body = bytes([0x02, len(payload) + 6, seq & 0xFF, (seq >> 8) & 0xFF]) + payload
+    body += bytes([(~sum(body)) & 0xFF, 0xFD])
+    return (body + bytes(64))[:64]
+
+
+def _mk_x7(hid):
+    x = x7.X7.__new__(x7.X7)        # bypass __init__ (no real device open)
+    x.dev = hid
+    x.seq = 0
+    return x
+
+
+def test_transceive_seq_sync():
+    # (1) a stale frame left in the buffer by a timed-out prior op is DRAINED before
+    #     the write, so this command reads its own seq-matched answer, not the stale
+    #     one. seq starts at 2 (as if one command already ran) -> want = 2|1 = 3.
+    x = _mk_x7(_FakeHID(stale=[_resp(1)]))     # leftover echo of command #1 (seq 1)
+    x.seq = 2
+    x.dev.on_write = [_resp(3)]                 # command #2's real answer (seq 3)
+    reps = x.transceive([0xD4, 0x4A, 0x01, 0x00])
+    dec = x7.X7.decode(reps[0]) if reps else None
+    check("transceive drains a stale prior-op frame before reading its own answer",
+          dec is not None and dec["seq"] == 3, repr(dec))
+
+    # (2) a wrong-seq frame arriving DURING the read window (not drained) is skipped;
+    #     transceive keeps reading until the seq matches.
+    x2 = _mk_x7(_FakeHID())
+    x2.seq = 2
+    x2.dev.on_write = [_resp(1), _resp(3)]      # a late leftover (seq 1) then our answer
+    reps2 = x2.transceive([0xD4, 0x4A, 0x01, 0x00], reads=8)
+    dec2 = x7.X7.decode(reps2[0]) if reps2 else None
+    check("transceive skips a wrong-seq frame and accepts its seq-matched answer",
+          dec2 is not None and dec2["seq"] == 3, repr(dec2))
+
+    # (3) no regression: a clean single seq-matched response is returned as-is.
+    x3 = _mk_x7(_FakeHID())
+    x3.dev.on_write = [_resp(1)]                 # first command: want = 0|1 = 1
+    reps3 = x3.transceive([0xD4, 0x4A])
+    check("transceive returns a clean seq-matched frame (no regression)",
+          bool(reps3) and x7.X7.decode(reps3[0])["seq"] == 1, repr(reps3))
+
+    # (4) a silent reader returns empty (no hang, no stale frame mis-accepted).
+    x4 = _mk_x7(_FakeHID())
+    check("transceive returns empty when the reader is silent",
+          x4.transceive([0xD4, 0x4A], reads=3, timeout=1) == [])
+
+
+# --------------------------------------------------------------------------
+# 13. decode NTAG guard: a non-Classic card never enters the dict walk (#6).
+# --------------------------------------------------------------------------
+def test_decode_ntag_guard():
+    class NtagFake(FakeCard):
+        def __init__(self, **kw):
+            super().__init__(sak=0x00, **kw)
+            self.dumped = False
+        def _info(self):
+            return {"uid": self.uid, "atqa": b"\x00\x44", "sak": 0x00}   # genuine NTAG
+        def dump(self, *a, **k):
+            self.dumped = True
+            return x7lib.X7Card.dump(self, *a, **k)
+    c = NtagFake(ntag={0: b"\x04\x11\x22\x33", 1: b"\xaa\xbb\xcc\xdd"})
+    d = daemon_with(c); d.emit = lambda o: None
+    r = d.decode({})
+    check("decode routes an NTAG to the page reader, not the Classic dict walk",
+          r.get("kind") == "ntag" and "pages" in r and not c.dumped, str(r)[:120])
+
+
+# --------------------------------------------------------------------------
+# 14. poll wedge detection: empty-read wedge drops the handle (#7).
+# --------------------------------------------------------------------------
+def test_poll_wedge_detection():
+    # Cards stub only poll() (per sub-poll), so the REAL wait_for_card aggregation is
+    # exercised - `pattern(n)` says whether sub-poll n got a valid d5 4b response.
+    class Reader(x7lib.X7Card):
+        def __init__(self, pattern):
+            self.uid = None; self._n = 0; self._pat = pattern; self.closed = False
+        def poll(self):
+            self.reader_answered = self._pat(self._n)   # mirror what the real poll() sets
+            self._n += 1
+            return None                                 # never couples (we test the alive signal)
+        def close(self):
+            self.closed = True
+
+    # (a) a true wedge: NO sub-poll ever answers -> dropped + reader:false at threshold.
+    wedged = Reader(lambda n: False)
+    dw = daemon_with(wedged)
+    rw = [dw.poll({"tries": 8}) for _ in range(x7d.Daemon.WEDGE_THRESHOLD)]
+    check("an empty-read wedge is detected and drops the handle (reader:false)",
+          rw[-1] == {"present": False, "reader": False} and wedged.closed, str(rw))
+
+    # (b) a healthy reader that answers every no-card sub-poll is never wedged.
+    healthy = Reader(lambda n: True)
+    dh = daemon_with(healthy)
+    rh = [dh.poll({"tries": 8}) for _ in range(x7d.Daemon.WEDGE_THRESHOLD + 1)]
+    check("a healthy no-card reader stays reader:true (no wedge false-positive)",
+          all(x == {"present": False, "reader": True} for x in rh) and not healthy.closed,
+          str(rh[-1]))
+
+    # (c) F4: a flaky-but-alive reader answers 7 of every 8 sub-polls and only times out
+    #     on the LAST - the aggregate must latch alive, so it is NOT declared wedged.
+    flaky = Reader(lambda n: (n % 8) != 7)          # sub-poll index 7 (the 8th) is silent
+    df = daemon_with(flaky)
+    rf = [df.poll({"tries": 8}) for _ in range(x7d.Daemon.WEDGE_THRESHOLD + 1)]
+    check("a flaky-but-alive reader (answers on early sub-polls) is not wedged",
+          all(x == {"present": False, "reader": True} for x in rf) and not flaky.closed,
+          str(rf))
+
+
+# --------------------------------------------------------------------------
+# 15. cooperative cancel: long ops stop early + return partial (#14).
+# --------------------------------------------------------------------------
+def test_dump_cancel():
+    BIG = ["%012x" % i for i in range(17000)]
+    class Walk(FakeCard):
+        def find_key(self, block, keys=DEFAULT_KEYS, budget=None, on_progress=None):
+            return x7lib.X7Card.find_key(self, block, keys, budget, on_progress)
+        def auth(self, block, key, keytype="A", to=700):
+            return FakeCard.auth(self, block, key, keytype, to)
+    c = Walk(keymap={s: None for s in range(16)})   # all-unknown: would walk every sector
+    calls = [0]
+    def should_cancel():
+        calls[0] += 1
+        return calls[0] > 500      # trip the cancel a few hundred auth-checks in
+    d = c.dump(keys=BIG, max_seconds=999, should_cancel=should_cancel)
+    check("dump honours a cooperative cancel and returns partial",
+          d.get("cancelled") is True and d["recovered"] == 0
+          and d["attempts"] < 17000 and d["exhausted"] is False,
+          str((d.get("cancelled"), d["recovered"], d["attempts"], d["exhausted"])))
+
+
+def test_run_cancel_routing():
+    # run() must handle `cancel` INLINE (off the worker), answering it even while the
+    # worker is busy, and still process the queued op. (The abort flag itself is not
+    # asserted here: EOF also sets it, so is_set() would be tautological - we assert the
+    # cancel REQUEST was answered instead.)
+    c = FakeCard()
+    d = daemon_with(c)
+    out = []
+    d.emit = lambda o: out.append(o)
+    d.run(io.StringIO('{"id": 1, "method": "poll", "params": {"tries": 1}}\n'
+                      '{"id": 2, "method": "cancel"}\n'))
+    ans = {o.get("id"): o for o in out if "id" in o}
+    check("run answers a queued op and an inline cancel",
+          1 in ans and ans.get(2, {}).get("result", {}).get("cancelled") is True, str(out))
+
+
+class _GatedLines:
+    """A stdin stand-in that yields `lines`, then blocks at EOF until `gate` is set - so
+    a test can let a queued op finish before run()'s EOF cancel+shutdown fires."""
+    def __init__(self, lines, gate):
+        self._it = iter(lines)
+        self._gate = gate
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            self._gate.wait(2)
+            raise
+
+
+def test_cancel_before_worker_starts():
+    # F1: a cancel delivered AFTER an op is dispatched but BEFORE the worker starts it
+    # must still cancel that op. The op body must NOT clear an already-delivered cancel
+    # (it used to clear at entry, dropping it). Simulate the ordering directly: arm the
+    # window (dispatch clears), deliver the cancel, THEN run the op - it returns partial.
+    c = FakeCard(keymap={s: ("A", "ffffffffffff") for s in range(16)})
+    d = daemon_with(c); d.emit = lambda o: None
+    d._cancel.clear()               # dispatch arms a fresh window
+    d._cancel.set()                 # cancel lands before the worker starts the op
+    r = d.decode({})                # worker starts the op
+    check("a cancel delivered before the op starts is honoured (op returns cancelled)",
+          r.get("cancelled") is True and r["recovered"] == 0,
+          str((r.get("cancelled"), r["recovered"])))
+
+
+def test_dispatch_clears_stale_cancel():
+    # F1: dispatch (queuing) a cancellable op arms a FRESH cancel window, so a stale
+    # cancel left set by a prior op does not leak into the next one. The op body no
+    # longer clears, so WITHOUT the dispatch-clear this decode would wrongly cancel.
+    # The gated stream holds EOF (whose own cancel would confound this) until the decode
+    # has already finished.
+    done = threading.Event()
+    c = FakeCard(keymap={s: ("A", "ffffffffffff") for s in range(16)})
+    d = daemon_with(c)
+    out = []
+    def emit(o):
+        out.append(o)
+        if o.get("id") == 1:
+            done.set()              # release EOF only AFTER the decode has completed
+    d.emit = emit
+    d._cancel.set()                 # a stale cancel left over from a prior op
+    d.run(_GatedLines(['{"id": 1, "method": "decode"}\n'], done))
+    dec = next((o for o in out if o.get("id") == 1), None)
+    check("dispatch arms a fresh cancel window (a stale cancel does not leak in)",
+          dec is not None and dec["result"]["recovered"] == 16
+          and not dec["result"].get("cancelled"), str(dec))
+
+
+def test_eof_joins_worker_before_close():
+    # F5: on stdin EOF, run() must signal cancel and JOIN the in-flight worker BEFORE
+    # closing the reader handle, so close() never races a HID read still in flight. The
+    # op blocks until the EOF handler cancels it; we assert the op finished (order) and
+    # the handle was closed only after the worker stopped.
+    order = []
+    class BlockingDump(FakeCard):
+        def dump(self, *a, **k):
+            sc = k.get("should_cancel")
+            for _ in range(1000):               # block until EOF's cancel fires (bounded)
+                if sc and sc():
+                    break
+                time.sleep(0.005)
+            order.append("op_done")
+            return x7lib.X7Card.dump(self, *a, **k)
+        def close(self):
+            order.append("closed")
+            super().close()
+    c = BlockingDump(keymap={0: ("A", "ffffffffffff")})
+    d = daemon_with(c)
+    out = []
+    d.emit = lambda o: out.append(o)
+    d.run(io.StringIO('{"id": 1, "method": "decode"}\n'))   # one op, then EOF
+    dec = next((o for o in out if o.get("id") == 1), None)
+    check("EOF cancels the in-flight op and joins the worker before closing the handle",
+          dec is not None and order == ["op_done", "closed"] and c.closed, str((order, dec is not None)))
+
+
+# --------------------------------------------------------------------------
+# 16. write_mfd retries a key after a transient auth miss (#15).
+# --------------------------------------------------------------------------
+def test_write_transient_auth_retry():
+    class FlakyAuth(FakeCard):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.hits = 0
+        def auth(self, block, key, keytype="A", to=700):
+            kh = key if isinstance(key, str) else key.hex()
+            if kh == "a0b1c2d3e4f5" and keytype == "A":
+                self.hits += 1
+                return self.hits > 1        # first auth blips, later ones succeed
+            return False                    # non-magic target: FF never auths
+    c = FlakyAuth(keymap={0: ("A", "a0b1c2d3e4f5")})
+    d = daemon_with(c); d.emit = lambda o: None
+    res = d.write_mfd({"blocks": {"1": "00" * 16},
+                       "keys": {"0": ["A", "a0b1c2d3e4f5"]},
+                       "trailers": False, "uid": False})
+    check("write_mfd retries a key after a transient auth miss (not straight to FF)",
+          res["wrote"] == 1 and res["failed"] == [], str(res))
+
+
+# --------------------------------------------------------------------------
+# 17. PASS A honours the wall-clock budget (#16).
+# --------------------------------------------------------------------------
+def test_dump_passA_budget():
+    BIG = ["%012x" % i for i in range(17000)]
+    class Walk(FakeCard):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.auth_count = 0
+        def find_key(self, block, keys=DEFAULT_KEYS, budget=None, on_progress=None):
+            return x7lib.X7Card.find_key(self, block, keys, budget, on_progress)
+        def auth(self, block, key, keytype="A", to=700):
+            self.auth_count += 1
+            return FakeCard.auth(self, block, key, keytype, to)
+    c = Walk(keymap={s: None for s in range(16)})
+    d = c.dump(keys=BIG, max_seconds=-1)         # deadline already in the past
+    check("PASS A honours the wall-clock budget (no hot-sweep auths past the deadline)",
+          c.auth_count == 0 and d["exhausted"] is True and d["recovered"] == 0,
+          "auth_count=%d exhausted=%s" % (c.auth_count, d["exhausted"]))
+
+
+# --------------------------------------------------------------------------
+# 18. KeyB provenance: a mirrored KeyB is flagged assumed, not recovered (#20).
+# --------------------------------------------------------------------------
+def test_dump_keyb_provenance():
+    c = FakeCard(keymap={0: ("A", "aabbccddeeff")})     # trailer reads back all-zero
+    d = daemon_with(c); d.emit = lambda o: None
+    r = d.decode({})
+    check("decode flags an assumed (mirrored) KeyB, not presenting it as recovered",
+          r.get("assumed_keys", {}).get("0") == "B", str(r.get("assumed_keys")))
+
+    genuine = bytes.fromhex("a0b1c2d3e4f5" + "ff078069" + "cafebabe0011")
+    c2 = FakeCard(keymap={0: ("A", "aabbccddeeff")}, data={3: genuine})
+    d2 = daemon_with(c2); d2.emit = lambda o: None
+    r2 = d2.decode({})
+    check("decode does not flag a genuinely-read KeyB as assumed",
+          "0" not in r2.get("assumed_keys", {}), str(r2.get("assumed_keys")))
+
+
+# --------------------------------------------------------------------------
+# 19. sector_count geometry: Mini + other Classic SAKs sized correctly (#21).
+# --------------------------------------------------------------------------
+def test_sector_count_geometry():
+    check("sector_count: Mini (SAK 0x09) = 5 sectors", sector_count(0x09) == 5)
+    check("sector_count: 1K (SAK 0x08) = 16 sectors", sector_count(0x08) == 16)
+    check("sector_count: 1K variant (SAK 0x88) = 16 sectors", sector_count(0x88) == 16)
+    check("sector_count: 2K Classic (SAK 0x19) = 32 sectors", sector_count(0x19) == 32)
+    check("sector_count: Plus 2K SL2 (SAK 0x10) = 32 sectors", sector_count(0x10) == 32)
+    check("sector_count: Plus 4K SL2 (SAK 0x11) = 40 sectors", sector_count(0x11) == 40)
+    check("sector_count: 4K (SAK 0x18) = 40 sectors", sector_count(0x18) == 40)
+    check("sector_count: unknown SAK defaults to 1K (16)", sector_count(0x99) == 16)
+    c = FakeCard(sak=0x09, keymap={s: ("A", "ffffffffffff") for s in range(5)})
+    d = daemon_with(c); d.emit = lambda o: None
+    r = d.decode({})
+    check("decode of a Mini scans exactly 5 sectors (no phantom 6-15)",
+          r["sectors"] == 5 and r["recovered"] == 5, str((r["sectors"], r["recovered"])))
+
+
 if __name__ == "__main__":
     test_find_key_sweep()
     test_dump_reuse_and_budget()
@@ -741,6 +1085,18 @@ if __name__ == "__main__":
     test_apdu_parse()
     test_learned_keys()
     test_daemon_learned_cache()
+    test_transceive_seq_sync()
+    test_decode_ntag_guard()
+    test_poll_wedge_detection()
+    test_dump_cancel()
+    test_run_cancel_routing()
+    test_cancel_before_worker_starts()
+    test_dispatch_clears_stale_cancel()
+    test_eof_joins_worker_before_close()
+    test_write_transient_auth_retry()
+    test_dump_passA_budget()
+    test_dump_keyb_provenance()
+    test_sector_count_geometry()
     test_subprocess_selftests()
     # Chameleon Ultra daemon (chameleon_d) - hardware-free, FakeChameleon-driven.
     for t in test_chameleon.TESTS:

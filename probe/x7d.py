@@ -17,6 +17,8 @@ Hex is lowercase space-separated ("01 02 03 04"); keys are 12-char hex.
 """
 import sys
 import json
+import queue
+import threading
 from x7 import X7, hx
 from x7lib import (X7Card, trailer_block, first_block, sector_count, card_kind,
                    access_bits_valid, trailer_locks_keys, DEFAULT_KEYS, BUILTIN_KEYS,
@@ -45,14 +47,26 @@ def _sector_of(b):
 
 class Daemon:
     METHODS = ("info", "poll", "decode", "read_ntag", "apdu", "write_mfd",
-               "format", "nested_recover", "keys_default", "keys_builtin_count",
-               "learned_stats", "learned_clear")
+               "format", "nested_recover", "cancel", "keys_default",
+               "keys_builtin_count", "learned_stats", "learned_clear")
+
+    # Consecutive status polls where the reader answered NOTHING (empty reads, no
+    # OSError) before the handle is treated as wedged and dropped for a clean re-open.
+    WEDGE_THRESHOLD = 3
+
+    # Long ops whose cancel window is armed (the flag cleared) at DISPATCH, not inside
+    # the op body - so a cancel delivered after dispatch but before the worker starts
+    # the op still targets it, and a stale cancel from a prior op cannot leak in.
+    CANCELLABLE = ("decode", "write_mfd", "format")
 
     def __init__(self, learned=None):
         self.card = None
         # Verified-key reranker: keys that authed live on real cards are tried
         # ahead of the static dictionary on later decodes. Injectable for tests.
         self.learned = learned if learned is not None else LearnedKeyCache()
+        self._cancel = threading.Event()       # cooperative abort for long ops
+        self._no_answer = 0                    # consecutive unresponsive status polls
+        self._emit_lock = threading.Lock()     # serialize stdout across worker + reader
 
     def _open(self):
         """Open + RF-init the reader once; reuse across commands (start
@@ -74,8 +88,9 @@ class Daemon:
             self.card = None
 
     def emit(self, obj):
-        sys.stdout.write(json.dumps(obj) + "\n")
-        sys.stdout.flush()
+        with self._emit_lock:
+            sys.stdout.write(json.dumps(obj) + "\n")
+            sys.stdout.flush()
 
     # ---- methods -----------------------------------------------------------
 
@@ -102,12 +117,27 @@ class Daemon:
             i = c.wait_for_card(tries=tries)
         except OSError:
             self._drop()
+            self._no_answer = 0
             return {"present": False, "reader": False}
-        if not i:
+        if i:
+            self._no_answer = 0
+            return {"present": True, "reader": True, "uid": hx(i["uid"]),
+                    "atqa": hx(i["atqa"]), "sak": i["sak"],
+                    "kind": card_kind(i["sak"], i["atqa"])}
+        # No card. Distinguish a healthy reader with nothing on it (InListPassiveTarget
+        # still answered) from a wedged / half-dropped handle whose reads come back
+        # empty with NO OSError - the latter would otherwise report reader:True forever
+        # while every op silently no-ops, recoverable only by a replug. Only a run of
+        # answer-less polls counts as a wedge, so a normal no-card poll never trips it.
+        if getattr(c, "reader_answered", True):
+            self._no_answer = 0
             return {"present": False, "reader": True}
-        return {"present": True, "reader": True, "uid": hx(i["uid"]),
-                "atqa": hx(i["atqa"]), "sak": i["sak"],
-                "kind": card_kind(i["sak"], i["atqa"])}
+        self._no_answer += 1
+        if self._no_answer >= self.WEDGE_THRESHOLD:
+            self._drop()
+            self._no_answer = 0
+            return {"present": False, "reader": False}
+        return {"present": False, "reader": True}
 
     def keys_default(self, p):
         """The small in-binary fast-path key list (legacy; the full dictionary is
@@ -130,6 +160,16 @@ class Daemon:
 
     def decode(self, p):
         c = self._open()
+        # Guard a non-Classic card out of the crypto1 dictionary walk: an NTAG /
+        # Ultralight (SAK 0x00, ATQA 0x0044) can never crypto1-auth, so dump() would
+        # grind the whole dictionary to the watchdog (~90s) and return empty. Route it
+        # to the page reader instead. A Classic card, or no card, falls through: dump()
+        # re-polls and either dumps or raises the no-card error the UI already handles.
+        i = c.wait_for_card()
+        if i and card_kind(i["sak"], i["atqa"]) == "ntag":
+            out = self.read_ntag(p)
+            out["kind"] = "ntag"
+            return out
         # Key order tried: the USER's editable keys first, then keys learned from
         # real cards (recency/frequency ranked), then the big curated dictionary.
         # The app never sees the learned cache or the dictionary; both live here.
@@ -157,7 +197,8 @@ class Daemon:
             self.emit({"event": "progress", "method": "decode", "sector": s,
                        "total": None, "attempts": attempts, "walk_total": walk_total,
                        "phase": phase})
-        d = c.dump(keys=keys, progress=prog, on_try=on_try, max_seconds=max_seconds)
+        d = c.dump(keys=keys, progress=prog, on_try=on_try, max_seconds=max_seconds,
+                   should_cancel=self._cancel.is_set)
         blocks = {str(b): (hx(v) if v else None) for b, v in d["blocks"].items()}
         keys_out = {str(s): ([k[0], k[1]] if k else None) for s, k in d["keys"].items()}
         # Learn the keys that authed live on this card so later decodes try them
@@ -171,6 +212,8 @@ class Daemon:
         return {"uid": hx(d["uid"]), "atqa": hx(d["atqa"]), "sak": d["sak"],
                 "sectors": d["sectors"], "recovered": d["recovered"],
                 "attempts": d["attempts"], "exhausted": d["exhausted"],
+                "cancelled": d.get("cancelled", False),
+                "assumed_keys": {str(s): kt for s, kt in d.get("assumed_keys", {}).items()},
                 "blocks": blocks, "keys": keys_out}
 
     def read_ntag(self, p):
@@ -223,8 +266,11 @@ class Daemon:
             else:
                 fail.append(int(b))
         keys = {int(s): v for s, v in (p.get("keys") or {}).items()}
-        ok, swapped = 0, False
+        ok, swapped, cancelled = 0, False, False
         for b in sorted(blocks):
+            if self._cancel.is_set():          # cooperative abort: stop, keep the partial
+                cancelled = True
+                break
             if b == 0 and not p.get("uid"):
                 continue
             s = _sector_of(b)
@@ -275,7 +321,9 @@ class Daemon:
                         swapped = True
                         break
                     if not c.auth(trailer_block(s), kk, kt):
-                        break
+                        continue               # transient auth miss: re-poll and retry the
+                                               # SAME key instead of abandoning it (a blip
+                                               # would otherwise fall through to FF and fail)
                     if c.write_block(b, data):
                         wrote = True
                         break
@@ -291,7 +339,10 @@ class Daemon:
         if swapped:
             return {"present": True, "wrote": ok, "failed": fail,
                     "error": "card changed during write"}
-        return {"present": True, "wrote": ok, "failed": fail}
+        out = {"present": True, "wrote": ok, "failed": fail}
+        if cancelled:
+            out["cancelled"] = True
+        return out
 
     def format(self, p):
         """Reset a MIFARE Classic to factory: zero every data block and write the
@@ -310,8 +361,11 @@ class Daemon:
                     "error": "the card on the reader is not the one shown"}
         keys = {int(s): v for s, v in (p.get("keys") or {}).items()}
         zero = bytes(16)
-        ok, fail, swapped = 0, [], False
+        ok, fail, swapped, cancelled = 0, [], False, False
         for s in range(sector_count(i["sak"])):
+            if self._cancel.is_set():          # cooperative abort: stop, keep the partial
+                cancelled = True
+                break
             tb = trailer_block(s)
             k = keys.get(s)
             kk = k[1] if k else "ffffffffffff"
@@ -346,7 +400,10 @@ class Daemon:
         if swapped:
             return {"present": True, "formatted": ok, "failed": fail,
                     "error": "card changed during format"}
-        return {"present": True, "formatted": ok, "failed": fail}
+        out = {"present": True, "formatted": ok, "failed": fail}
+        if cancelled:
+            out["cancelled"] = True
+        return out
 
     def nested_recover(self, p):
         """params: known_blk, known_key, target_blk, known_kt, target_kt,
@@ -366,6 +423,14 @@ class Daemon:
             on_progress=prog)
         return {"key": key, "target_blk": p["target_blk"]}
 
+    def cancel(self, p):
+        """Cooperative abort: trip a flag the long decode/write/format loops check so
+        the shell can stop a stuck or long op WITHOUT killing the daemon. The op then
+        returns whatever partial result it had gathered. Handled inline by run() (off
+        the worker) so it lands while the op is still running."""
+        self._cancel.set()
+        return {"cancelled": True}
+
     # ---- dispatch ----------------------------------------------------------
 
     def handle(self, req):
@@ -384,8 +449,26 @@ class Daemon:
         except Exception as e:
             return {"id": rid, "error": "%s: %s" % (type(e).__name__, e)}
 
-    def run(self):
-        for line in sys.stdin:
+    def run(self, stream=None):
+        # A worker thread executes requests one at a time (the reader is strictly
+        # sequential, so ops never overlap) while THIS thread keeps reading stdin.
+        # A `cancel` arriving mid-op is handled inline - off the worker - so it trips
+        # the flag the long loops watch and the shell can abort without killing the
+        # daemon; every other request is serialized on the worker.
+        if stream is None:
+            stream = sys.stdin
+        q = queue.Queue()
+
+        def worker():
+            while True:
+                req = q.get()
+                if req is None:
+                    return
+                self.emit(self.handle(req))
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        for line in stream:
             line = line.strip()
             if not line:
                 continue
@@ -394,8 +477,25 @@ class Daemon:
             except ValueError as e:
                 self.emit({"error": "bad json: %s" % e})
                 continue
-            self.emit(self.handle(req))
-        if self.card:
+            method = req.get("method")
+            if method == "cancel":
+                self.emit(self.handle(req))
+            else:
+                if method in self.CANCELLABLE:
+                    # Arm a fresh cancel window for THIS op at dispatch, BEFORE any
+                    # later cancel line is read - so a cancel that lands before the
+                    # worker starts the op still cancels it, and a stale cancel from a
+                    # prior op cannot leak in. The op body never clears the flag.
+                    self._cancel.clear()
+                q.put(req)
+        # EOF: abort any in-flight op so the worker can exit, then JOIN it (bounded)
+        # BEFORE closing the reader handle - closing while a worker HID read is still
+        # in flight would race the device. Only close once the worker has actually
+        # stopped; otherwise leave the handle to be reclaimed on process exit.
+        self._cancel.set()
+        q.put(None)
+        t.join(timeout=5)
+        if not t.is_alive() and self.card:
             self.card.close()
 
 
