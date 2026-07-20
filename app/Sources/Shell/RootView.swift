@@ -218,14 +218,15 @@ private struct ActionBar: View {
                 let willShow = !model.showLibrary
                 withAnimation(.easeInOut(duration: 0.2)) {
                     model.showLibrary = willShow
-                    if willShow { model.showSlots = false }
+                    if willShow { model.showSlots = false; model.showLF = false }
                 }
                 if willShow { model.refreshSavedCards() }
             }
             // Chameleon-only verbs, gated on the connected device's capabilities: the
             // slot library, the reader<->emulate toggle, and loading the working
             // document into a slot for emulation. A plain reader (X7) shows none of them.
-            if model.capabilities.slots > 0 || model.capabilities.emulate || model.capabilities.dfu {
+            if model.capabilities.slots > 0 || model.capabilities.emulate
+                || model.capabilities.lf || model.capabilities.dfu {
                 Rectangle().fill(theme.p.hairline).frame(width: 1, height: 18).padding(.horizontal, 3)
             }
             if model.capabilities.slots > 0 {
@@ -234,9 +235,22 @@ private struct ActionBar: View {
                     let willShow = !model.showSlots
                     withAnimation(.easeInOut(duration: 0.2)) {
                         model.showSlots = willShow
-                        if willShow { model.showLibrary = false }
+                        if willShow { model.showLibrary = false; model.showLF = false }
                     }
                     if willShow { Task { await model.loadSlots() } }
+                }
+            }
+            // LF (125 kHz) panel, gated on the device advertising lf: read an LF tag,
+            // clone it to a T5577, or load an EM410x id into a slot to emulate. A plain
+            // reader (X7, lf:false) never shows it.
+            if model.capabilities.lf {
+                ActionButton(title: "LF", icon: "wifi", on: model.showLF,
+                             enabled: !model.lfBusy, help: l.t("lf_hint")) {
+                    let willShow = !model.showLF
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        model.showLF = willShow
+                        if willShow { model.showSlots = false; model.showLibrary = false }
+                    }
                 }
             }
             if model.capabilities.emulate {
@@ -387,6 +401,10 @@ private struct CanvasView: View {
                 // Chameleon-only slot library, opened from the action bar. The single
                 // document flow (below) is untouched; this is a separate detail area.
                 SlotLibraryView()
+            } else if model.showLF && model.capabilities.lf {
+                // Chameleon-only LF (125 kHz) panel: read / T5577 write / EM410x emulate.
+                // Another mutually-exclusive detail area; the document flow is untouched.
+                LFPanel()
             } else if !model.sectors.isEmpty || !model.pages.isEmpty {
                 // A document is loaded (decoding, decoded, or an NTAG page dump): show
                 // it. It persists across card swaps, so the working image never

@@ -79,20 +79,64 @@ struct SlotNickResult: Codable, Sendable {
 
 /// A selectable emulated tag type for the slot library's type picker. `name` is the
 /// TagSpecificType enum name the daemon accepts; `label` is the shown text (kept
-/// verbatim, not localised - these are product type names).
+/// verbatim, not localised - these are product type names); `sense` is the slot field
+/// the type lives in ("hf" / "lf"), so the picker wires enable/emulate to the right one.
 struct SlotTagType: Identifiable, Equatable {
     let name: String
     let label: String
+    var sense: String = "hf"
     var id: String { name }
 
-    /// The curated set offered in the UI: HF types only. The slot library's actions
-    /// (enable/disable, set-type, open-content) are wired to the HF field, so an LF type
-    /// (EM410X etc.) is intentionally excluded here - LF is later scope.
-    static let selectable: [SlotTagType] = [
+    /// The HF types offered in the slot library's type picker.
+    static let hf: [SlotTagType] = [
         SlotTagType(name: "MIFARE_1024", label: "MIFARE Classic 1K"),
         SlotTagType(name: "MIFARE_4096", label: "MIFARE Classic 4K"),
         SlotTagType(name: "MIFARE_Mini", label: "MIFARE Mini"),
         SlotTagType(name: "NTAG_215", label: "NTAG 215"),
         SlotTagType(name: "NTAG_216", label: "NTAG 216"),
     ]
+
+    /// The LF types offered for a slot's LF field. EM410x-only in v1 (LF emulate is scoped
+    /// to EM410x); the daemon can set other LF types but only this one is surfaced.
+    static let lf: [SlotTagType] = [
+        SlotTagType(name: "EM410X", label: "EM410X", sense: "lf"),
+    ]
+
+    /// The HF list, kept under its original name so the HF picker call sites are unchanged.
+    static var selectable: [SlotTagType] { hf }
+    /// HF + LF, for resolving a type name to its friendly label regardless of frequency.
+    static var all: [SlotTagType] { hf + lf }
+}
+
+/// lf_scan result: the LF (125 kHz) tag on the reader. `kind` is "em410x" / "hidprox";
+/// `id` is the hex id (echoed back to lf_write / lf_emu). For HID Prox the human fields
+/// (format, fc, cn, il, oem) are populated; for EM410x `tagType` names the variant.
+struct LfScanResult: Codable, Sendable, Equatable {
+    let present: Bool
+    let kind: String?
+    let id: String?
+    let tagType: String?          // em410x: the TagSpecificType name (EM410X / EM410X_ELECTRA)
+    let format: Int?              // hidprox: the raw HID format value
+    let formatName: String?       // hidprox: the HID format enum name (e.g. H10301)
+    let fc: Int?                  // hidprox: facility code
+    let cn: Int?                  // hidprox: card number
+    let il: Int?                  // hidprox: issue level
+    let oem: Int?                 // hidprox: OEM code
+}
+
+/// lf_write result: whether the id was written to the T5577 blank, and whether a read-back
+/// verified it (best-effort - a blank T5577 has no stable identity to pin before writing).
+/// `note` carries the reason when a write is unverified (read-back mismatch / no tag).
+struct LfWriteResult: Codable, Sendable {
+    let wrote: Bool
+    let kind: String?
+    let id: String?
+    let verified: Bool?
+    let note: String?
+}
+
+/// lf_emu result: the active slot's EM410x emulation id was set.
+struct LfEmuResult: Codable, Sendable {
+    let loaded: Bool
+    let id: String?
 }

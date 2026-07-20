@@ -67,6 +67,17 @@ final class AppModel {
     /// The Chameleon-only slot library is showing instead of the document canvas.
     var showSlots = false
 
+    // ---- LF 125 kHz (Chameleon-only, gated on capabilities.lf) -------------
+    /// The LF panel (read / T5577 write / EM410x emulate) is showing instead of the
+    /// document canvas. A Chameleon-only detail area, so it drops on a device swap.
+    var showLF = false
+    /// The last LF read (em410x / hidprox tag on the reader), shown in the LF panel.
+    var lfScanResult: LfScanResult?
+    /// The last LF T5577 write outcome (wrote + verified), shown in the LF panel.
+    var lfWriteResult: LfWriteResult?
+    /// An LF op (read / write / emulate) owns the reader. Folded into `deviceBusy`.
+    var lfBusy = false
+
     // ---- saved-cards library (device-agnostic) -----------------------------
     /// The persistent library of saved card dumps, refreshed when the library view opens
     /// and after any save / import / rename / delete.
@@ -120,7 +131,7 @@ final class AppModel {
     /// A device op already owns the reader. Reconnect / swap must not replace the
     /// bridge under one, and a second op must not start while one runs. Slot ops are
     /// included so a slot edit and a decode / clone can never overlap on the reader.
-    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy || slotBusy || flashing }
+    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy || slotBusy || flashing || lfBusy }
 
     /// The active bridge, created lazily for the current descriptor. A prior bridge
     /// for a different device is torn down explicitly on the swap path (which nils
@@ -295,6 +306,9 @@ final class AppModel {
         slots = []
         selectedSlot = nil
         showSlots = false
+        showLF = false
+        lfScanResult = nil
+        lfWriteResult = nil
         emulating = false
         dfuStatus = nil
         // A failed flash usually leaves the device in the bootloader, which triggers a
@@ -956,6 +970,65 @@ final class AppModel {
             lastError = nil
         } catch { lastError = "\(error)" }
         slotBusy = false
+    }
+
+    // ---- LF 125 kHz (Chameleon-only, gated on capabilities.lf) -------------
+
+    /// Read the LF (125 kHz) tag on the reader (em410x, then hidprox). A reader op, so it
+    /// is refused while emulating (a reader op would force the device out of tag mode).
+    func lfScan() async {
+        guard capabilities.lf, !swapping, !deviceBusy, !emulating else { return }
+        lfBusy = true
+        lfWriteResult = nil
+        lastError = nil
+        do { lfScanResult = try await activeBridge().lfScan(); lastError = nil }
+        catch { lastError = "\(error)" }
+        lfBusy = false
+    }
+
+    /// Write an LF id onto a blank T5577 on the reader (the LF clone). Destructive - the LF
+    /// panel gates it behind a confirm. `kind` is "em410x" / "hidprox"; the daemon reads the
+    /// tag back to verify and the panel shows that outcome. Refused while emulating.
+    func lfWrite(kind: String, id: String) async {
+        guard capabilities.lf, !swapping, !deviceBusy, !emulating else { return }
+        let clean = id.replacingOccurrences(of: " ", with: "")
+        guard !clean.isEmpty else { return }
+        lfBusy = true
+        lfWriteResult = nil
+        lastError = nil
+        do { lfWriteResult = try await activeBridge().lfWrite(kind: kind, id: clean) }
+        catch { lastError = "\(error)" }
+        lfBusy = false
+    }
+
+    /// Load an EM410x id into a slot for LF emulation: select the slot, set its LF field to
+    /// the type matching the id length (5-byte -> EM410X, 13-byte -> EM410X_ELECTRA), enable
+    /// it, set the emulation id, then save. The slot type MUST match the id length, or the
+    /// command layer rejects the id (a 13-byte id on an EM410X slot expects 5 bytes). EM410x
+    /// family only (the v1 LF emulate scope). Reuses the slot bridge path plus lf_emu; no
+    /// reader op, so it is not gated on emulate mode (presented once the user flips emulate).
+    func loadLFEmu(id: String, slot i: Int) async {
+        guard capabilities.lf, capabilities.emulate, !swapping, !deviceBusy else { return }
+        let clean = id.replacingOccurrences(of: " ", with: "")
+        // 5-byte EM410x or 13-byte Electra; anything else has no emulate path.
+        let type: String
+        switch clean.count {
+        case 10: type = "EM410X"
+        case 26: type = "EM410X_ELECTRA"
+        default: lastError = "lf emulate id must be a 5-byte EM410x or 13-byte Electra id"; return
+        }
+        lfBusy = true
+        do {
+            let b = activeBridge()
+            try await b.slotSelect(i)
+            try await b.slotSetType(slot: i, type: type)
+            try await b.slotEnable(slot: i, sense: "lf", enabled: true)
+            _ = try await b.lfEmu(id: clean)
+            try await b.slotSave()
+            slots = try await b.slotsList()
+            lastError = nil
+        } catch { lastError = "\(error)" }
+        lfBusy = false
     }
 
     // ---- firmware update (Chameleon-only, gated on capabilities.dfu) -------

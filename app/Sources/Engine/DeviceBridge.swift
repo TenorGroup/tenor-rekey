@@ -388,6 +388,23 @@ actor DeviceBridge {
         try await request("emu_read", params: EmuReadParam(count: count), timeout: .seconds(120), as: EmuReadResult.self).blocks
     }
 
+    // ---- LF 125 kHz (Chameleon-only; gated on capabilities.lf) ------------------
+
+    /// Read the LF (125 kHz) tag on the reader: EM410x first, then HID Prox (the two
+    /// read protocols in scope). No tag -> present:false.
+    func lfScan() async throws -> LfScanResult {
+        try await request("lf_scan", timeout: .seconds(30), as: LfScanResult.self)
+    }
+    /// Write an LF id onto a blank T5577 on the reader. `kind` is "em410x" / "hidprox";
+    /// `id` is the hex id (from a scan or entered). The daemon reads it back to verify.
+    func lfWrite(kind: String, id: String) async throws -> LfWriteResult {
+        try await request("lf_write", params: LfWriteParams(kind: kind, id: id), timeout: .seconds(60), as: LfWriteResult.self)
+    }
+    /// Set the active slot's EM410x emulation id (LF emulate is EM410x-only in v1).
+    func lfEmu(id: String) async throws -> LfEmuResult {
+        try await request("lf_emu", params: LfEmuParams(id: id), as: LfEmuResult.self)
+    }
+
     /// Clone a dump onto a magic card on the reader (the Chameleon's own reader).
     /// Per-block results stream to `onBlock`; the tally returns in the write shape.
     /// The X7 write path (writeMFD) is untouched - this is the Chameleon-only route.
@@ -444,6 +461,8 @@ actor DeviceBridge {
     private struct EmulateModeParam: Encodable { let reader: Bool }
     private struct EmulateLoadParam: Encodable { let blocks: [String: String] }
     private struct EmuReadParam: Encodable { let count: Int }
+    private struct LfWriteParams: Encodable { let kind: String; let id: String }
+    private struct LfEmuParams: Encodable { let id: String }
     private struct MagicParams: Encodable {
         let blocks: [String: String]; let keys: [String: [String]]
         let trailers: Bool; let uid: Bool; let target_uid: String?

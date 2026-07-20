@@ -22,6 +22,7 @@ import re
 import json
 import time
 import queue
+import struct
 import shutil
 import hashlib
 import zipfile
@@ -36,7 +37,8 @@ import importlib.util
 from chameleon.chameleon_com import ChameleonCom, NotOpenException, OpenFailException
 from chameleon.chameleon_cmd import ChameleonCMD
 from chameleon.chameleon_enum import (SlotNumber, TagSpecificType, TagSenseType, MfcKeyType,
-                                      Status, MifareClassicPrngType, MifareClassicDarksideStatus)
+                                      Status, MifareClassicPrngType, MifareClassicDarksideStatus,
+                                      HIDFormat)
 from chameleon.chameleon_utils import UnexpectedResponseError
 
 # Host-side crackers over the vendored C tools (firmware acquires nonces, host
@@ -207,6 +209,33 @@ def _sense(s):
     return TagSenseType.LF if str(s).lower() == "lf" else TagSenseType.HF
 
 
+# LF (125 kHz) slot types with an emulation path in v1: em410x_set_emu_id supports
+# EXACTLY these two (5-byte EM410x, 13-byte Electra). Any OTHER LF-sense type (Viking /
+# PAC / ioProx / Idteck / Jablotron / HID Prox / the EM410x ASK sub-variants with no
+# emu-id support) is out of the v1 LF scope AND has no emulation path, so slot_set_type
+# refuses to configure it - it would strand a slot the shell can never fill.
+_LF_EMU_TYPES = frozenset({TagSpecificType.EM410X, TagSpecificType.EM410X_ELECTRA})
+
+# The human status string the CLI's @expect_response raises for an empty LF field
+# (LF_TAG_NO_FOUND). lf_scan treats ONLY this as "no tag"; any other status (PAR_ERR /
+# device-mode / NOT_IMPLEMENTED / INVALID_CMD) surfaces as a real error, not a phantom
+# absent. Computed from the enum so it stays in sync with the vendored status strings.
+_LF_NO_TAG_MSG = str(Status.LF_TAG_NO_FOUND)
+
+
+def _is_lf_type(tt):
+    """True when a TagSpecificType is an LF-sense type (0 < value < TAG_TYPES_LF_END),
+    so HF types (>= 1000) are left unrestricted by the LF-scope gate."""
+    return TagSpecificType.UNDEFINED < tt < TagSpecificType.TAG_TYPES_LF_END
+
+
+def _is_lf_no_tag(exc):
+    """True only when an UnexpectedResponseError is the LF_TAG_NO_FOUND status. The
+    vendored @expect_response collapses the status to its human string, so we compare
+    against that string (there is no status attribute on the exception)."""
+    return str(exc) == _LF_NO_TAG_MSG
+
+
 def _capabilities(model, cracker=None):
     """The capability manifest the shell reads to gate panels (SPEC 2.3). Built
     from the device model, not hardcoded: model 0 = Ultra, 1 = Lite. The Lite has
@@ -216,8 +245,11 @@ def _capabilities(model, cracker=None):
     # when its host cracker binary is actually built. Advertise it DYNAMICALLY - appended
     # to the base attacks only when the cracker reports it present - so the shell never
     # lights up an attack the daemon cannot deliver (mirrors the graceful degrade of the
-    # other crackers). lf + sniff stay FALSE until this daemon exposes an LF method / a
-    # sniffer: advertising them would light up shell panels that do nothing.
+    # other crackers). `lf` is now TRUE: this daemon exposes lf_scan / lf_write / lf_emu,
+    # but ONLY for the protocols listed in lfProtocols (EM410x + HID Prox read, T5577
+    # write, EM410x emulate) - the daemon can drive more LF protocols but only these are
+    # surfaced, so the shell never lights up an LF protocol without live acceptance. `sniff`
+    # stays FALSE until this daemon exposes a sniffer.
     attacks = ["dict", "nested", "staticNested", "darkside"]
     if cracker is not None:
         try:
@@ -226,12 +258,18 @@ def _capabilities(model, cracker=None):
         except Exception:                # a cracker with no available() probe: omit it
             pass
     caps = {
-        "slots": 8, "emulate": True, "lf": False, "dfu": True, "sniff": False,
+        "slots": 8, "emulate": True, "lf": True, "sniff": False, "dfu": True,
+        "lfProtocols": ["em410x", "hidprox"],
         "attacks": attacks,
         "writeModes": ["normal", "denied", "deceive", "shadow", "shadowReq"],
     }
-    if model != 0:                       # Lite: no reader front-end -> no attacks
+    if model != 0:
+        # Lite: no reader front-end. It still configures + emulates an EM410x slot (lf stays
+        # true so the slot LF controls stay reachable), but it CANNOT read or clone an LF
+        # tag, so it advertises NO lf read protocols - the shell hides the read/write panel
+        # on an empty lfProtocols. Reader-mode attacks are cleared for the same reason.
         caps["attacks"] = []
+        caps["lfProtocols"] = []
     return caps
 
 
@@ -361,6 +399,7 @@ class Daemon:
                "decode", "cancel",
                "slot_set_type", "slot_enable", "slot_nick", "slot_save",
                "emulate_mode", "emulate_load", "emu_read", "magic_write",
+               "lf_scan", "lf_write", "lf_emu",
                "dfu_check", "dfu_flash")
 
     # Long ops whose cancel window is armed (the flag cleared) at DISPATCH, so a
@@ -373,6 +412,11 @@ class Daemon:
     # unbounded instead). A class attribute so tests can shrink it to prove the flash path
     # takes the unbounded branch rather than this one.
     EOF_JOIN_TIMEOUT = 5.0
+
+    # Settle delay before the LF write read-back verify: a freshly written T5577 needs a
+    # moment to re-power and answer, so an immediate re-scan can miss it and report a false
+    # unverified. Matches the reference GUI's 500 ms. A class attribute so tests set it to 0.
+    LF_SETTLE_SECONDS = 0.5
 
     def __init__(self, learned=None, port=None, cracker=crack):
         self.com = None
@@ -541,10 +585,18 @@ class Daemon:
     def slot_set_type(self, p):
         """Set a slot's emulated tag type: set_slot_tag_type (RAM) + set_slot_data_default
         (default data, persisted on the next save). `slot` is 0-based (matches
-        slots_list); `type` is a TagSpecificType name or value."""
+        slots_list); `type` is a TagSpecificType name or value.
+
+        LF-scope gate: an LF-sense type may ONLY be EM410x / EM410x Electra (the two with an
+        emulation path in v1); any other LF type (Viking / PAC / ioProx / Idteck / Jablotron
+        / HID Prox, by name OR number) is refused, so a caller cannot configure an
+        out-of-scope LF slot the shell can never emulate. HF types are unrestricted."""
         c = self._connect(p.get("port"))
         slot = int(p["slot"])
         tt = _resolve_type(p["type"])
+        if _is_lf_type(tt) and tt not in _LF_EMU_TYPES:
+            raise RuntimeError("LF slot type %s is out of scope; only EM410X / "
+                               "EM410X_ELECTRA can be set on a slot's LF field" % tt.name)
         sn = SlotNumber.from_fw(slot)
         c.set_slot_tag_type(sn, tt)
         c.set_slot_data_default(sn, tt)
@@ -650,6 +702,120 @@ class Daemon:
                 blocks[str(b + i)] = hx(data[i * 16:(i + 1) * 16])
             b += n
         return {"blocks": blocks, "count": count}
+
+    # ---- LF 125 kHz: EM410x + HID Prox read, T5577 write, EM410x emulate --------
+    # NARROWED surface (v1): only the three protocols the owner has hardware-accepted.
+    # The vendored engine can drive more LF protocols; those are deliberately NOT
+    # exposed here (each exposed protocol needs its own live acceptance).
+
+    @staticmethod
+    def _hid_id_bytes(fmt, fc, cn1, cn2, il, oem):
+        """Re-pack the 6 parsed HID Prox fields into the 13-byte id the firmware read /
+        write / emulate all speak (`>BIBIBH`, matching the upstream CLI)."""
+        return struct.pack(">BIBIBH", fmt, fc, cn1, cn2, il, oem)
+
+    @staticmethod
+    def _hid_result(kind, parsed):
+        """Shape a HID Prox scan/read tuple `(format, fc, cn1, cn2, il, oem)` into the
+        wire result: the 13-byte id (hex) the shell echoes back to lf_write / lf_emu, plus
+        the human fields (card number is the two halves recombined)."""
+        fmt, fc, cn1, cn2, il, oem = parsed
+        id_bytes = Daemon._hid_id_bytes(fmt, fc, cn1, cn2, il, oem)
+        try:
+            fmt_name = HIDFormat(fmt).name
+        except ValueError:
+            fmt_name = "H%d" % fmt
+        return {"present": True, "kind": kind, "id": hx(id_bytes),
+                "format": fmt, "formatName": fmt_name,
+                "fc": fc, "cn": (cn1 << 32) + cn2, "il": il, "oem": oem}
+
+    def lf_scan(self, p):
+        """Read the LF (125 kHz) tag on the reader. Tries EM410x first, then HID Prox
+        (the two READ protocols in scope), mirroring the GUI's read order. Reader-mode
+        gated like the HF read. Returns {present, kind:'em410x'/'hidprox', id (hex),
+        ...fields}; an EMPTY field (LF_TAG_NO_FOUND) -> {present:false}. A genuine fault
+        (PAR_ERR / device-mode / NOT_IMPLEMENTED / INVALID_CMD) is surfaced as an error,
+        never mistaken for absent. Viking / PAC / ioProx / Idteck are NOT probed here."""
+        c = self._connect(p.get("port"))
+        self._ensure_reader(c)
+        try:
+            tag_type, uid = c.em410x_scan()
+            return {"present": True, "kind": "em410x",
+                    "id": hx(uid), "tagType": _type_name(tag_type)}
+        except UnexpectedResponseError as e:
+            if not _is_lf_no_tag(e):
+                raise                            # a real fault: surface it, do not fall through
+        try:
+            parsed = c.hidprox_scan(0)           # format 0 = no hint, firmware auto-detects
+            return self._hid_result("hidprox", parsed)
+        except UnexpectedResponseError as e:
+            if not _is_lf_no_tag(e):
+                raise                            # a real fault: surface it, not a phantom absent
+            return {"present": False}
+
+    def _lf_verify(self, read):
+        """Run the read-back verify after an LF write, after a settle delay so a freshly
+        written T5577 has re-powered and can answer. `read` returns (ok, note): whether the
+        read-back matched, and a note on a mismatch / read fault (None on a clean match).
+        A read fault is kept as the note rather than collapsed silently to unverified."""
+        if self.LF_SETTLE_SECONDS:
+            time.sleep(self.LF_SETTLE_SECONDS)
+        try:
+            return read()
+        except UnexpectedResponseError as e:
+            return False, str(e)                 # e.g. LF_TAG_NO_FOUND: the write did not take
+
+    def lf_write(self, p):
+        """Write an LF id onto a blank T5577 tag on the reader (the LF clone). `kind` is a
+        REQUIRED explicit protocol ('em410x' / 'hidprox') - a destructive endpoint never
+        defaults a protocol; `id` is the hex id (an EM410x 5-byte id or 13-byte Electra; a
+        HID Prox 13-byte id, as returned by lf_scan). Reader-mode gated. After a settle
+        delay the tag is read back and byte-compared, so `verified` reports whether the
+        clone took, with `note` carrying the reason on a mismatch / read fault (best-effort,
+        mirroring the GUI's write-then-read-back). No card-uid pin: a blank T5577 has no
+        stable identity before it is written."""
+        c = self._connect(p.get("port"))
+        self._ensure_reader(c)
+        kind = p.get("kind")
+        if kind is None:
+            raise RuntimeError("lf_write requires an explicit kind (em410x / hidprox)")
+        kind = str(kind).lower()
+        id_bytes = bytes.fromhex((p.get("id") or "").replace(" ", ""))
+        if kind == "em410x":
+            if len(id_bytes) not in (5, 13):
+                raise RuntimeError("EM410x id must be 5 bytes (10 hex) or 13 bytes (Electra)")
+            c.em410x_write_to_t55xx(id_bytes)
+
+            def read():
+                _tt, uid = c.em410x_scan()
+                ok = bytes(uid) == id_bytes
+                return ok, (None if ok else "read-back mismatch")
+            verified, note = self._lf_verify(read)
+            return {"wrote": True, "kind": kind, "id": hx(id_bytes),
+                    "verified": verified, "note": note}
+        if kind == "hidprox":
+            if len(id_bytes) != 13:
+                raise RuntimeError("HID Prox id must be 13 bytes (26 hex)")
+            c.hidprox_write_to_t55xx(id_bytes)
+
+            def read():
+                ok = self._hid_id_bytes(*c.hidprox_scan(0)) == id_bytes
+                return ok, (None if ok else "read-back mismatch")
+            verified, note = self._lf_verify(read)
+            return {"wrote": True, "kind": kind, "id": hx(id_bytes),
+                    "verified": verified, "note": note}
+        raise RuntimeError("unsupported LF kind %r (em410x / hidprox only)" % kind)
+
+    def lf_emu(self, p):
+        """Set the ACTIVE slot's EM410x emulation id (`em410x_set_emu_id`), for LF emulate.
+        EM410x-only in v1: the firmware requires the active slot's LF field to already be
+        EM410x (or Electra) - if it is not, or the id length is wrong, it raises, surfaced
+        as a clean error envelope. `id` is the 5-byte EM410x (or 13-byte Electra) hex. Not
+        reader-mode gated (a slot config op, not a reader op), mirroring slot_set_type."""
+        c = self._connect(p.get("port"))
+        id_bytes = bytes.fromhex((p.get("id") or "").replace(" ", ""))
+        c.em410x_set_emu_id(id_bytes)
+        return {"loaded": True, "id": hx(id_bytes)}
 
     # ---- magic clone: write a dump onto a magic card on the reader --------------
 

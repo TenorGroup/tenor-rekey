@@ -15,30 +15,35 @@ struct DeviceCapabilities: Codable, Equatable, Sendable {
     var sniff: Bool = false
     var attacks: [String] = []
     var writeModes: [String] = []
+    /// The LF (125 kHz) protocols the daemon actually reads, so the LF panel offers only
+    /// those it can deliver. `lf: true` gates the panel; `lfProtocols` scopes what it can
+    /// do (v1: em410x + hidprox read + T5577 write, em410x emulate). Empty when lf is off.
+    var lfProtocols: [String] = []
 
     /// The XIXEI X7 baseline: an HF reader with a dictionary + nested recovery and
     /// nothing else. Mirrors the manifest x7d.py declares, so the descriptor default
     /// and the daemon's own report agree.
     static let x7 = DeviceCapabilities(
         slots: 0, emulate: false, lf: false, dfu: false, sniff: false,
-        attacks: ["dict", "nested"], writeModes: [])
+        attacks: ["dict", "nested"], writeModes: [], lfProtocols: [])
 
     /// The Chameleon Ultra baseline. Used as the descriptor default until the
     /// device's own `info` manifest lands (which is authoritative, so an Ultra vs a
-    /// Lite still gates correctly once connected). `lf` + `sniff` are false: the
-    /// daemon does not implement LF or sniffing yet, so we mirror its manifest and
-    /// never claim a panel that has no backing verb.
+    /// Lite still gates correctly once connected). `lf` is true (em410x + hidprox read,
+    /// T5577 write, em410x emulate); `sniff` stays false - the daemon has no sniffer yet,
+    /// so we mirror its manifest and never claim a panel that has no backing verb.
     static let chameleonUltra = DeviceCapabilities(
-        slots: 8, emulate: true, lf: false, dfu: true, sniff: false,
+        slots: 8, emulate: true, lf: true, dfu: true, sniff: false,
         attacks: ["dict", "nested", "staticNested", "darkside"],
-        writeModes: ["normal", "denied", "deceive", "shadow", "shadowReq"])
+        writeModes: ["normal", "denied", "deceive", "shadow", "shadowReq"],
+        lfProtocols: ["em410x", "hidprox"])
 
     /// A Chameleon sitting in the Nordic bootloader (re-enumerated to VID 0x1915). It
     /// exposes no card / slot interface - only DFU - so the shell offers ONLY the
     /// firmware action, which is exactly what recovers a device stuck in DFU.
     static let chameleonDFU = DeviceCapabilities(
         slots: 0, emulate: false, lf: false, dfu: true, sniff: false,
-        attacks: [], writeModes: [])
+        attacks: [], writeModes: [], lfProtocols: [])
 }
 
 extension DeviceCapabilities {
@@ -54,5 +59,6 @@ extension DeviceCapabilities {
         sniff = try c.decodeIfPresent(Bool.self, forKey: .sniff) ?? false
         attacks = try c.decodeIfPresent([String].self, forKey: .attacks) ?? []
         writeModes = try c.decodeIfPresent([String].self, forKey: .writeModes) ?? []
+        lfProtocols = try c.decodeIfPresent([String].self, forKey: .lfProtocols) ?? []
     }
 }

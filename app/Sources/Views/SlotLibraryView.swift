@@ -175,6 +175,33 @@ private struct SlotDetail: View {
                 ActionButton(title: l.t("rename"), icon: "pencil", enabled: !busy) { rename() }
                 Spacer()
             }
+            // LF field controls, shown only when the device can drive LF (capabilities.lf).
+            // A slot's LF field can be set to EM410x (the only LF emulate type in v1) and
+            // enabled / disabled; the id itself is loaded from the LF panel (lf_emu).
+            if model.capabilities.lf {
+                HStack(spacing: 8) {
+                    Menu {
+                        ForEach(SlotTagType.lf) { t in
+                            Button(t.label) { Task { await model.setSlotType(slot.index, type: t.name) } }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "wifi").font(.system(size: 11))
+                            Text(l.t("set_lf_type")).font(l.sans(12, .medium))
+                        }
+                        .padding(.horizontal, 11).frame(height: 30)
+                        .background(RoundedRectangle(cornerRadius: 7).fill(theme.p.tileFill.opacity(0.6)))
+                        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(theme.p.tileBorder, lineWidth: 0.5))
+                        .foregroundStyle(theme.p.textPrimary)
+                    }
+                    .menuStyle(.borderlessButton).fixedSize().disabled(busy)
+                    ActionButton(title: l.t(slot.lf.enabled ? "disable_lf" : "enable_lf"), icon: "power",
+                                 enabled: !busy) {
+                        Task { await model.enableSlot(slot.index, sense: "lf", enabled: !slot.lf.enabled) }
+                    }
+                    Spacer()
+                }
+            }
         }
         .padding(.horizontal, 24).padding(.vertical, 14)
         .background(theme.p.panel)
@@ -190,6 +217,6 @@ private struct SlotDetail: View {
 /// A slot's emulated tag type as a friendly label (falls back to the enum name with
 /// underscores spaced). Kept verbatim across languages - these are product type names.
 func slotTypeLabel(_ name: String) -> String {
-    if let t = SlotTagType.selectable.first(where: { $0.name == name }) { return t.label }
+    if let t = SlotTagType.all.first(where: { $0.name == name }) { return t.label }
     return name.replacingOccurrences(of: "_", with: " ")
 }

@@ -54,7 +54,8 @@ class FakeChameleon:
                  uid=b"\xaa\xbb\xcc\xdd", atqa=b"\x04\x00", sak=b"\x08", ats=b"",
                  present=True, keymap=None, blockdata=None,
                  slot_info=None, enabled=None, nicks=None, active=0,
-                 reader_mode=False, prng=None, hard_body=None):
+                 reader_mode=False, prng=None, hard_body=None,
+                 lf_kind=None, lf_em_id=None, lf_hid=None, lf_fault=None):
         self.model, self.app, self.git, self.chip = model, app, git, chip
         self.uid, self.atqa, self.sak, self.ats = uid, atqa, sak, ats
         self.present = present
@@ -89,6 +90,18 @@ class FakeChameleon:
         self.written = {}                 # block -> 16 bytes (physical card write target)
         self.writes = []                  # (block, keytype, keyhex) in order
         self.magic = {"gen1a": None, "gen2": None, "block_anti_coll": None}
+        # ---- LF (125 kHz) surface (v1: EM410x + HID Prox) ----
+        # The tag in the field is whatever the test CONFIGURES (lf_kind/lf_em_id/lf_hid);
+        # a write does NOT auto-manufacture the read-back (the test sets what scans back), so
+        # the verify path is proven by explicit match / mismatch / absent cases.
+        self.lf_kind = lf_kind            # "em410x" / "hidprox" / None (no LF tag in field)
+        self.lf_em_id = lf_em_id          # bytes: EM410x (5) or Electra (13)
+        self.lf_hid = lf_hid              # (format, fc, cn1, cn2, il, oem)
+        self.lf_fault = lf_fault          # when set, em410x_scan raises this (a device fault)
+        self.lf_calls = []                # scan call order, for asserting em410x-then-hid
+        self.t5577_em = None              # id bytes written to a T5577 via em410x_write
+        self.t5577_hid = None             # id bytes written to a T5577 via hidprox_write
+        self.lf_emu_id = None             # id set via em410x_set_emu_id
 
     # firmware rejects a card op in tag/emulator mode (Status.DEVICE_MODE_ERROR)
     def _require_reader(self):
@@ -284,6 +297,58 @@ class FakeChameleon:
         self.written[block] = bytes(block_data)
         return True
 
+    # ---- LF (125 kHz): EM410x + HID Prox read / T5577 write / EM410x emulate ----
+    # Return the SAME parsed shapes the real decorated methods return; raise the exact
+    # LF_TAG_NO_FOUND status string on an empty field (so the daemon's no-tag test matches
+    # the real @expect_response), and lf_fault to model a genuine (non-no-tag) device fault.
+    def em410x_scan(self):
+        self._require_reader()
+        self.lf_calls.append("em410x_scan")
+        if self.lf_fault is not None:
+            raise UnexpectedResponseError(self.lf_fault)
+        if self.lf_kind != "em410x" or not self.lf_em_id:
+            raise UnexpectedResponseError(str(Status.LF_TAG_NO_FOUND))
+        tt = (TagSpecificType.EM410X_ELECTRA if len(self.lf_em_id) == 13
+              else TagSpecificType.EM410X)
+        return (int(tt), bytes(self.lf_em_id))
+
+    def hidprox_scan(self, format):
+        self._require_reader()
+        self.lf_calls.append("hidprox_scan")
+        if self.lf_kind != "hidprox" or not self.lf_hid:
+            raise UnexpectedResponseError(str(Status.LF_TAG_NO_FOUND))
+        return tuple(self.lf_hid)
+
+    def em410x_write_to_t55xx(self, id_bytes):
+        self._require_reader()
+        if len(id_bytes) not in (5, 13):
+            raise ValueError("The id bytes length must equal 5 (EM410X) or 13 (Electra)")
+        # Record the write ONLY. What a subsequent scan reads back is whatever the test
+        # configured (lf_kind/lf_em_id), so a match / mismatch / absent verify is explicit.
+        self.t5577_em = bytes(id_bytes)
+
+    def hidprox_write_to_t55xx(self, id_bytes):
+        self._require_reader()
+        if len(id_bytes) != 13:
+            raise ValueError("The id bytes length must equal 13")
+        self.t5577_hid = bytes(id_bytes)
+
+    def _get_active_lf_tag_type(self):
+        return TagSpecificType(self.slot_info[self.active]["lf"])
+
+    def em410x_set_emu_id(self, id):
+        # mirror the firmware guard: the active slot's LF field must already be EM410x
+        lf = self._get_active_lf_tag_type()
+        if lf == TagSpecificType.EM410X_ELECTRA:
+            expected = 13
+        elif lf == TagSpecificType.EM410X:
+            expected = 5
+        else:
+            raise ValueError("Active LF slot type %s is not EM410X" % lf)
+        if len(id) != expected:
+            raise ValueError("The id bytes length must equal %d" % expected)
+        self.lf_emu_id = bytes(id)
+
 
 class FakeCrack:
     """Stand-in for chameleon_crack: returns a canned candidate key so the decode
@@ -406,9 +471,11 @@ def test_cham_info(check):
     check("info surfaces the chip id as serial (no real card uid)",
           r["serial"] == "aabbccddeeff0011")
     check("info hw carries app version + git", "app 1.2" in r["hw"] and "0abcdef" in r["hw"], r["hw"])
-    check("capabilities manifest has the SPEC 2.3 shape (lf/sniff off until built)",
-          caps.get("slots") == 8 and caps.get("emulate") is True and caps.get("lf") is False
+    check("capabilities manifest has the SPEC 2.3 shape (lf on, sniff off until built)",
+          caps.get("slots") == 8 and caps.get("emulate") is True and caps.get("lf") is True
           and caps.get("dfu") is True and caps.get("sniff") is False, str(caps))
+    check("capabilities advertises the narrowed LF read protocols (em410x + hidprox only)",
+          caps.get("lfProtocols") == ["em410x", "hidprox"], str(caps.get("lfProtocols")))
     check("capabilities lists the attack + writeMode surface",
           caps.get("attacks") == ["dict", "nested", "staticNested", "darkside"]
           and caps.get("writeModes") == ["normal", "denied", "deceive", "shadow", "shadowReq"],
@@ -420,6 +487,11 @@ def test_cham_info(check):
           rl["family"] == "chameleon-lite" and rl["capabilities"]["slots"] == 8
           and rl["capabilities"]["attacks"] == [] and rl["capabilities"]["sniff"] is False,
           str(rl["capabilities"]))
+    # Lite has no reader front-end: lf stays true (EM410x slot config/emulate still works)
+    # but it advertises NO lf read protocols, so the shell hides the LF read/write panel.
+    check("Lite keeps lf true but advertises no lf read protocols (read/write hidden)",
+          rl["capabilities"]["lf"] is True and rl["capabilities"]["lfProtocols"] == [],
+          str(rl["capabilities"].get("lfProtocols")))
 
 
 # --------------------------------------------------------------------------
@@ -1005,6 +1077,181 @@ def test_cham_emu_read(check):
     check("emu_read round-trips the loaded dump byte-identical (block 5)",
           r["blocks"]["5"].replace(" ", "") == (bytes([5]) + bytes(range(1, 16))).hex(),
           r["blocks"].get("5"))
+
+
+# --------------------------------------------------------------------------
+# 22b. lf_scan: EM410x-then-HID read order (proven via a call log), reader-mode
+# gated, empty field -> absent, a genuine fault surfaced (not swallowed as absent).
+# --------------------------------------------------------------------------
+def test_cham_lf_scan(check):
+    # EM410x present: scanned first, id echoed as hex, tag type surfaced (placeholder id)
+    em = FakeChameleon(lf_kind="em410x", lf_em_id=b"\x11\x22\x33\x44\x55")
+    d = cham_daemon(em)
+    r = d.lf_scan({})
+    check("lf_scan ensures reader mode before reading (tag-mode default -> reader)",
+          em.reader_mode is True, str(em.mode_sets))
+    check("lf_scan reads an EM410x tag: kind + hex id + tag type",
+          r["present"] is True and r["kind"] == "em410x"
+          and r["id"].replace(" ", "") == "1122334455" and r["tagType"] == "EM410X", str(r))
+    check("lf_scan stops at em410x when it hits (hid prox is not probed)",
+          em.lf_calls == ["em410x_scan"], str(em.lf_calls))
+
+    # HID Prox present: EM410x scan misses, HID scan resolves (synthetic fc/cn, no real card)
+    hid = FakeChameleon(lf_kind="hidprox", lf_hid=(1, 123, 0, 45678, 0, 0))
+    d2 = cham_daemon(hid)
+    r2 = d2.lf_scan({})
+    want_id = struct.pack(">BIBIBH", 1, 123, 0, 45678, 0, 0).hex()
+    check("lf_scan falls through to HID Prox: kind + 13-byte id + recombined card number",
+          r2["present"] is True and r2["kind"] == "hidprox"
+          and r2["id"].replace(" ", "") == want_id
+          and r2["fc"] == 123 and r2["cn"] == 45678 and r2["formatName"] == "H10301", str(r2))
+    check("lf_scan tries em410x FIRST, then falls through to hid prox (call order)",
+          hid.lf_calls == ["em410x_scan", "hidprox_scan"], str(hid.lf_calls))
+
+    # no LF tag in the field -> present:false (both scans raise LF_TAG_NO_FOUND)
+    empty = FakeChameleon(lf_kind=None)
+    r3 = cham_daemon(empty).lf_scan({})
+    check("lf_scan with no LF tag reports present:false (after trying both protocols)",
+          r3 == {"present": False} and empty.lf_calls == ["em410x_scan", "hidprox_scan"],
+          str(r3) + " " + str(empty.lf_calls))
+
+    # a genuine device fault (NOT LF_TAG_NO_FOUND) must surface as an error, not a phantom absent
+    faulty = FakeChameleon(lf_fault="API request fail, device mode error")
+    err = cham_daemon(faulty).handle({"id": 1, "method": "lf_scan"})
+    check("lf_scan surfaces a device fault instead of swallowing it as present:false",
+          "error" in err and "device mode error" in err["error"], str(err))
+
+
+# --------------------------------------------------------------------------
+# 22c. lf_write: EM410x + HID T5577 write; the read-back verify PROVEN by explicit
+# match / mismatch / absent; explicit-kind, hex, length and scope guards.
+# --------------------------------------------------------------------------
+def test_cham_lf_write(check):
+    # EM410x: the tag reads back as the written id (a clean clone) -> verified
+    em = FakeChameleon(lf_kind="em410x", lf_em_id=b"\x11\x22\x33\x44\x55")
+    d = cham_daemon(em)
+    d.LF_SETTLE_SECONDS = 0                 # no real settle sleep in tests
+    r = d.lf_write({"kind": "em410x", "id": "1122334455"})
+    check("lf_write ensures reader mode before writing", em.reader_mode is True)
+    check("lf_write (em410x) writes the id to T5577; a matching read-back -> verified",
+          r["wrote"] is True and r["verified"] is True and r["note"] is None
+          and em.t5577_em == b"\x11\x22\x33\x44\x55", str(r))
+
+    # read-back MISMATCH (the tag reads a different id) -> verified:false with a reason
+    mis = FakeChameleon(lf_kind="em410x", lf_em_id=b"\x99\x88\x77\x66\x55")
+    dm = cham_daemon(mis); dm.LF_SETTLE_SECONDS = 0
+    rm = dm.lf_write({"kind": "em410x", "id": "1122334455"})
+    check("lf_write reports verified:false when the read-back MISMATCHES the written id",
+          rm["wrote"] is True and rm["verified"] is False and rm["note"] == "read-back mismatch"
+          and mis.t5577_em == b"\x11\x22\x33\x44\x55", str(rm))
+
+    # read-back ABSENT (the write did not take) -> verified:false, the no-tag status as note
+    ab = FakeChameleon(lf_kind=None)
+    da = cham_daemon(ab); da.LF_SETTLE_SECONDS = 0
+    ra = da.lf_write({"kind": "em410x", "id": "1122334455"})
+    check("lf_write reports verified:false (with the no-tag reason) when nothing reads back",
+          ra["wrote"] is True and ra["verified"] is False
+          and ra["note"] == str(Status.LF_TAG_NO_FOUND), str(ra))
+
+    # HID Prox: a 13-byte id, the tag reads back the same fields -> verified
+    hid_id = struct.pack(">BIBIBH", 1, 123, 0, 45678, 0, 0).hex()
+    hid = FakeChameleon(lf_kind="hidprox", lf_hid=(1, 123, 0, 45678, 0, 0))
+    dh = cham_daemon(hid); dh.LF_SETTLE_SECONDS = 0
+    rh = dh.lf_write({"kind": "hidprox", "id": hid_id})
+    check("lf_write (hidprox) writes the 13-byte id to T5577; matching read-back -> verified",
+          rh["wrote"] is True and rh["verified"] is True
+          and hid.t5577_hid == bytes.fromhex(hid_id), str(rh))
+
+    # a MISSING kind is refused: a destructive endpoint must not default a protocol
+    dk = cham_daemon(FakeChameleon())
+    ek = dk.handle({"id": 1, "method": "lf_write", "params": {"id": "1122334455"}})
+    check("lf_write requires an explicit kind (no silent default on a destructive op)",
+          "error" in ek and "requires an explicit kind" in ek["error"], str(ek))
+
+    # malformed hex -> clean error envelope (bytes.fromhex raises, nothing written)
+    dhx = cham_daemon(FakeChameleon())
+    ehx = dhx.handle({"id": 2, "method": "lf_write", "params": {"kind": "em410x", "id": "zzzz"}})
+    check("lf_write rejects a malformed hex id (clean error envelope)", "error" in ehx, str(ehx))
+
+    # a bad EM410x id length is refused (never a partial write)
+    de = cham_daemon(FakeChameleon())
+    ee = de.handle({"id": 3, "method": "lf_write", "params": {"kind": "em410x", "id": "1122"}})
+    check("lf_write refuses a wrong-length EM410x id (error envelope)",
+          "error" in ee and "EM410x id" in ee["error"], str(ee))
+
+    # a bad HID Prox id length is refused (must be 13 bytes)
+    dh2 = cham_daemon(FakeChameleon())
+    eh = dh2.handle({"id": 4, "method": "lf_write", "params": {"kind": "hidprox", "id": "1122334455"}})
+    check("lf_write refuses a wrong-length HID Prox id (error envelope)",
+          "error" in eh and "HID Prox id" in eh["error"], str(eh))
+
+    # an out-of-scope LF kind is refused (only em410x / hidprox are surfaced in v1)
+    dv = cham_daemon(FakeChameleon())
+    ev = dv.handle({"id": 5, "method": "lf_write", "params": {"kind": "viking", "id": "1122334455"}})
+    check("lf_write refuses an out-of-scope LF protocol (viking)",
+          "error" in ev and "unsupported LF kind" in ev["error"], str(ev))
+
+
+# --------------------------------------------------------------------------
+# 22d. lf_emu: set the active slot's EM410x (and Electra) emu id; guarded on type.
+# --------------------------------------------------------------------------
+def test_cham_lf_emu(check):
+    # active slot (index 0) LF field already EM410x -> lf_emu sets the 5-byte emulation id
+    slot_info = [{"hf": 0, "lf": 0} for _ in range(8)]
+    slot_info[0] = {"hf": 0, "lf": int(TagSpecificType.EM410X)}
+    ok = FakeChameleon(slot_info=slot_info, active=0)
+    d = cham_daemon(ok)
+    r = d.lf_emu({"id": "1122334455"})
+    check("lf_emu sets the active slot EM410x (5-byte) emulation id",
+          r["loaded"] is True and ok.lf_emu_id == b"\x11\x22\x33\x44\x55", str(r))
+
+    # active slot LF field is Electra -> lf_emu accepts the 13-byte id
+    slot_info2 = [{"hf": 0, "lf": 0} for _ in range(8)]
+    slot_info2[0] = {"hf": 0, "lf": int(TagSpecificType.EM410X_ELECTRA)}
+    elec = FakeChameleon(slot_info=slot_info2, active=0)
+    d2 = cham_daemon(elec)
+    re = d2.lf_emu({"id": "11223344556677889900112233"})    # 13 bytes = 26 hex
+    check("lf_emu sets the active slot Electra (13-byte) emulation id",
+          re["loaded"] is True
+          and elec.lf_emu_id == bytes.fromhex("11223344556677889900112233"), str(re))
+
+    # active slot LF is not EM410x -> the firmware guard raises, surfaced cleanly
+    bad = FakeChameleon(active=0)          # slot 0 LF defaults to UNDEFINED (0)
+    d3 = cham_daemon(bad)
+    err = d3.handle({"id": 1, "method": "lf_emu", "params": {"id": "1122334455"}})
+    check("lf_emu on a non-EM410x active slot -> clean error, nothing set",
+          "error" in err and bad.lf_emu_id is None, str(err))
+
+
+# --------------------------------------------------------------------------
+# 22e. slot_set_type LF scope: only EM410X / EM410X_ELECTRA may be set on the LF
+# field; any other LF type (named OR numeric) is refused; HF types unrestricted.
+# --------------------------------------------------------------------------
+def test_cham_slot_set_type_lf_scope(check):
+    d = cham_daemon(FakeChameleon())
+    r1 = d.slot_set_type({"slot": 0, "type": "EM410X"})
+    check("slot_set_type accepts EM410X on the LF field", r1["type"] == "EM410X", str(r1))
+    r2 = d.slot_set_type({"slot": 0, "type": "EM410X_ELECTRA"})
+    check("slot_set_type accepts EM410X_ELECTRA (needed for 13-byte emulate)",
+          r2["type"] == "EM410X_ELECTRA", str(r2))
+
+    # a NAMED out-of-scope LF type resolves then is rejected by the scope gate (proving the
+    # gate, not merely an unknown-name error): the message names the scope, not "unknown type"
+    ev = d.handle({"id": 1, "method": "slot_set_type", "params": {"slot": 0, "type": "Viking"}})
+    check("slot_set_type rejects a named out-of-scope LF type (Viking) via the scope gate",
+          "error" in ev and "out of scope" in ev["error"], str(ev))
+    # a NUMERIC out-of-scope LF type is rejected too (HIDProx = 200, ioProx = 201, IDTECK = 310)
+    eh = d.handle({"id": 2, "method": "slot_set_type", "params": {"slot": 0, "type": 200}})
+    ei = d.handle({"id": 3, "method": "slot_set_type",
+                   "params": {"slot": 0, "type": int(TagSpecificType.IDTECK)}})
+    check("slot_set_type rejects a numeric out-of-scope LF type (HIDProx=200, IDTECK)",
+          "error" in eh and "out of scope" in eh["error"]
+          and "error" in ei and "out of scope" in ei["error"], str(eh) + " " + str(ei))
+
+    # HF types stay unrestricted (the gate is LF-sense only)
+    r3 = d.slot_set_type({"slot": 0, "type": "MIFARE_1024"})
+    check("slot_set_type leaves HF types unrestricted (MIFARE_1024 accepted)",
+          r3["type"] == "MIFARE_1024", str(r3))
 
 
 # --------------------------------------------------------------------------
@@ -2130,7 +2377,9 @@ TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_decode_hardnested_chain, test_cham_decode_hardnested_no_anchor,
          test_cham_capability_hardnested,
          test_cham_slot_config, test_cham_emulate_mode, test_cham_emulate_load,
-         test_cham_emu_read, test_cham_magic_write, test_cham_magic_write_guards,
+         test_cham_emu_read, test_cham_lf_scan, test_cham_lf_write, test_cham_lf_emu,
+         test_cham_slot_set_type_lf_scope,
+         test_cham_magic_write, test_cham_magic_write_guards,
          test_cham_magic_write_midswap, test_cham_magic_write_trailer_keys,
          test_cham_dfu_asset, test_cham_dfu_norm_model, test_cham_dfu_port_discovery,
          test_cham_dfu_enter_bootloader, test_cham_dfu_validate,
