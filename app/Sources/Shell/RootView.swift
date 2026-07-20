@@ -210,6 +210,18 @@ private struct ActionBar: View {
                          enabled: model.source != nil) { model.saveDumpDialog() }
             ActionButton(title: l.t("open_dump"), icon: "folder", enabled: true) { model.openDumpDialog() }
             ActionButton(title: "apdu", icon: "terminal", on: model.apduOpen, enabled: true) { model.apduOpen.toggle() }
+            // Saved-cards library: device-agnostic (shown for both the X7 and a Chameleon),
+            // so it sits with the document verbs, not behind the Chameleon divider. Opening
+            // it closes the Chameleon slot library (only one detail area at a time).
+            ActionButton(title: l.t("library"), icon: "books.vertical", on: model.showLibrary,
+                         enabled: true) {
+                let willShow = !model.showLibrary
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    model.showLibrary = willShow
+                    if willShow { model.showSlots = false }
+                }
+                if willShow { model.refreshSavedCards() }
+            }
             // Chameleon-only verbs, gated on the connected device's capabilities: the
             // slot library, the reader<->emulate toggle, and loading the working
             // document into a slot for emulation. A plain reader (X7) shows none of them.
@@ -220,7 +232,10 @@ private struct ActionBar: View {
                 ActionButton(title: l.t("slots"), icon: "square.stack.3d.up", on: model.showSlots,
                              enabled: !model.slotBusy) {
                     let willShow = !model.showSlots
-                    withAnimation(.easeInOut(duration: 0.2)) { model.showSlots = willShow }
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        model.showSlots = willShow
+                        if willShow { model.showLibrary = false }
+                    }
                     if willShow { Task { await model.loadSlots() } }
                 }
             }
@@ -364,7 +379,11 @@ private struct CanvasView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.showSlots && model.capabilities.slots > 0 {
+            if model.showLibrary {
+                // Saved-cards library, opened from the action bar. Device-agnostic, so it
+                // shows for any device; the document flow below is untouched.
+                SavedCardsView()
+            } else if model.showSlots && model.capabilities.slots > 0 {
                 // Chameleon-only slot library, opened from the action bar. The single
                 // document flow (below) is untouched; this is a separate detail area.
                 SlotLibraryView()

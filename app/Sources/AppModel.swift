@@ -66,6 +66,16 @@ final class AppModel {
     var slotBusy = false
     /// The Chameleon-only slot library is showing instead of the document canvas.
     var showSlots = false
+
+    // ---- saved-cards library (device-agnostic) -----------------------------
+    /// The persistent library of saved card dumps, refreshed when the library view opens
+    /// and after any save / import / rename / delete.
+    var savedCards: [SavedCard] = []
+    /// The library entry highlighted in the view (its actions apply to it).
+    var selectedSavedCard: String?
+    /// The saved-cards library is showing instead of the document canvas. Unlike the slot
+    /// library it is device-agnostic, so it persists across a device swap.
+    var showLibrary = false
     /// The device is in tag/emulate mode (presenting the active slot), not reader mode.
     /// While true the status monitor stops polling, since a poll would switch the device
     /// back to reader mode under the emulation.
@@ -137,6 +147,8 @@ final class AppModel {
     /// The user's editable keys (Settings > Dictionaries), tried before the
     /// daemon's large built-in dictionary.
     let keyStore = KeyStore()
+    /// The persistent saved-cards library (device-agnostic; works for X7 dumps too).
+    let savedCardStore = SavedCardStore.standard()
     /// Size of the daemon's built-in curated dictionary (shown in Settings).
     var builtinKeyCount = 0
     /// Keys the daemon has learned from real cards and reranks decodes with (Settings).
@@ -904,18 +916,26 @@ final class AppModel {
     }
 
     /// Load the working document into a chosen slot's HF emulator, so the Chameleon
-    /// emulates that card: select the slot, set its type + enable HF from the dump, load
-    /// the blocks, then save. Needs a held document + an emulation-capable device.
+    /// emulates that card. Needs a held document + an emulation-capable device.
     func loadDocumentToSlot(_ i: Int) async {
-        guard capabilities.emulate, !swapping, !deviceBusy, let src = source else { return }
+        guard let src = source else { return }
+        await writeDumpToSlot(src, slot: i)
+    }
+
+    /// Write a dump into a chosen slot's HF emulator: select the slot, set its type +
+    /// enable HF from the dump, load the blocks, then save. Shared by the working-document
+    /// load and the saved-cards library's write-to-slot, so both take the exact same
+    /// bridge path (no new daemon verb).
+    func writeDumpToSlot(_ dump: CardDump, slot i: Int) async {
+        guard capabilities.emulate, !swapping, !deviceBusy else { return }
         slotBusy = true
-        let type = src.sak == 0x18 ? "MIFARE_4096" : "MIFARE_1024"
+        let type = dump.sak == 0x18 ? "MIFARE_4096" : "MIFARE_1024"
         do {
             let b = activeBridge()
             try await b.slotSelect(i)
             try await b.slotSetType(slot: i, type: type)
             try await b.slotEnable(slot: i, sense: "hf", enabled: true)
-            try await b.emulateLoad(blocks: src.blockParams)
+            try await b.emulateLoad(blocks: dump.blockParams)
             try await b.slotSave()
             slots = try await b.slotsList()
             lastError = nil
@@ -1052,6 +1072,81 @@ final class AppModel {
         } catch {
             lastError = "\(error)"
         }
+    }
+
+    // ---- saved-cards library -----------------------------------------------
+
+    /// Re-read the library index (opening the library view, or after a mutation).
+    func refreshSavedCards() { savedCards = savedCardStore.list() }
+
+    /// Save the current working document into the library and select the new entry. The
+    /// label defaults to the document's uid (renamable afterwards). No-op with no document.
+    func saveCurrentToLibrary() {
+        guard let src = source else { return }
+        do {
+            let entry = try savedCardStore.save(src, name: "")
+            refreshSavedCards()
+            selectedSavedCard = entry.id
+            lastError = nil
+        } catch { lastError = error.localizedDescription }
+    }
+
+    /// Load a saved card as the working document: it becomes the source and its memory map
+    /// renders on the canvas (like Open), so it can be cloned / emulated. Returns to the
+    /// document canvas.
+    func loadSavedCard(_ card: SavedCard) {
+        do {
+            let dump = try savedCardStore.load(card.id)
+            let vms = Self.buildSectors(fromDump: dump)
+            withAnimation(.easeInOut(duration: 0.3)) {
+                source = dump; sectors = vms; pages = []
+                selected = vms.first(where: { $0.hasKey })?.index ?? vms.first?.index
+                selectedBlock = nil; showLibrary = false
+                cloneResults = [:]; cloneFailReasons = [:]; noKeysFound = false
+            }
+            lastError = nil
+        } catch { lastError = error.localizedDescription }
+    }
+
+    /// Relabel a saved card.
+    func renameSavedCard(_ card: SavedCard, name: String) {
+        do { try savedCardStore.rename(card.id, to: name); refreshSavedCards(); lastError = nil }
+        catch { lastError = error.localizedDescription }
+    }
+
+    /// Delete a saved card (and its backing files). The physical card is untouched.
+    func deleteSavedCard(_ card: SavedCard) {
+        do {
+            try savedCardStore.delete(card.id)
+            if selectedSavedCard == card.id { selectedSavedCard = nil }
+            refreshSavedCards()
+            lastError = nil
+        } catch { lastError = error.localizedDescription }
+    }
+
+    /// Import a dump from another tool (Proxmark3 .eml / .json / .bin, Flipper .nfc) into
+    /// the library and select it. `unrecognised` is the localized message shown when the
+    /// file matches none of the parsers (the model has no L10n, so the view supplies it).
+    func importCardFile(from url: URL, unrecognised: String) {
+        let dump: CardDump
+        do { dump = try CardDump.importFile(url: url) }
+        catch { lastError = unrecognised; return }
+        do {
+            let entry = try savedCardStore.save(dump, name: dump.name)
+            refreshSavedCards()
+            selectedSavedCard = entry.id
+            lastError = nil
+        } catch { lastError = error.localizedDescription }
+    }
+
+    /// Write a saved card into a Chameleon slot's HF emulator, reusing the shared
+    /// load-to-slot path. Gated on an emulation-capable device (the library UI shows this
+    /// only when a Chameleon is connected).
+    func writeSavedCardToSlot(_ card: SavedCard, slot i: Int) async {
+        do {
+            let dump = try savedCardStore.load(card.id)
+            await writeDumpToSlot(dump, slot: i)
+        } catch { lastError = error.localizedDescription }
     }
 }
 

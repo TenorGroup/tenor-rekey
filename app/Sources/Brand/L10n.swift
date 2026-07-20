@@ -208,5 +208,18 @@ final class L10n {
         "quit_while_flashing_title": ["vi": "đang cập nhật firmware", "en": "firmware update in progress", "zh": "固件更新进行中", "ja": "ファームウェア更新中"],
         "quit_while_flashing_msg": ["vi": "không thể thoát khi đang nạp firmware. thoát lúc này có thể làm hỏng thiết bị. chờ nạp xong đã.", "en": "the app cannot quit while firmware is being written. quitting now can brick the device. wait for the update to finish.", "zh": "固件写入期间无法退出。此时退出可能导致设备变砖。请等待更新完成。", "ja": "ファームウェア書き込み中はアプリを終了できません。今終了すると文鎮化する恐れがあります。更新の完了をお待ちください。"],
         "keep_updating":     ["vi": "tiếp tục cập nhật", "en": "keep updating", "zh": "继续更新", "ja": "更新を続ける"],
+        // ---- saved-cards library (P7) ----
+        "library":           ["vi": "thư viện", "en": "library", "zh": "卡库", "ja": "ライブラリ"],
+        "saved_cards":       ["vi": "thẻ đã lưu", "en": "saved cards", "zh": "已存卡片", "ja": "保存済みカード"],
+        "save_current":      ["vi": "lưu thẻ hiện tại", "en": "save current", "zh": "保存当前", "ja": "現在を保存"],
+        "load_to_document":  ["vi": "nạp vào tài liệu", "en": "load to document", "zh": "载入文档", "ja": "ドキュメントに読込"],
+        "write_to_slot":     ["vi": "ghi vào khe", "en": "write to slot", "zh": "写入卡槽", "ja": "スロットに書込"],
+        "card_name":         ["vi": "tên thẻ", "en": "card name", "zh": "卡片名称", "ja": "カード名"],
+        "delete":            ["vi": "xóa", "en": "delete", "zh": "删除", "ja": "削除"],
+        "no_saved_cards":    ["vi": "chưa lưu thẻ nào", "en": "no saved cards yet", "zh": "还没有保存的卡片", "ja": "保存済みカードはありません"],
+        "saved_cards_hint":  ["vi": "giải mã hoặc nhập một thẻ, rồi lưu vào đây để dùng lại", "en": "decode or import a card, then save it here to reuse", "zh": "解码或导入一张卡片后保存到这里以便复用", "ja": "カードをデコードまたはインポートし、ここに保存して再利用します"],
+        "import_failed":     ["vi": "không nhận dạng được tệp dump", "en": "unrecognised dump file", "zh": "无法识别的转储文件", "ja": "認識できないダンプファイルです"],
+        "delete_card_q":     ["vi": "xóa thẻ đã lưu này?", "en": "delete this saved card?", "zh": "删除这张已保存的卡片？", "ja": "この保存済みカードを削除しますか？"],
+        "delete_card_msg":   ["vi": "xóa khỏi thư viện, không hoàn tác được. thẻ vật lý không bị ảnh hưởng.", "en": "removes it from the library and cannot be undone. the physical card is unaffected.", "zh": "将其从卡库中移除，不可撤销。实体卡片不受影响。", "ja": "ライブラリから削除します。元に戻せません。実体カードには影響しません。"],
     ]
 }

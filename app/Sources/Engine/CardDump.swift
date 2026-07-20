@@ -68,9 +68,13 @@ struct CardDump: Equatable, Sendable {
     /// Flat binary image: block index * 16 bytes; missing blocks left as zero.
     func mfdData() -> Data {
         let size = sak == 0x18 ? 4096 : 1024
+        let blockCount = size / 16
         var buf = Data(count: size)
         for (b, hex) in blocks {
-            guard (b + 1) * 16 <= size, let bytes = Data(hexString: hex), bytes.count == 16 else { continue }
+            // Bounds-check the index BEFORE any arithmetic: a negative or out-of-range block
+            // (an imported dump is untrusted) must never reach `b * 16` (overflow) or address
+            // outside the buffer. `b < blockCount` keeps `b * 16 + 16 <= size`.
+            guard b >= 0, b < blockCount, let bytes = Data(hexString: hex), bytes.count == 16 else { continue }
             buf.replaceSubrange(b * 16 ..< b * 16 + 16, with: bytes)
         }
         return buf
