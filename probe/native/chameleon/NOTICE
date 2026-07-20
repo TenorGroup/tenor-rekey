@@ -1,0 +1,26 @@
+Vendored MIFARE Classic key-recovery crackers
+=============================================
+
+The C sources under src/ are copied verbatim from:
+
+  RfidResearchGroup/ChameleonUltra, software/src/
+  https://github.com/RfidResearchGroup/ChameleonUltra
+
+They implement the Crypto1 cipher and the nested / static-nested / darkside key
+recovery used by the upstream Chameleon CLI and GUI. The Chameleon firmware
+acquires the encrypted nonces on-device; these host-side tools crack them into
+keys. tenor/rekey drives them by subprocess from probe/chameleon_crack.py,
+mirroring the upstream CLI's argv/stdout contract.
+
+License: GPL. Individual files carry "GNU GPL, version 2 or (at your option) any
+later version"; the ones without a per-file header inherit the project license.
+This is compatible with tenor/rekey's own GPLv3 (see the repo-root LICENSE).
+Copyright notices in the source headers (e.g. "Copyright (C) 2008-2014 bla") are
+preserved unmodified.
+
+Build: run build.sh to compile nested, staticnested and darkside for macOS arm64
+into bin/ (git-ignored). Only these three tools are built here; hardnested
+(hard-PRNG) is a follow-up (it needs the HardnestedRecovery tree plus liblzma).
+
+Do not edit the files under src/ - they are upstream. Re-vendor from the source
+repo if an update is needed, keeping the license and copyright headers intact.

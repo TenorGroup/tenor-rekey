@@ -28,7 +28,8 @@ os.environ.setdefault("X7_LEARNED_PATH",
 
 import chameleon_d
 from chameleon.chameleon_com import ChameleonCom
-from chameleon.chameleon_enum import Status, SlotNumber, TagSpecificType
+from chameleon.chameleon_enum import (Status, SlotNumber, TagSpecificType, MfcKeyType,
+                                      MifareClassicPrngType, MifareClassicDarksideStatus)
 from chameleon.chameleon_utils import UnexpectedResponseError
 from learned_keys import LearnedKeyCache
 
@@ -48,10 +49,15 @@ class FakeChameleon:
                  uid=b"\xaa\xbb\xcc\xdd", atqa=b"\x04\x00", sak=b"\x08", ats=b"",
                  present=True, keymap=None, blockdata=None,
                  slot_info=None, enabled=None, nicks=None, active=0,
-                 reader_mode=False):
+                 reader_mode=False, prng=None):
         self.model, self.app, self.git, self.chip = model, app, git, chip
         self.uid, self.atqa, self.sak, self.ats = uid, atqa, sak, ats
         self.present = present
+        # prng None = no reader-mode attack surface (mf1_detect_prng raises, so the
+        # daemon's attack stage skips cleanly, as on a card with no detectable
+        # vulnerability). Set 0/1/2 (STATIC/WEAK/HARD) to enable the acquire methods.
+        self.prng = prng
+        self.acquired = []                # names of acquire/detect calls, in order
         # default: an all-FF MIFARE Classic 1K (both keys FF on every sector)
         self.keymap = keymap if keymap is not None else {
             (s, kt): FF for s in range(16) for kt in ("A", "B")}
@@ -151,6 +157,66 @@ class FakeChameleon:
         return {"status": Status.HF_TAG_OK, "found": bytes(found),
                 "sectorKeys": sector_keys}
 
+    # ---- attack surface (mirrors the firmware acquire methods' parsed shapes) ----
+    def _uid_int(self):
+        return int.from_bytes(self.uid[-4:], "big")
+
+    def mf1_detect_prng(self):
+        self._require_reader()
+        if self.prng is None:                 # no detectable vulnerability
+            raise UnexpectedResponseError("prng detect: no vuln")
+        return int(self.prng)
+
+    def mf1_detect_nt_dist(self, block_known, type_known, key_known):
+        self._require_reader()
+        self.acquired.append("detect_nt_dist")
+        return {"uid": self._uid_int(), "dist": 100}
+
+    def mf1_nested_acquire(self, block_known, type_known, key_known, block_target, type_target):
+        self._require_reader()
+        self.acquired.append("nested_acquire")
+        # Opaque placeholder nonces - the injected fake cracker is what turns these
+        # into a key here; the real cracker is proven separately in chameleon_crack.
+        return [{"nt": 1, "nt_enc": 2, "par": 0} for _ in range(4)]
+
+    def mf1_static_nested_acquire(self, block_known, type_known, key_known, block_target, type_target):
+        self._require_reader()
+        self.acquired.append("static_nested_acquire")
+        return {"uid": self._uid_int(), "nts": [{"nt": 0x01200145, "nt_enc": 2}]}
+
+    def mf1_darkside_acquire(self, block_target, type_target, first_recover, sync_max):
+        self._require_reader()
+        self.acquired.append("darkside_acquire")
+        return (MifareClassicDarksideStatus.OK,
+                {"uid": self._uid_int(), "nt1": 1, "par": 0, "ks1": 0, "nr": 2, "ar": 3})
+
+    def mf1_auth_one_key_block(self, block, type_value, key):
+        self._require_reader()
+        kt = "A" if int(type_value) == 0x60 else "B"
+        want = self.keymap.get((self._sector_of(block), kt))
+        return want is not None and bytes.fromhex(want) == key
+
+
+class FakeCrack:
+    """Stand-in for chameleon_crack: returns a canned candidate key so the decode
+    chaining (acquire -> crack -> verify -> feed back) is testable without the built
+    C binaries. The real crackers are proven by chameleon_crack's forward-sim."""
+    def __init__(self, key):
+        self.key = key
+        self.calls = []
+
+    def nested(self, uid, dist, samples):
+        self.calls.append("nested")
+        return [self.key]
+
+    def staticnested(self, uid, type_target, pairs):
+        self.calls.append("staticnested")
+        return [self.key]
+
+    def darkside(self, uid, items):
+        self.calls.append("darkside")
+        return [self.key], True
+
 
 class SwapFake(FakeChameleon):
     """A card that is swapped mid-decode: after `swap_after` scans it reports a
@@ -200,7 +266,7 @@ def test_cham_info(check):
           caps.get("slots") == 8 and caps.get("emulate") is True and caps.get("lf") is True
           and caps.get("dfu") is True and caps.get("sniff") is True, str(caps))
     check("capabilities lists the attack + writeMode surface",
-          caps.get("attacks") == ["dict", "nested", "staticNested", "darkside", "hardnested"]
+          caps.get("attacks") == ["dict", "nested", "staticNested", "darkside"]
           and caps.get("writeModes") == ["normal", "denied", "deceive", "shadow", "shadowReq"],
           str(caps))
     # Lite: same 8 slots, but no reader-mode attacks / sniff (data-driven off model)
@@ -464,10 +530,146 @@ def test_cham_dispatch(check):
           "error" in rb and "Chameleon" in rb["error"], str(rb))
 
 
+# --------------------------------------------------------------------------
+# 13. decode nested chain: 1 dict key + weak PRNG -> nested opens the rest.
+# --------------------------------------------------------------------------
+def test_cham_decode_nested_chain(check):
+    K = "0f1e2d3c4b5a"                    # not in the shipped dictionary
+    km = {(s, kt): K for s in range(16) for kt in ("A", "B")}
+    km[(0, "A")] = FF                     # sector 0 opens on the dict; 1..15 need nested
+    km[(0, "B")] = FF
+    learned, path = _fresh_learned()
+    fake = FakeChameleon(keymap=km, prng=MifareClassicPrngType.WEAK)
+    d = cham_daemon(fake, learned=learned)
+    d.crack = FakeCrack(K)
+    d.emit = lambda o: None
+    r = d.decode({})
+    check("nested-chain: one dict key + weak PRNG recovers all 16 sectors",
+          r["recovered"] == 16, str(r["recovered"]))
+    check("nested-chain: routes through the nested acquire path (detect_nt_dist + nested_acquire), not darkside",
+          "detect_nt_dist" in fake.acquired and "nested_acquire" in fake.acquired
+          and "darkside_acquire" not in fake.acquired, str(fake.acquired))
+    check("nested-chain: the host cracker was invoked for nested",
+          "nested" in d.crack.calls, str(d.crack.calls))
+    check("nested-chain: one recovered key is fed back and opens the rest in a single acquire",
+          fake.acquired.count("nested_acquire") == 1 and r["keys"]["9"] is not None,
+          str(fake.acquired))
+    os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# 14. decode darkside chain: a zero-key card routes to darkside for a foothold.
+# --------------------------------------------------------------------------
+def test_cham_decode_darkside_chain(check):
+    K = "0f1e2d3c4b5a"
+    km = {(s, kt): K for s in range(16) for kt in ("A", "B")}   # nothing in the dict
+    learned, path = _fresh_learned()
+    fake = FakeChameleon(keymap=km, prng=MifareClassicPrngType.WEAK)
+    d = cham_daemon(fake, learned=learned)
+    d.crack = FakeCrack(K)
+    d.emit = lambda o: None
+    r = d.decode({})
+    check("darkside-chain: a zero-key card routes to darkside_acquire for a foothold",
+          "darkside_acquire" in fake.acquired, str(fake.acquired))
+    check("darkside-chain: the darkside cracker was invoked", "darkside" in d.crack.calls,
+          str(d.crack.calls))
+    check("darkside-chain: the foothold key is fed back and opens all 16 sectors",
+          r["recovered"] == 16, str(r["recovered"]))
+    os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# 15. decode static chain: a static-PRNG card routes to static-nested.
+# --------------------------------------------------------------------------
+def test_cham_decode_static_chain(check):
+    K = "0f1e2d3c4b5a"
+    km = {(s, kt): K for s in range(16) for kt in ("A", "B")}
+    km[(0, "A")] = FF
+    km[(0, "B")] = FF
+    learned, path = _fresh_learned()
+    fake = FakeChameleon(keymap=km, prng=MifareClassicPrngType.STATIC)
+    d = cham_daemon(fake, learned=learned)
+    d.crack = FakeCrack(K)
+    d.emit = lambda o: None
+    r = d.decode({})
+    check("static-chain: a static-PRNG card routes to static_nested_acquire (not weak nested)",
+          "static_nested_acquire" in fake.acquired and "nested_acquire" not in fake.acquired,
+          str(fake.acquired))
+    check("static-chain: static-nested recovers the remaining sectors", r["recovered"] == 16,
+          str(r["recovered"]))
+    os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# 16. decode hard PRNG: hardnested is not wired in P1 -> hard sectors stay unopened.
+# --------------------------------------------------------------------------
+def test_cham_decode_hard_prng(check):
+    K = "0f1e2d3c4b5a"
+    km = {(s, kt): K for s in range(16) for kt in ("A", "B")}
+    km[(0, "A")] = FF
+    km[(0, "B")] = FF
+    learned, path = _fresh_learned()
+    fake = FakeChameleon(keymap=km, prng=MifareClassicPrngType.HARD)
+    d = cham_daemon(fake, learned=learned)
+    d.crack = FakeCrack(K)
+    events = []
+    d.emit = lambda o: events.append(o)
+    r = d.decode({})
+    check("hard-PRNG: hardnested is out of scope for P1, so hard sectors stay unrecovered",
+          r["recovered"] == 1 and r["exhausted"] is True, str(r["recovered"]))
+    check("hard-PRNG: decode reports the hardnested stage as unsupported",
+          any(e.get("stage") == "hardnested" and e.get("supported") is False for e in events),
+          "no unsupported-hardnested progress event")
+    os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# 17. decode cancel: the cooperative abort stops the attack stage, returns partial.
+# --------------------------------------------------------------------------
+def test_cham_decode_cancel(check):
+    K = "0f1e2d3c4b5a"
+    km = {(s, kt): K for s in range(16) for kt in ("A", "B")}   # zero dict keys
+    learned, path = _fresh_learned()
+    fake = FakeChameleon(keymap=km, prng=MifareClassicPrngType.WEAK)
+    d = cham_daemon(fake, learned=learned)
+    d.crack = FakeCrack(K)
+    d.emit = lambda o: None
+    check("cancel() trips the cooperative abort flag",
+          d.cancel({}) == {"cancelled": True} and d._cancel.is_set())
+    r = d.decode({})
+    check("a pre-cancelled decode aborts the attack stage (no acquire) and reports cancelled",
+          r["cancelled"] is True and r["recovered"] == 0 and fake.acquired == [],
+          str((r["cancelled"], r["recovered"], fake.acquired)))
+    os.remove(path)
+
+
+# --------------------------------------------------------------------------
+# 18. attack budget guard: an already-expired wall-clock budget stops the stage.
+# --------------------------------------------------------------------------
+def test_cham_attack_budget_guard(check):
+    K = "0f1e2d3c4b5a"
+    km = {(s, kt): K for s in range(16) for kt in ("A", "B")}
+    # reader_mode=True: decode() sets this via _ensure_reader before the attack stage;
+    # this unit test drives _recover_attacks directly, so set it up front.
+    fake = FakeChameleon(keymap=km, prng=MifareClassicPrngType.WEAK, reader_mode=True)
+    d = cham_daemon(fake)
+    d.crack = FakeCrack(K)
+    d.emit = lambda o: None
+    sk, pool = {}, set()
+    attempts, cancelled = d._recover_attacks(
+        fake, 16, sk, pool, [], time.monotonic() - 1, 0)
+    check("an already-expired budget stops the attack stage before any acquire",
+          cancelled is True and fake.acquired == [] and sk == {},
+          str((cancelled, fake.acquired)))
+
+
 TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_read_block, test_cham_decode, test_cham_decode_partial,
          test_cham_decode_nocard, test_cham_decode_swap, test_cham_decode_user_key,
-         test_cham_transport_wedge, test_cham_dispatch]
+         test_cham_transport_wedge, test_cham_dispatch,
+         test_cham_decode_nested_chain, test_cham_decode_darkside_chain,
+         test_cham_decode_static_chain, test_cham_decode_hard_prng,
+         test_cham_decode_cancel, test_cham_attack_budget_guard]
 
 
 if __name__ == "__main__":

@@ -554,7 +554,7 @@ def test_apdu_parse():
 def test_subprocess_selftests():
     here = os.path.dirname(os.path.abspath(__file__))
     env = dict(os.environ)
-    for mod in ("crapto1.py", "test_pt_anchor.py", "x7crypto.py"):
+    for mod in ("crapto1.py", "test_pt_anchor.py", "x7crypto.py", "chameleon_crack.py"):
         r = subprocess.run([sys.executable, mod], cwd=here, env=env,
                            capture_output=True, text=True, timeout=300)
         ok = r.returncode == 0

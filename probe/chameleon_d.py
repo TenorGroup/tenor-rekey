@@ -18,13 +18,25 @@ Hex at the JSON boundary is lowercase space-separated ("01 02 03 04"); keys are
 """
 import sys
 import json
+import time
+import queue
+import threading
 
 # Vendored upstream engine (GPLv3, RfidResearchGroup/ChameleonUltra). Imports on a
 # bare interpreter - serial/colorama/prompt_toolkit are optional in the package.
 from chameleon.chameleon_com import ChameleonCom, NotOpenException, OpenFailException
 from chameleon.chameleon_cmd import ChameleonCMD
-from chameleon.chameleon_enum import SlotNumber, TagSpecificType, MfcKeyType, Status
+from chameleon.chameleon_enum import (SlotNumber, TagSpecificType, MfcKeyType, Status,
+                                      MifareClassicPrngType, MifareClassicDarksideStatus)
 from chameleon.chameleon_utils import UnexpectedResponseError
+
+# Host-side crackers over the vendored C tools (firmware acquires nonces, host
+# cracks them). Optional: if the binaries are not built, decode degrades to the
+# on-device dictionary check and never crashes.
+try:
+    import chameleon_crack as crack
+except Exception:                        # pragma: no cover - import guard
+    crack = None
 
 # The learned-key reranker + the curated dictionary are SHARED with x7d (one cache
 # and one dictionary across both readers). Both are optional so the daemon still
@@ -44,6 +56,16 @@ CHAMELEON_VID = 0x6868
 # How many learned keys to try (after user keys, before the dictionary). Mirrors
 # x7d so the two readers rerank identically.
 LEARNED_TOP_N = 64
+
+# Attack-stage budget. The on-device dictionary check is fast; the nonce-cracking
+# attacks (nested/darkside) are the slow part, so the wall-clock budget guards them
+# (overridable per-call via params.max_seconds). Mirrors x7d's runaway watchdog.
+DEFAULT_ATTACK_SECONDS = 120
+# Darkside collects one acquisition per round and retries until the crack yields a
+# key or the parity-zero intersection converges; bounded by rounds AND the budget.
+DARKSIDE_MAX_ROUNDS = 24
+DARKSIDE_SYNC_MAX = 30                    # firmware sync attempts per round (CLI default)
+DARKSIDE_TARGET_BLOCK = 3                # sector 0 trailer, KeyA - the autopwn foothold
 
 # Public, well-known MIFARE Classic default keys (documented defaults, never card
 # secrets - safe in a public repo). The named set comes first so a factory card
@@ -114,7 +136,10 @@ def _capabilities(model):
     attacks and sniffing do not apply (P0 default; confirm the Lite on hardware)."""
     caps = {
         "slots": 8, "emulate": True, "lf": True, "dfu": True, "sniff": True,
-        "attacks": ["dict", "nested", "staticNested", "darkside", "hardnested"],
+        # hardnested is intentionally omitted: the device supports it but the host
+        # cracker is not built yet, so the tool cannot deliver it. Advertise only
+        # what decode() can actually run; add "hardnested" back when it is built.
+        "attacks": ["dict", "nested", "staticNested", "darkside"],
         "writeModes": ["normal", "denied", "deceive", "shadow", "shadowReq"],
     }
     if model != 0:                       # Lite: no reader front-end
@@ -130,13 +155,22 @@ _DEAD = (OSError, NotOpenException, OpenFailException)
 
 
 class Daemon:
-    METHODS = ("info", "poll", "slots_list", "slot_select", "mf_read_block", "decode")
+    METHODS = ("info", "poll", "slots_list", "slot_select", "mf_read_block",
+               "decode", "cancel")
 
-    def __init__(self, learned=None, port=None):
+    # Long ops whose cancel window is armed (the flag cleared) at DISPATCH, so a
+    # cancel that lands before the worker starts the op still targets it and a stale
+    # cancel from a prior op cannot leak in (mirrors x7d).
+    CANCELLABLE = ("decode",)
+
+    def __init__(self, learned=None, port=None, cracker=crack):
         self.com = None
         self.cmd = None                  # the ChameleonCMD command layer (or a fake)
         self._port = port
         self._reader_mode = None         # cached: True once the device is in reader mode
+        self.crack = cracker             # host-side crackers (injectable for tests)
+        self._cancel = threading.Event()  # cooperative abort for the long decode
+        self._emit_lock = threading.Lock()  # serialize stdout across worker + reader
         # The protocol channel, captured at construction. __main__ redirects
         # sys.stdout to stderr so vendored-library print() cannot corrupt it.
         self._out = sys.stdout
@@ -203,8 +237,9 @@ class Daemon:
         self._reader_mode = True
 
     def emit(self, obj):
-        self._out.write(json.dumps(obj) + "\n")
-        self._out.flush()
+        with self._emit_lock:
+            self._out.write(json.dumps(obj) + "\n")
+            self._out.flush()
 
     # ---- methods -----------------------------------------------------------
 
@@ -335,11 +370,17 @@ class Daemon:
         return tags[0]["uid"] if tags else None
 
     def decode(self, p):
-        """params: user_keys [hex]. DICT-ONLY recovery for P0 (nested/darkside is
-        P1): check the dictionary on-device, then read every block of each recovered
-        sector. Emits a progress event per sector. Returns the x7d decode shape. No
-        card -> raises (a clean error envelope), matching x7d / x7lib."""
+        """params: user_keys [hex], max_seconds. Full key recovery, mirroring the
+        CLI autopwn chain: (1) on-device dictionary check, then for sectors still
+        unresolved (2) nested when at least one key is known and the PRNG is weak,
+        (3) darkside when NO key is known, (4) static-nested for static-PRNG cards.
+        Every newly recovered key is fed back into the check-keys pool so a shared
+        key unlocks the other sectors. Then every block of each recovered sector is
+        read. Emits progress per stage/sector; respects a wall-clock budget and the
+        cooperative cancel flag. Returns the x7d decode shape. No card -> raises (a
+        clean error envelope), matching x7d / x7lib."""
         c = self._connect(p.get("port"))
+        deadline = time.monotonic() + int(p.get("max_seconds") or DEFAULT_ATTACK_SECONDS)
         self._ensure_reader(c)
         try:
             tags = c.hf14a_scan()
@@ -382,6 +423,16 @@ class Daemon:
             s = idx // 2
             kt = "A" if idx % 2 == 0 else "B"
             sk.setdefault(s, {})[kt] = kb.hex()
+
+        # STAGE 2: nonce-cracking attacks for sectors the dictionary could not open.
+        # The pool is every hex key proven so far; recovered keys are fed back so a
+        # shared key unlocks other sectors. Skipped cleanly when no cracker is bundled
+        # or the device has no reader-mode attacks (Lite).
+        pool = {v for f in sk.values() for v in f.values()}
+        cancelled = False
+        if self.crack is not None and any(s not in sk for s in range(n)):
+            attempts, cancelled = self._recover_attacks(
+                c, n, sk, pool, key_bytes, deadline, attempts)
 
         blocks, keys_out, recovered = {}, {}, 0
         for s in range(n):
@@ -439,7 +490,163 @@ class Daemon:
         return {"uid": hx(target), "atqa": hx(atqa), "sak": sak[0],
                 "sectors": n, "recovered": recovered,
                 "attempts": attempts, "exhausted": recovered < n,
+                "cancelled": cancelled,
                 "blocks": blocks, "keys": keys_out}
+
+    # ---- attack stage: nested / darkside / static-nested -------------------
+
+    def _pick_known(self, sk):
+        """A (block, keytype, keyhex) already proven on this card, for use as the
+        nested/static-nested KNOWN sector. None if no key is known yet."""
+        for s in sorted(sk):
+            for kt in ("A", "B"):
+                if kt in sk[s]:
+                    return trailer_block(s), kt, sk[s][kt]
+        return None
+
+    def _verify_candidates(self, c, block, cands, keytypes=("A", "B")):
+        """Return the first candidate that authenticates on `block` (crackers emit
+        candidates, not proven keys), with the keytype it worked as. (None, None) if
+        none auth. A dead port propagates; a plain auth-fail is just a miss."""
+        for keyhex in cands:
+            kb = bytes.fromhex(keyhex)
+            for kt in keytypes:
+                mkt = MfcKeyType.A if kt == "A" else MfcKeyType.B
+                try:
+                    if c.mf1_auth_one_key_block(block, mkt, kb):
+                        return keyhex, kt
+                except UnexpectedResponseError:
+                    continue
+        return None, None
+
+    def _absorb_key(self, c, n, sk, pool, key_bytes, keyhex):
+        """Fold a freshly proven key into the pool and re-check it against ALL
+        sectors on-device, so a shared key (common on hotel cards) unlocks every
+        sector it opens. Returns keys tried in the feedback check."""
+        if keyhex not in pool:
+            pool.add(keyhex)
+            key_bytes.append(bytes.fromhex(keyhex))
+        new_sk, tried = self._check_keys(c, n, [bytes.fromhex(keyhex)])
+        for idx, kb in new_sk.items():
+            s = idx // 2
+            kt = "A" if idx % 2 == 0 else "B"
+            sk.setdefault(s, {})[kt] = kb.hex()
+        return tried
+
+    def _nested_recover(self, c, known, target_blk, ttype, deadline):
+        """Weak-PRNG nested: prime the nt distance, acquire encrypted nonces, crack
+        them host-side. Returns candidate keys (verified by the caller)."""
+        blk, kt, keyhex = known
+        mkt_known = MfcKeyType.A if kt == "A" else MfcKeyType.B
+        mkt_target = MfcKeyType.A if ttype == "A" else MfcKeyType.B
+        kb = bytes.fromhex(keyhex)
+        dist = c.mf1_detect_nt_dist(blk, mkt_known, kb)          # {'uid','dist'}
+        samples = c.mf1_nested_acquire(blk, mkt_known, kb, target_blk, mkt_target)
+        if not samples:
+            return []
+        return self.crack.nested(dist["uid"], dist["dist"], samples)
+
+    def _staticnested_recover(self, c, known, target_blk, ttype):
+        """Static-PRNG nested: acquire the static nonce pairs, crack host-side."""
+        blk, kt, keyhex = known
+        mkt_known = MfcKeyType.A if kt == "A" else MfcKeyType.B
+        mkt_target = MfcKeyType.A if ttype == "A" else MfcKeyType.B
+        sn = c.mf1_static_nested_acquire(blk, mkt_known, bytes.fromhex(keyhex),
+                                         target_blk, mkt_target)
+        if not sn or not sn.get("nts"):
+            return []
+        code = 0x60 if ttype == "A" else 0x61
+        return self.crack.staticnested(sn["uid"], code, sn["nts"])
+
+    def _darkside_recover(self, c, deadline):
+        """Zero-known-key foothold: acquire darkside leaks on the sector-0 KeyA and
+        crack until a candidate authenticates or the budget/rounds run out. Returns
+        (keyhex, 'A') on success, (None, None) otherwise. Mirrors the CLI's retry +
+        NXP parity-zero reset."""
+        items, first = [], True
+        for _ in range(DARKSIDE_MAX_ROUNDS):
+            if self._cancel.is_set() or time.monotonic() > deadline:
+                break
+            resp = c.mf1_darkside_acquire(DARKSIDE_TARGET_BLOCK, MfcKeyType.A,
+                                          first, DARKSIDE_SYNC_MAX)
+            first = False
+            if not resp or resp[0] != MifareClassicDarksideStatus.OK:
+                break
+            obj = resp[1]
+            if obj["par"] != 0:                 # NXP workaround: reset accumulation
+                items = []
+            items.append({"nt1": obj["nt1"], "ks1": obj["ks1"], "par": obj["par"],
+                          "nr": obj["nr"], "ar": obj["ar"]})
+            cands, _ = self.crack.darkside(obj["uid"], items)
+            key, kt = self._verify_candidates(c, DARKSIDE_TARGET_BLOCK, cands, ("A",))
+            if key:
+                return key, kt
+        return None, None
+
+    def _recover_attacks(self, c, n, sk, pool, key_bytes, deadline, attempts):
+        """Drive the attack chain over the sectors the dictionary left unopened.
+        Returns (attempts, cancelled). A sector is 'open' once we hold any key for
+        it (A or B), which is all decode needs to read + dump it. A mid-attack card
+        swap is caught by the per-sector uid guard in the block-read stage (which
+        aborts before any key is learned), so this stage needs no separate guard."""
+        cancelled = False
+        # PRNG class decides which nested variant applies; if the device has no
+        # reader-mode attacks (Lite) this raises and we skip the whole stage.
+        try:
+            prng = int(c.mf1_detect_prng())
+        except (UnexpectedResponseError,) + _DEAD:
+            return attempts, cancelled
+
+        def unresolved():
+            return [s for s in range(n) if s not in sk]
+
+        # No key at all: darkside a foothold before any nested attack can run (the
+        # autopwn order). Its key is fed back, which may open shared sectors.
+        if not pool and unresolved():
+            self.emit({"event": "progress", "method": "decode", "stage": "darkside",
+                       "sector": DARKSIDE_TARGET_BLOCK // 4})
+            key, _kt = self._darkside_recover(c, deadline)
+            if key:
+                attempts += self._absorb_key(c, n, sk, pool, key_bytes, key)
+
+        for s in list(unresolved()):
+            if self._cancel.is_set() or time.monotonic() > deadline:
+                cancelled = True
+                break
+            if s in sk:                          # opened by an earlier feedback merge
+                continue
+            known = self._pick_known(sk)
+            target_blk = trailer_block(s)
+            if prng == MifareClassicPrngType.HARD:
+                # Hard-PRNG needs the hardnested cracker (not built in P1); report it
+                # and stop - no light attack can open these sectors.
+                self.emit({"event": "progress", "method": "decode",
+                           "stage": "hardnested", "sector": s, "supported": False})
+                break
+            if known is None:
+                break                            # darkside failed; nothing to nest from
+            stage = "nested" if prng == MifareClassicPrngType.WEAK else "staticNested"
+            self.emit({"event": "progress", "method": "decode", "stage": stage,
+                       "sector": s, "known_block": known[0]})
+            try:
+                if prng == MifareClassicPrngType.WEAK:
+                    cands = self._nested_recover(c, known, target_blk, "A", deadline)
+                else:
+                    cands = self._staticnested_recover(c, known, target_blk, "A")
+            except UnexpectedResponseError:
+                cands = []                       # acquisition faulted: treat as a miss
+            key, _kt = self._verify_candidates(c, target_blk, cands, ("A", "B"))
+            if key:
+                attempts += self._absorb_key(c, n, sk, pool, key_bytes, key)
+        return attempts, cancelled
+
+    def cancel(self, p):
+        """Cooperative abort: trip the flag the decode attack loop watches so the
+        shell can stop a long recovery WITHOUT killing the daemon; decode then
+        returns whatever it recovered so far. Handled inline by run() (off the
+        worker) so it lands while decode is still running."""
+        self._cancel.set()
+        return {"cancelled": True}
 
     # ---- dispatch ----------------------------------------------------------
 
@@ -458,8 +665,26 @@ class Daemon:
         except Exception as e:
             return {"id": rid, "error": "%s: %s" % (type(e).__name__, e)}
 
-    def run(self):
-        for line in sys.stdin:
+    def run(self, stream=None):
+        # A worker thread runs requests one at a time (the device is a single command
+        # stream, so ops never overlap) while THIS thread keeps reading stdin. A
+        # `cancel` arriving mid-decode is handled inline - off the worker - so it
+        # trips the flag the attack loop watches and the shell can abort a long
+        # recovery without killing the daemon; every other request is serialized.
+        if stream is None:
+            stream = sys.stdin
+        q = queue.Queue()
+
+        def worker():
+            while True:
+                req = q.get()
+                if req is None:
+                    return
+                self.emit(self.handle(req))
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        for line in stream:
             line = line.strip()
             if not line:
                 continue
@@ -468,8 +693,26 @@ class Daemon:
             except ValueError as e:
                 self.emit({"error": "bad json: %s" % e})
                 continue
-            self.emit(self.handle(req))
-        self._drop()
+            method = req.get("method")
+            if method == "cancel":
+                self.emit(self.handle(req))
+            else:
+                if method in self.CANCELLABLE:
+                    # Arm a fresh cancel window for THIS op at dispatch, before any
+                    # later cancel line is read - so a cancel that lands before the
+                    # worker starts the op still cancels it, and a stale cancel from a
+                    # prior op cannot leak in. The op body never clears the flag.
+                    self._cancel.clear()
+                q.put(req)
+        # EOF: abort any in-flight op and join the worker (bounded). Only drop the
+        # handle if the worker actually stopped, so close() cannot race a serial
+        # read still in flight on the worker thread (matches x7d's EOF guard). If
+        # the worker is still blocked, leave the handle for process-exit cleanup.
+        self._cancel.set()
+        q.put(None)
+        t.join(timeout=5)
+        if not t.is_alive():
+            self._drop()
 
 
 if __name__ == "__main__":
