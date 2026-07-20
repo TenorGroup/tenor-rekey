@@ -25,9 +25,11 @@ struct DeviceCapabilities: Codable, Equatable, Sendable {
 
     /// The Chameleon Ultra baseline. Used as the descriptor default until the
     /// device's own `info` manifest lands (which is authoritative, so an Ultra vs a
-    /// Lite still gates correctly once connected).
+    /// Lite still gates correctly once connected). `lf` + `sniff` are false: the
+    /// daemon does not implement LF or sniffing yet, so we mirror its manifest and
+    /// never claim a panel that has no backing verb.
     static let chameleonUltra = DeviceCapabilities(
-        slots: 8, emulate: true, lf: true, dfu: true, sniff: true,
+        slots: 8, emulate: true, lf: false, dfu: true, sniff: false,
         attacks: ["dict", "nested", "staticNested", "darkside"],
         writeModes: ["normal", "denied", "deceive", "shadow", "shadowReq"])
 

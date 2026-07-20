@@ -34,8 +34,12 @@ PY_URL="https://github.com/astral-sh/python-build-standalone/releases/download/$
 # including the cache, so a poisoned cache cannot survive.
 PY_SHA256="f0a7fa7decc75df2b1a789329a44f657c4a15c0a683f197ce46a5cb621bc6ef4"
 
-# Runtime engine modules (the daemon + its import graph) and the dictionary.
-PROBE_MODULES=(x7d.py x7lib.py x7.py x7hid.py x7_init.py x7crypto.py crapto1.py learned_keys.py)
+# Runtime engine modules (each daemon + its import graph) and the dictionary. Two
+# device stacks share the bundle: x7 (X7 reader) and chameleon (Chameleon Ultra/Lite).
+# learned_keys + dict are shared by both. The chameleon daemon additionally needs the
+# vendored chameleon/ package + the built crackers, copied as trees in step 3.
+PROBE_MODULES=(x7d.py x7lib.py x7.py x7hid.py x7_init.py x7crypto.py crapto1.py learned_keys.py
+               chameleon_d.py chameleon_crack.py)
 
 echo "==> 1/7  build release .app"
 cd "$APP_DIR"
@@ -71,10 +75,48 @@ tar -xzf "$CACHE/$PY_TARBALL" -C "$RES"        # extracts a 'python' dir
 find "$RES/python/lib" -type d -name "test" -prune -exec rm -rf {} + 2>/dev/null || true
 find "$RES/python/lib" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
 
+# Chameleon daemon runtime deps into the bundled runtime: pyserial (the serial
+# transport, imported lazily by the daemon + chameleon package) and adafruit-nrfutil
+# (the Nordic Secure DFU firmware flasher, invoked as the `adafruit-nrfutil` console
+# entry point). Both are pure-python; pip drops them into the relocatable runtime's
+# site-packages and the step-5 .pyc precompile seals them alongside the stdlib.
+echo "    pip install chameleon deps (pyserial, adafruit-nrfutil)"
+"$RES/python/bin/python3" -m pip install --no-cache-dir --no-warn-script-location \
+    --disable-pip-version-check pyserial adafruit-nrfutil >/dev/null
+# pip writes the adafruit-nrfutil console script with an ABSOLUTE shebang baked to the
+# build-time interpreter path, which no longer exists once the .app is relocated (drag
+# to /Applications, or run from the dmg). Replace it with a relocatable POSIX wrapper
+# that execs the bundled python sitting next to it, so the flasher runs under the
+# bundled runtime from any install location. The daemon calls it by name
+# (subprocess ["adafruit-nrfutil", ...]); this keeps that name pointing at the entry
+# point (nordicsemi.__main__:cli) regardless of where the bundle lands.
+ANR="$RES/python/bin/adafruit-nrfutil"
+[ -f "$ANR" ] || { echo "adafruit-nrfutil entry point missing after pip install"; exit 1; }
+printf '#!/bin/sh\nexec "$(dirname "$0")/python3" -m nordicsemi "$@"\n' > "$ANR"
+chmod +x "$ANR"
+
 echo "==> 3/7  vendor probe engine + dictionary"
 rm -rf "$RES/probe"; mkdir -p "$RES/probe/dict"
 for m in "${PROBE_MODULES[@]}"; do cp "$PROBE/$m" "$RES/probe/"; done
 cp "$PROBE/dict/mfc_keys.dic" "$RES/probe/dict/"
+# Chameleon stack: the vendored upstream engine package (chameleon_d.py imports
+# chameleon.chameleon_com / _cmd / _enum / _utils) + the built host-side crackers.
+# chameleon_crack.py resolves the binaries at native/chameleon/bin RELATIVE to itself
+# (CHAMELEON_BIN overrides), so mirror that exact layout under the bundled probe.
+cp -R "$PROBE/chameleon" "$RES/probe/chameleon"
+find "$RES/probe/chameleon" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
+mkdir -p "$RES/probe/native/chameleon/bin"
+# bin/ is gitignored, so a clean checkout has no cracker binaries: build them from the
+# tracked sources first, then require all four to exist before bundling.
+bash "$PROBE/native/chameleon/build.sh" || { echo "cracker build failed"; exit 1; }
+for b in nested staticnested darkside hardnested; do
+    src="$PROBE/native/chameleon/bin/$b"
+    [ -x "$src" ] || { echo "cracker $b not built ($src)"; exit 1; }
+    cp "$src" "$RES/probe/native/chameleon/bin/$b"
+    chmod +x "$RES/probe/native/chameleon/bin/$b"          # keep the executable bit
+done
+# liblzma: hardnested links the macOS SYSTEM /usr/lib/liblzma.5.dylib (always present
+# on macOS); the other three crackers link only libSystem. Nothing to bundle for it.
 
 echo "==> 4/7  vendor libhidapi"
 HIDAPI_SRC=""
@@ -110,6 +152,13 @@ fi
 # interpreter is the process that loads the bundled libs via ctypes).
 "${SIGN[@]}" "$FW/libhidapi.dylib"
 find "$RES/python" \( -name "*.dylib" -o -name "*.so" \) -exec "${SIGN[@]}" {} + 2>/dev/null || true
+# The vendored Chameleon crackers are standalone Mach-O helpers spawned as subprocess
+# (pure compute, no entitlements needed). Sign them so a hardened/notarizable build
+# and a strict verify cover every mach-o in the bundle.
+for b in nested staticnested darkside hardnested; do
+    "${SIGN[@]}" "$RES/probe/native/chameleon/bin/$b" || { echo "codesign failed: cracker $b"; exit 1; }
+    codesign --verify --strict "$RES/probe/native/chameleon/bin/$b" || { echo "codesign verify failed: cracker $b"; exit 1; }
+done
 find "$RES/python/bin" -type f -perm -111 -exec "${SIGN_ENT[@]}" {} + 2>/dev/null || true
 "${SIGN_ENT[@]}" "$STAGE/Contents/MacOS/tenorrekey" 2>/dev/null || true
 "${SIGN_ENT[@]}" "$STAGE"

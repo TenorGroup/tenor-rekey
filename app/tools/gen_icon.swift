@@ -7,8 +7,19 @@
 import AppKit
 import CoreText
 
-let brandFonts = "/Users/tuan/Claude/Tenor/branding/fonts/geist-sans"
-let outDir = "/Users/tuan/Claude/Tenor/tenor-rekey/app/Resources"
+// The Geist Sans faces live in the SIBLING @tenor/brand repo (.../Tenor/branding); the
+// icon lands in this repo's app/Resources. Both resolve relative to THIS source file at
+// compile time (.../app/tools/gen_icon.swift -> repo root), overridable via env, so no
+// absolute home path is baked into the tool.
+let env = ProcessInfo.processInfo.environment
+let repoRoot = URL(fileURLWithPath: #filePath)   // .../app/tools/gen_icon.swift
+    .deletingLastPathComponent()                 // tools
+    .deletingLastPathComponent()                 // app
+    .deletingLastPathComponent()                 // repo root
+let brandFonts = env["TENOR_BRAND_FONTS"]
+    ?? repoRoot.deletingLastPathComponent().appendingPathComponent("branding/fonts/geist-sans").path
+let outDir = env["REKEY_RESOURCES"]
+    ?? repoRoot.appendingPathComponent("app/Resources").path
 let iconset = outDir + "/AppIcon.iconset"
 let focal = "rekey"
 

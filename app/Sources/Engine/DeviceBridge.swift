@@ -74,8 +74,22 @@ actor DeviceBridge {
         }
         let env = ProcessInfo.processInfo.environment
         let python = URL(fileURLWithPath: env["X7_PYTHON"] ?? "/usr/bin/python3")
-        let probe = URL(fileURLWithPath: env["X7_PROBE_DIR"] ?? "/Users/tuan/Claude/Tenor/tenor-rekey/probe")
+        let probe = URL(fileURLWithPath: env["X7_PROBE_DIR"] ?? Self.devProbeDir)
         return (python, probe, scriptURL(probeRoot: probe, descriptor: descriptor))
+    }
+
+    /// Last-resort dev-checkout probe dir, computed from THIS source file's location at
+    /// compile time (.../app/Sources/Engine/DeviceBridge.swift -> repo root -> /probe) so
+    /// a from-source run still finds probe/ without baking in an absolute home path. A
+    /// shipped app never reaches this (the bundled Resources copy wins first), nor does a
+    /// run that sets X7_PROBE_DIR.
+    private static var devProbeDir: String {
+        URL(fileURLWithPath: #filePath)   // .../app/Sources/Engine/DeviceBridge.swift
+            .deletingLastPathComponent()  // Engine
+            .deletingLastPathComponent()  // Sources
+            .deletingLastPathComponent()  // app
+            .deletingLastPathComponent()  // repo root
+            .appendingPathComponent("probe").path
     }
 
     private static func scriptURL(probeRoot: URL, descriptor: DeviceDescriptor) -> URL {

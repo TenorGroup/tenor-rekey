@@ -346,9 +346,9 @@ def test_cham_info(check):
     check("info surfaces the chip id as serial (no real card uid)",
           r["serial"] == "aabbccddeeff0011")
     check("info hw carries app version + git", "app 1.2" in r["hw"] and "0abcdef" in r["hw"], r["hw"])
-    check("capabilities manifest has the SPEC 2.3 shape",
-          caps.get("slots") == 8 and caps.get("emulate") is True and caps.get("lf") is True
-          and caps.get("dfu") is True and caps.get("sniff") is True, str(caps))
+    check("capabilities manifest has the SPEC 2.3 shape (lf/sniff off until built)",
+          caps.get("slots") == 8 and caps.get("emulate") is True and caps.get("lf") is False
+          and caps.get("dfu") is True and caps.get("sniff") is False, str(caps))
     check("capabilities lists the attack + writeMode surface",
           caps.get("attacks") == ["dict", "nested", "staticNested", "darkside"]
           and caps.get("writeModes") == ["normal", "denied", "deceive", "shadow", "shadowReq"],

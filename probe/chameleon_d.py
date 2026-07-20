@@ -202,18 +202,20 @@ def _sense(s):
 def _capabilities(model):
     """The capability manifest the shell reads to gate panels (SPEC 2.3). Built
     from the device model, not hardcoded: model 0 = Ultra, 1 = Lite. The Lite has
-    the same 8 slots + emulation + LF + DFU but no HF/LF reader, so reader-mode
-    attacks and sniffing do not apply (P0 default; confirm the Lite on hardware)."""
+    the same 8 slots + emulation + DFU but no HF reader, so reader-mode attacks do
+    not apply (P0 default; confirm the Lite on hardware)."""
     caps = {
-        "slots": 8, "emulate": True, "lf": True, "dfu": True, "sniff": True,
-        # hardnested is intentionally omitted: the device supports it but the host
-        # cracker is not built yet, so the tool cannot deliver it. Advertise only
-        # what decode() can actually run; add "hardnested" back when it is built.
+        # lf + sniff are FALSE until the daemon actually implements them: the device
+        # has the LF hardware and can sniff, but this daemon exposes no LF method and
+        # no sniffer yet, so advertising them would light up shell panels that do
+        # nothing. hardnested is omitted for the same reason - the device supports it
+        # but the host cracker is not wired into decode() yet. Advertise only what the
+        # daemon can deliver; flip each on when it is built.
+        "slots": 8, "emulate": True, "lf": False, "dfu": True, "sniff": False,
         "attacks": ["dict", "nested", "staticNested", "darkside"],
         "writeModes": ["normal", "denied", "deceive", "shadow", "shadowReq"],
     }
-    if model != 0:                       # Lite: no reader front-end
-        caps["sniff"] = False
+    if model != 0:                       # Lite: no reader front-end -> no attacks
         caps["attacks"] = []
     return caps
 

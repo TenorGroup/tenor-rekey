@@ -5,11 +5,16 @@ Single source of truth = the brand package; we never hand-type brand hex /
 opacity / radius in Swift (brand-lint rule: no hardcoded brand data). Re-run
 after the brand package changes:  python3 app/tools/gen_brand.py
 """
+import os
 import re
 import pathlib
 
 HERE = pathlib.Path(__file__).resolve()
-BRAND = pathlib.Path("/Users/tuan/Claude/Tenor/branding/packages/brand/src")
+# The @tenor/brand package is a SIBLING repo (.../Tenor/branding). Resolve it relative
+# to this file (.../Tenor/tenor-rekey/app/tools/gen_brand.py -> .../Tenor -> branding),
+# overridable with TENOR_BRAND_SRC, so no absolute home path is baked into the tool.
+BRAND = pathlib.Path(os.environ.get("TENOR_BRAND_SRC")
+                     or HERE.parents[3] / "branding" / "packages" / "brand" / "src")
 SRC = BRAND / "tokens.js"
 ASSETS = BRAND / "assets.js"
 OUT = HERE.parent.parent / "Sources" / "Brand" / "TenorBrand.generated.swift"
