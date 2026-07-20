@@ -11,6 +11,15 @@ the upstream CLI's argv/stdout contract exactly (AUDIT PART B):
   nested        weak-PRNG    argv: uid dist (nt nt_enc par)...   DECIMAL radix
   staticnested  static-PRNG  argv: uid type (nt nt_enc)...       DECIMAL radix
   darkside      zero-key     argv: uid (nt ks par nr ar)...      DECIMAL radix
+  hardnested    hard-PRNG    argv: nonces.bin                    pm3 nonce file
+
+hardnested (hardened-PRNG / MFC Ev1) is the ciphertext-only attack. Unlike the
+other three it reads a binary pm3 nonce file (header uid/sector/key_type, then the
+encrypted-nonce blob from mf1_hardnested_nonces_acquire) rather than decimal argv,
+and it prints the key on a "Key found:" line amid verbose progress; its wrapper
+parses only that line (the progress table also prints 12-digit decimal state counts
+that the generic scrape would mistake for keys). It needs liblzma to inflate the
+bitflip tables: the system dylib on macOS, so nothing is bundled in P5.
 
 Every recovered key is a CANDIDATE: the caller MUST verify it by an on-card auth
 before trusting it (the CLI does the same). Key extraction uses the CLI's own regex
@@ -23,7 +32,9 @@ self-test (proves the built binaries recover a synthetic known key; no hardware)
 """
 import os
 import re
+import struct
 import subprocess
+import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 # Packaging note: the app bundle ships these binaries next to the Python modules;
@@ -114,6 +125,51 @@ def darkside(uid, items, timeout=DEFAULT_TIMEOUT):
     return _scrape(out), ("key not found" not in out.lower())
 
 
+# hardnested reads a binary pm3 nonce file, not decimal argv, and its key is on a
+# dedicated "Key found:" line: scope the scrape there (its progress table prints
+# 12-digit decimal #states counts that the generic 12-hex scrape would grab).
+_HARDKEY = re.compile(r"[Kk]ey found:\s*([0-9a-fA-F]{12})")
+
+
+def assemble_nonce_bin(uid, sector, key_type, body):
+    """Build the pm3 hardnested nonce file: header uid(4, big-endian) sector(1)
+    key_type(1) followed by `body`, the raw encrypted-nonce blob from the firmware
+    (repeated nt_enc1(4, BE) nt_enc2(4, BE) par(1), 9 bytes per pair). `key_type`
+    is 0 for KeyA / 1 for KeyB (the .bin convention); 0x60/0x61 are accepted too."""
+    kt = 1 if int(key_type) in (1, 0x61) else 0
+    return struct.pack(">IBB", int(uid) & 0xFFFFFFFF, int(sector) & 0xFF, kt) + bytes(body)
+
+
+def _scrape_hardnested(stdout):
+    out, seen = [], set()
+    for m in _HARDKEY.findall(stdout):
+        k = m.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def hardnested(uid, sector, key_type, body, timeout=DEFAULT_TIMEOUT):
+    """Hard-PRNG (MFC Ev1) crack. `body` is the encrypted-nonce blob streamed by the
+    firmware's mf1_hardnested_nonces_acquire (9 bytes per pair, see assemble_nonce_bin).
+    Prepends the pm3 header and runs the vendored `hardnested` on the assembled file.
+    Returns (candidates, found): `found` is False when the tool prints "Key not found."
+    (too few nonces / wrong known key - the caller acquires more and retries)."""
+    blob = assemble_nonce_bin(uid, sector, key_type, body)
+    # hardnested writes its scratch temp_nonces.txt in the CWD, so run it inside a
+    # throwaway dir (the daemon may launch from a read-only bundle).
+    with tempfile.TemporaryDirectory() as td:
+        binpath = os.path.join(td, "nonces.bin")
+        with open(binpath, "wb") as f:
+            f.write(blob)
+        proc = subprocess.run(
+            [tool_path("hardnested"), binpath],
+            capture_output=True, text=True, cwd=td, timeout=timeout)
+    keys = _scrape_hardnested(proc.stdout)
+    return keys, (proc.returncode == 0 or bool(keys))
+
+
 # ---------------------------------------------------------------------------
 # Offline forward-sim self-test: synthesize firmware-shaped nonces for a known
 # key, run the built binaries, prove they recover it. No hardware, no real keys.
@@ -149,6 +205,47 @@ def _sim_static_pair(key, uid, base_nt, dist):
     ntp = crapto1.prng_successor(base_nt, dist)
     ks1 = crapto1.crypto1_word(crapto1.crypto1_create(key), (uid ^ ntp) & 0xFFFFFFFF, 0)
     return {"nt": base_nt, "nt_enc": (ntp ^ ks1) & 0xFFFFFFFF}
+
+
+def _sim_hard_nonce(key, uid, nt):
+    """Encrypt one plaintext tag nonce `nt` under `key` exactly as an Ev1 tag does in
+    a nested auth, matching the Chameleon firmware (authex + mf1_hardnested_nonces_
+    acquire): the LFSR is clocked with uid^nt, nt_enc = nt ^ keystream, and the tag's
+    RAW wire parity per byte (oddparity8(plaintext) ^ next keystream bit) is stored
+    byte0 -> bit3 .. byte3 -> bit0. Returns (nt_enc, par_nibble)."""
+    import crapto1
+    pcs = crapto1.crypto1_create(key)
+    in_stream = (uid ^ nt) & 0xFFFFFFFF
+    nt_enc = 0
+    par = 0
+    for j in range(32):
+        ks_bit = crapto1.crypto1_bit(pcs, crapto1.BEBIT(in_stream, j), 0)
+        nt_bit = crapto1.BEBIT(nt, j)
+        nt_enc |= ((nt_bit ^ ks_bit) & 1) << (24 ^ j)
+        if (j & 7) == 7:                                 # finished a byte
+            pos = j >> 3                                 # 0 = most significant byte
+            ks_next = crapto1.filter(pcs.odd)
+            nt_byte = (nt >> (24 - 8 * pos)) & 0xFF
+            wire_par = ks_next ^ _oddparity8(nt_byte)
+            par |= (wire_par & 1) << (3 - pos)
+    return nt_enc & 0xFFFFFFFF, par & 0x0F
+
+
+def _sim_hard_body(key, uid, pairs, seed=0xACE12345):
+    """Firmware-shaped hardnested nonce blob for `key`: `pairs` chunks of nt_enc1(BE)
+    nt_enc2(BE) packed-par, from a deterministic nonce stream so the KAT is
+    reproducible. Ev1 nonces are effectively random 32-bit, which is what we feed."""
+    body = bytearray()
+    for _ in range(pairs):
+        seed ^= (seed << 13) & 0xFFFFFFFF; seed ^= seed >> 17; seed ^= (seed << 5) & 0xFFFFFFFF
+        nt1 = seed
+        seed ^= (seed << 13) & 0xFFFFFFFF; seed ^= seed >> 17; seed ^= (seed << 5) & 0xFFFFFFFF
+        nt2 = seed
+        e1, p1 = _sim_hard_nonce(key, uid, nt1)
+        e2, p2 = _sim_hard_nonce(key, uid, nt2)
+        body += struct.pack(">II", e1, e2)
+        body.append(((p1 & 0x0F) << 4) | (p2 & 0x0F))
+    return bytes(body)
 
 
 def _selftest():
@@ -192,6 +289,21 @@ def _selftest():
                                         "nr": 0x22222222, "ar": 0x33333333}])
         assert found is False, "darkside unexpectedly reported a key on a null vector"
         print("[ok] darkside binary runs and reports no-key on a null vector")
+
+    # hardnested: full cryptographic KAT. Synthesize a firmware-shaped Ev1 nonce set
+    # for the planted key (same encryption + raw wire-parity packing as the on-device
+    # mf1_hardnested_nonces_acquire) and prove the built binary recovers it offline.
+    # ~4000 pairs guarantees the tool sees all 256 first bytes with a valid sum
+    # property; recovery runs in a few seconds. Needs liblzma - present on macOS.
+    if available("hardnested"):
+        body = _sim_hard_body(KEY, UID, 4000)
+        hcands, hfound = hardnested(UID, 3, 0, body)     # sector 3, KeyA (0)
+        assert hfound and KEY_HEX in hcands, \
+            "hardnested did not recover the known key: found=%r cands=%r" % (hfound, hcands)
+        print("[ok] hardnested recovers %s from %d simulated Ev1 nonces" % (KEY_HEX, 8000))
+    else:
+        print("[SKIP] hardnested not built (needs liblzma: system dylib on macOS, "
+              "-llzma elsewhere); hard-PRNG decode is UNPROVEN in this run")
 
     print("\nALL CHAMELEON_CRACK SELF-TESTS PASSED")
     return 0

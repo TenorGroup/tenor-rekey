@@ -12,15 +12,26 @@ acquires the encrypted nonces on-device; these host-side tools crack them into
 keys. tenor/rekey drives them by subprocess from probe/chameleon_crack.py,
 mirroring the upstream CLI's argv/stdout contract.
 
+The hard-PRNG (MFC Ev1) attack is vendored verbatim under
+src/hardnested_recovery/ (the upstream software/src/HardnestedRecovery/ tree:
+cmdhfmfhard, the hardnested/ bitslice core, the pm3/ helpers, and its own
+crapto1/crypto1/parity which differ from the flat ones above). It is the
+Meijer/Verdult ciphertext-only attack and carries the Proxmark3 GPLv3 headers.
+
+src/hardnested_recovery/lzma_headers/ holds the xz-utils <lzma.h> API headers
+(SPDX 0BSD, from xz 5.8.3), vendored so the build resolves the header offline
+without CMake FetchContent. hardnested LINKS the system liblzma (-llzma): macOS
+ships /usr/lib/liblzma.5.dylib and the SDK the liblzma.tbd stub, so the runtime
+dependency is a stock system dylib and nothing needs bundling.
+
 License: GPL. Individual files carry "GNU GPL, version 2 or (at your option) any
 later version"; the ones without a per-file header inherit the project license.
 This is compatible with tenor/rekey's own GPLv3 (see the repo-root LICENSE).
 Copyright notices in the source headers (e.g. "Copyright (C) 2008-2014 bla") are
-preserved unmodified.
+preserved unmodified. The vendored lzma_headers/ keep their 0BSD SPDX tags.
 
-Build: run build.sh to compile nested, staticnested and darkside for macOS arm64
-into bin/ (git-ignored). Only these three tools are built here; hardnested
-(hard-PRNG) is a follow-up (it needs the HardnestedRecovery tree plus liblzma).
+Build: run build.sh to compile nested, staticnested, darkside and hardnested for
+macOS arm64 into bin/ (git-ignored).
 
 Do not edit the files under src/ - they are upstream. Re-vendor from the source
 repo if an update is needed, keeping the license and copyright headers intact.
