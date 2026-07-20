@@ -20,6 +20,7 @@ import tempfile
 import x7d
 import x7lib
 import learned_keys
+import test_chameleon
 
 # Keep every test's default learned-key cache off the real App Support store.
 os.environ.setdefault("X7_LEARNED_PATH",
@@ -741,6 +742,9 @@ if __name__ == "__main__":
     test_learned_keys()
     test_daemon_learned_cache()
     test_subprocess_selftests()
+    # Chameleon Ultra daemon (chameleon_d) - hardware-free, FakeChameleon-driven.
+    for t in test_chameleon.TESTS:
+        t(check)
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
     if FAIL:
         print("FAILED:", ", ".join(FAIL))
