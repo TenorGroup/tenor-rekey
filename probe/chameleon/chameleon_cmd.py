@@ -304,7 +304,7 @@ class ChameleonCMD:
     def hf14a_4_reader_apdu(self, apdu: bytes):
         """
         Select card (with RATS) and send one ISO14443-4 T=CL APDU in a single
-        firmware call — avoiding the USB round-trip gap that would depower the card.
+        firmware call - avoiding the USB round-trip gap that would depower the card.
 
         :param apdu: raw APDU bytes (no PCB wrapping needed)
         :return: response object with resp.data = APDU response bytes (no PCB/CRC)
@@ -531,7 +531,7 @@ class ChameleonCMD:
           [2 bytes: bit count, big-endian] [N bytes: frame data, ceil(bits/8)] ...
 
         :param timeout_ms: Listen duration in ms (1-30000, default 5000)
-        :return: Raw response — check .status and .data
+        :return: Raw response - check .status and .data
         """
         timeout_ms = max(1, min(30000, timeout_ms))
         payload = bytes([(timeout_ms >> 8) & 0xFF, timeout_ms & 0xFF])
@@ -545,8 +545,8 @@ class ChameleonCMD:
 
         The firmware polls for a tag in the field for up to `timeout_ms`
         milliseconds, then performs anticoll + SELECT + (optional RATS) +
-        AUTH and packs all frames — synthesized anticoll plus the live
-        AUTH/NT/NR||AR/AT — into the same buffer format used by hf14a_sniff:
+        AUTH and packs all frames - synthesized anticoll plus the live
+        AUTH/NT/NR||AR/AT - into the same buffer format used by hf14a_sniff:
           [2 bytes: bit count, big-endian] [N bytes: frame data, ceil(bits/8)] ...
         Bit 15 of the bit-count header: 0 = reader→card, 1 = card→reader.
 
@@ -554,7 +554,7 @@ class ChameleonCMD:
         :param key_type:   0x60 (Key A) or 0x61 (Key B)
         :param key:        6-byte sector key
         :param timeout_ms: tag-presence polling timeout in ms (1-30000)
-        :return: Raw response — check .status and .data
+        :return: Raw response - check .status and .data
         """
         if key_type not in (0x60, 0x61):
             raise ValueError("key_type must be 0x60 (Key A) or 0x61 (Key B)")
@@ -709,7 +709,7 @@ class ChameleonCMD:
         Each byte is an 8-bit ADC value: ~0x80 = field on, lower = gap/no field.
 
         :param timeout_ms: Capture duration in ms (1-10000, default 2000)
-        :return: Raw response object — check .status and .data
+        :return: Raw response object - check .status and .data
         """
         timeout_ms = max(1, min(10000, timeout_ms))
         payload = bytes([(timeout_ms >> 8) & 0xFF, timeout_ms & 0xFF])
@@ -722,11 +722,11 @@ class ChameleonCMD:
         Read an EM4x05 or EM4x69 tag (reader-talk-first).
 
         Response payload (14 bytes, big-endian):
-          config    4 bytes  — block 0 configuration word
-          uid       4 bytes  — EM4x05 UID
-          uid_hi    4 bytes  — EM4x69 uid_hi (zero for plain EM4x05)
-          is_em4x69 1 byte   — 1 if a 64-bit EM4x69 UID was read
-          uid_block 1 byte   — block number UID was read from
+          config    4 bytes  - block 0 configuration word
+          uid       4 bytes  - EM4x05 UID
+          uid_hi    4 bytes  - EM4x69 uid_hi (zero for plain EM4x05)
+          is_em4x69 1 byte   - 1 if a 64-bit EM4x69 UID was read
+          uid_block 1 byte   - block number UID was read from
 
         :param pwd: 32-bit password for LOGIN (default 0x00000000)
         :return: parsed tuple (config, uid, uid_hi, is_em4x69, uid_block)
