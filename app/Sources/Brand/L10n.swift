@@ -264,6 +264,12 @@ final class L10n {
         "no_device_hint":     ["vi": "chưa thấy thiết bị nào. kiểm tra cáp là loại truyền dữ liệu (không phải cáp chỉ sạc) và thử cổng usb khác.", "en": "no device detected - check the cable is a data cable, not charge-only, and try another usb port.", "zh": "未检测到设备 - 请确认使用的是数据线而非仅充电线，并换一个 usb 口试试。", "ja": "デバイスが見つかりません - ケーブルが充電専用ではなくデータ用か確認し、別の usb ポートを試してください。"],
         "unrecognized_port_hint": ["vi": "tìm thấy cổng serial nhưng không phải đầu đọc nào được nhận diện. nếu đây là chameleon, hãy kết nối thủ công, hoặc kiểm tra bạn đang dùng cáp truyền dữ liệu.", "en": "found serial ports but none is a recognized reader - if this is your chameleon connect it manually, or check you are using a data cable.", "zh": "找到串口但没有可识别的读卡器 - 若这是你的 chameleon，请手动连接，或确认使用的是数据线。", "ja": "シリアルポートは見つかりましたが認識できる読み取り機がありません - これがお使いの chameleon なら手動で接続するか、データ用ケーブルか確認してください。"],
         "bluetooth":          ["vi": "bluetooth", "en": "bluetooth", "zh": "蓝牙", "ja": "bluetooth"],
-        "bluetooth_later":    ["vi": "sẽ thêm ở bản cập nhật sau", "en": "added in a later update", "zh": "将在后续更新中加入", "ja": "今後のアップデートで追加"],
+        "bt_scan":            ["vi": "quét", "en": "scan", "zh": "扫描", "ja": "スキャン"],
+        "bt_stop":            ["vi": "dừng", "en": "stop", "zh": "停止", "ja": "停止"],
+        "bt_none":            ["vi": "chưa thấy chameleon nào qua bluetooth", "en": "no chameleon found over bluetooth", "zh": "未通过蓝牙发现 chameleon", "ja": "bluetooth で chameleon が見つかりません"],
+        "bt_off":             ["vi": "bluetooth đang tắt - bật lên để kết nối không dây", "en": "bluetooth is off - turn it on to connect wirelessly", "zh": "蓝牙已关闭 - 打开后即可无线连接", "ja": "bluetooth がオフです - オンにすると無線で接続できます"],
+        "bt_unauthorized":    ["vi": "chưa cấp quyền bluetooth - bật trong cài đặt hệ thống > quyền riêng tư & bảo mật > bluetooth", "en": "bluetooth permission is off - enable it in system settings > privacy & security > bluetooth", "zh": "未授予蓝牙权限 - 请在系统设置 > 隐私与安全性 > 蓝牙中启用", "ja": "bluetooth の権限がオフです - システム設定 > プライバシーとセキュリティ > bluetooth で有効にしてください"],
+        "bt_unsupported":     ["vi": "máy mac này không có bluetooth le", "en": "this mac has no bluetooth le", "zh": "此 mac 不支持 bluetooth le", "ja": "この mac には bluetooth le がありません"],
+        "bt_dfu_note":        ["vi": "cập nhật firmware qua usb, không qua bluetooth", "en": "update firmware over usb, not bluetooth", "zh": "请通过 usb 更新固件，而非蓝牙", "ja": "ファームウェアは bluetooth ではなく usb で更新してください"],
     ]
 }

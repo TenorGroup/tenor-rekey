@@ -39,6 +39,11 @@ final class AppModel {
     var detectedDevices: [DeviceDescriptor] = []
     /// Every enumerated USB serial port (the manual-connect list).
     var serialPorts: [SerialPortInfo] = []
+    /// The Bluetooth LE radio for a wireless Chameleon link. Nested @Observable, so a view
+    /// that reads `model.ble.state` / `model.ble.devices` re-renders on its changes. A BLE
+    /// link is never auto-detected (it is not on the USB bus); it is opened only by the
+    /// explicit `bleConnect` from the Connect surface.
+    let ble = BLEManager()
 
     /// The working DOCUMENT: the image produced by a decode or loaded from a file.
     /// It is what the canvas shows, what Save writes out, and what Write clones onto
@@ -140,10 +145,21 @@ final class AppModel {
     /// the teardown await cannot grab the just-terminated bridge or the stale card.
     private var swapping = false
 
+    /// A BLE connect is in flight: the radio link + loopback bridge are being brought up,
+    /// which can take up to ~15s before `swapDevice` even runs. Reserved for that whole
+    /// window so a monitor tick or a second selection cannot interleave and swap the device
+    /// out from under the pending connect.
+    private var bleConnecting = false
+
     /// A device op already owns the reader. Reconnect / swap must not replace the
     /// bridge under one, and a second op must not start while one runs. Slot ops are
     /// included so a slot edit and a decode / clone can never overlap on the reader.
-    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy || slotBusy || flashing || lfBusy }
+    /// `bleConnecting` is folded in so EVERY op that guards `!deviceBusy` (reader ops,
+    /// firmware, connect) also refuses during the up-to-15s BLE connect window, where
+    /// `deviceOverBLE` still describes the OUTGOING device. `bleConnect` itself is safe:
+    /// it guards on `canChangeDevice` BEFORE setting `bleConnecting`, and its `swapDevice`
+    /// call guards only on `swapping`, not `deviceBusy`.
+    private var deviceBusy: Bool { decoding || cloning || formatting || apduBusy || slotBusy || flashing || lfBusy || bleConnecting }
 
     /// The active bridge, created lazily for the current descriptor. A prior bridge
     /// for a different device is torn down explicitly on the swap path (which nils
@@ -173,14 +189,20 @@ final class AppModel {
     var activeDeviceFamily: String { descriptor.family }
 
     /// A device swap / (re)connect is in flight, exposed read-only so the Connect
-    /// surface can show a spinner and disable Rescan while it runs.
-    var connecting: Bool { swapping }
+    /// surface can show a spinner and disable Rescan while it runs. A BLE connect is
+    /// included: its link-up window precedes the swap and must read as busy too.
+    var connecting: Bool { swapping || bleConnecting }
+
+    /// True when the active device is driven over a BLE loopback bridge (its port is pinned
+    /// to `tcp:...`). Firmware update over BLE is unsafe (the USB DFU flasher could hit the
+    /// wrong physical device), so the firmware UI and its methods gate on this being false.
+    var deviceOverBLE: Bool { descriptor.portOverride?.hasPrefix("tcp:") == true }
 
     /// The manual Connect controls (Rescan, the serial-port rows, the free-text connect)
     /// may act only when no swap or device op owns the reader - the same guard `connect`,
     /// `rescan`, and `connectManual` enforce - so a tap during one is a disabled control,
     /// never a silent no-op that the user reads as the app ignoring them.
-    var canChangeDevice: Bool { !swapping && !deviceBusy }
+    var canChangeDevice: Bool { !swapping && !deviceBusy && !bleConnecting }
 
     /// The user's editable keys (Settings > Dictionaries), tried before the
     /// daemon's large built-in dictionary.
@@ -252,6 +274,11 @@ final class AppModel {
     /// monitor tell a still-present pin (leave it) from one whose device was unplugged.
     private func pinnedPortPresent() -> Bool {
         guard let pinned = descriptor.portOverride else { return false }
+        // A BLE link pins a "tcp:127.0.0.1:<port>" bridge, not a serial /dev path, so the
+        // serial-port scan below would report it absent and the monitor would swap away from a
+        // live wireless link. It is "present" for as long as the manager holds the link; once
+        // the BLE link drops, this reads false and a normal hot-swap is allowed.
+        if pinned.hasPrefix("tcp:") { return ble.isConnected }
         return USBProbe.serialPorts().contains { $0.path == pinned }
     }
 
@@ -294,6 +321,53 @@ final class AppModel {
             portOverride: port)
         await swapDevice(to: manual)
         refreshConnectLists()
+    }
+
+    // ---- Bluetooth LE connect ----------------------------------------------
+
+    /// Begin / end a BLE scan for Chameleon advertisers. Thin pass-throughs so the Connect
+    /// surface drives the radio without importing the manager directly.
+    func bleStartScan() { ble.startScan() }
+    func bleStopScan() { ble.stopScan() }
+
+    /// Connect a scanned BLE Chameleon: bring up the radio link + its loopback TCP bridge,
+    /// then model it as a Chameleon-Ultra descriptor whose port is pinned to that bridge
+    /// (`tcp:127.0.0.1:<port>`), so the daemon speaks the SAME protocol it uses over USB.
+    /// Routes through `swapDevice` so the old daemon is torn down (never orphaned).
+    ///
+    /// A device advertising the Nordic DFU service is refused here (the view also hides its
+    /// connect action): firmware update over BLE is out of scope, so a bootloader device must
+    /// be recovered over USB.
+    func bleConnect(_ id: String) async {
+        guard canChangeDevice else { return }
+        guard let dev = ble.devices.first(where: { $0.id == id }), !dev.isDFU else { return }
+        // Reserve the whole connect (up to ~15s) so a monitor tick / second selection cannot
+        // interleave: bleConnecting gates canChangeDevice, connecting, and the monitor. It does
+        // NOT block the swapDevice call below (that guards on its own `swapping`).
+        bleConnecting = true
+        defer { bleConnecting = false }
+        // A BLE-A -> BLE-B switch needs no pre-disconnect here: ble.connect() now serialises
+        // internally (teardownAndWait tears down A and waits for its didDisconnect before
+        // connecting B), so dropping A here would be redundant.
+        do {
+            let port = try await ble.connect(id)
+            let base = DeviceRegistry.chameleonUltra
+            let desc = DeviceDescriptor(
+                id: "chameleon-ble:\(id)",
+                family: base.family,
+                displayName: base.displayName,
+                daemonScript: base.daemonScript,
+                probeSubdir: base.probeSubdir,
+                usbMatch: base.usbMatch,
+                capabilities: base.capabilities,
+                portOverride: "tcp:127.0.0.1:\(port)")
+            await swapDevice(to: desc)
+            ble.stopScan()
+            refreshConnectLists()
+        } catch {
+            lastError = "\(error)"
+            ble.disconnect()
+        }
     }
 
     /// Bring up the daemon for the active `descriptor`: read device info + key counts,
@@ -343,7 +417,7 @@ final class AppModel {
     func monitor() async {
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(1.5))
-            if deviceBusy || swapping { continue }
+            if deviceBusy || swapping || bleConnecting { continue }
             // Hot-swap detection runs even while emulating: unplugging an emulating
             // Chameleon and attaching another device must still tear down + swap. It is a
             // cheap IORegistry presence scan (no device I/O), so it is safe in tag mode.
@@ -384,6 +458,10 @@ final class AppModel {
         guard !swapping else { return }
         swapping = true
         defer { swapping = false }              // released however this returns
+        // Whether the OUTGOING device is a BLE link, captured BEFORE `descriptor` is
+        // reassigned. Swapping INTO a BLE device leaves this false (the outgoing device is
+        // USB/X7), so its radio teardown below fires only when LEAVING a BLE device.
+        let oldWasBLE = descriptor.portOverride?.hasPrefix("tcp:") == true
         let old = bridge
         bridge = nil                            // detach: no path can obtain the old bridge now
         descriptor = found
@@ -396,6 +474,12 @@ final class AppModel {
         }
         await old?.shutdown()                   // bounded terminate + drain of the old daemon
         await openCurrentDevice()               // creates + brings up the new bridge
+        // Leaving a BLE device for a NON-BLE one: close the radio + its loopback TCP bridge
+        // now that the old daemon is gone and the new device is open. Gated on the NEW device
+        // not being BLE too: a BLE->BLE switch is driven by bleConnect, which already dropped
+        // the old link and brought up the new one before this swap, so disconnecting here
+        // would kill the freshly-connected link. Idempotent.
+        if oldWasBLE, found.portOverride?.hasPrefix("tcp:") != true { ble.disconnect() }
     }
 
     /// Drop the Chameleon-scoped slot library + emulation state on a device swap or a
@@ -1210,6 +1294,9 @@ final class AppModel {
     /// the current version with a null latest + a note.
     func checkFirmware() async {
         guard capabilities.dfu, !swapping, !deviceBusy else { return }
+        // Firmware update is never offered over a BLE link (the USB DFU flasher could hit the
+        // wrong physical device). Defensive: the button is already hidden over BLE.
+        guard !deviceOverBLE else { return }
         flashError = nil
         // A device already in the bootloader has no command interface to query: leave the
         // status empty (the sheet shows the Ultra/Lite recovery choice) rather than erroring.
@@ -1227,6 +1314,9 @@ final class AppModel {
     /// mistake the reboot for an unplug.
     func flashFirmware(model: String?) async {
         guard capabilities.dfu, !swapping, !deviceBusy else { return }
+        // Never flash over a BLE link (the USB DFU flasher could hit the wrong physical
+        // device). Defensive: the firmware button is hidden over BLE.
+        guard !deviceOverBLE else { return }
         flashing = true
         flashDone = false
         flashError = nil

@@ -171,7 +171,13 @@ class ChameleonCom:
         try:
             assert self.transport is not None
             if self.transport_type is TransportType.SOCKET:
-                self.transport.shutdown()
+                # LOCAL PATCH (tenor/rekey): shutdown() requires a `how` argument; the bare
+                # call raised TypeError and skipped close() below. Guard it in its own
+                # try/except so a peer-closed socket (OSError) still falls through to close().
+                try:
+                    self.transport.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             self.transport.close()
         except Exception:
             pass
@@ -210,6 +216,13 @@ class ChameleonCom:
                 except socket.timeout:
                     continue
                 except OSError:
+                    print(color_string(CR, 'socket closed'))
+                    self.transport = None
+                    break
+                # LOCAL PATCH (tenor/rekey): an orderly TCP close makes recv() return b'',
+                # not raise. Treat zero bytes as EOF and exit like the OSError branch;
+                # otherwise this loop hot-spins on empty reads forever.
+                if len(data_bytes) == 0:
                     print(color_string(CR, 'socket closed'))
                     self.transport = None
                     break

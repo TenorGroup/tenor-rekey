@@ -33,6 +33,7 @@ private struct DeviceSettings: View {
                 }
             }
             Button(l.t("reconnect")) { Task { await model.connect() } }
+                .disabled(model.connecting)
         }
         .formStyle(.grouped)
     }

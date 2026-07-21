@@ -1,11 +1,11 @@
 import SwiftUI
 
-/// The Connect surface, opened from the header status pill or the empty state. USB
-/// only for now: it lists the known readers present on the bus, lets the user RESCAN,
-/// and manually pin a serial port when auto-detect does not recognise the device (the
-/// Chameleon-over-USB case). Bluetooth is a deliberately DISABLED placeholder for a
-/// later pass. Instrument aesthetic: hairlines, muted tokens, mono for machine
-/// identifiers (port paths), sans for chrome, signal via glyph + weight, no alarm colour.
+/// The Connect surface, opened from the header status pill or the empty state. It lists
+/// the known readers present on the USB bus, lets the user RESCAN, manually pin a serial
+/// port when auto-detect does not recognise the device (the Chameleon-over-USB case), and
+/// scan for + connect a Chameleon over Bluetooth LE. Instrument aesthetic: hairlines, muted
+/// tokens, mono for machine identifiers (port paths, rssi), sans for chrome, signal via
+/// glyph + weight, no alarm colour.
 struct ConnectView: View {
     @Environment(AppModel.self) private var model
     @Environment(Theme.self) private var theme
@@ -24,12 +24,26 @@ struct ConnectView: View {
                 divider
                 diagnostics(hint)
             }
-            divider
-            bluetoothRow
+            bluetoothSection
         }
         .frame(width: 340)
         .background(theme.p.panel)
-        .onAppear { model.refreshConnectLists() }
+        .onAppear {
+            model.refreshConnectLists()
+            // Kick the BLE radio so its state (and any advertisers) become known while the
+            // Connect surface is open. startScan lazily creates the central - which is what
+            // learns the state and raises the one-time permission prompt - and only actually
+            // scans once powered on, so it is safe in every state. Skip it when we already
+            // know the radio is off / unauthorized / unsupported (no point re-probing), and
+            // never while a swap or device op owns the reader.
+            if model.canChangeDevice,
+               model.ble.state != .poweredOff,
+               model.ble.state != .unauthorized,
+               model.ble.state != .unsupported {
+                model.bleStartScan()
+            }
+        }
+        .onDisappear { model.bleStopScan() }
     }
 
     // MARK: - header
@@ -151,7 +165,7 @@ struct ConnectView: View {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    // MARK: - diagnostics + bluetooth placeholder
+    // MARK: - diagnostics
 
     private func diagnostics(_ hint: String) -> some View {
         HStack(spacing: 7) {
@@ -170,18 +184,112 @@ struct ConnectView: View {
         return model.serialPorts.isEmpty ? l.t("no_device_hint") : l.t("unrecognized_port_hint")
     }
 
-    private var bluetoothRow: some View {
+    // MARK: - bluetooth le
+
+    /// The BLE section, keyed on the radio state. A live section with a scan control + the
+    /// discovered advertisers when powered on; an honest one-line hint when the radio is off /
+    /// unauthorized / unsupported; nothing at all while the state is not yet known. Each
+    /// non-empty state carries its own leading divider so a trailing hairline never dangles
+    /// under an empty section.
+    @ViewBuilder
+    private var bluetoothSection: some View {
+        switch model.ble.state {
+        case .poweredOn:
+            divider
+            bluetoothOnSection
+        case .unauthorized:
+            divider
+            bluetoothHint(l.t("bt_unauthorized"))
+        case .poweredOff:
+            divider
+            bluetoothHint(l.t("bt_off"))
+        case .unsupported:
+            divider
+            bluetoothHint(l.t("bt_unsupported"))
+        case .unknown:
+            EmptyView()
+        }
+    }
+
+    private var bluetoothOnSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                sectionLabel(l.t("bluetooth"))
+                Spacer()
+                scanControl
+            }
+            if model.ble.devices.isEmpty {
+                Text(l.t("bt_none")).font(l.sans(11)).foregroundStyle(theme.p.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(model.ble.devices) { bleRow($0) }
+            }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Toggle the scan: start when idle, stop while scanning (a small spinner marks the live
+    /// scan). Disabled while a swap / device op owns the reader, the same guard bleConnect enforces.
+    private var scanControl: some View {
+        Button {
+            if model.ble.scanning { model.bleStopScan() }
+            else if model.canChangeDevice { model.bleStartScan() }
+        } label: {
+            HStack(spacing: 5) {
+                if model.ble.scanning { ProgressView().controlSize(.small) }
+                Text(model.ble.scanning ? l.t("bt_stop") : l.t("bt_scan")).font(l.sans(11, .medium))
+            }
+            .padding(.horizontal, 9).frame(height: 26)
+            .background(RoundedRectangle(cornerRadius: 6).fill(theme.p.tileFill.opacity(0.6)))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(theme.p.tileBorder, lineWidth: 0.5))
+            .foregroundStyle(theme.p.textPrimary)
+        }
+        .buttonStyle(.plain).disabled(!model.canChangeDevice)
+    }
+
+    /// One discovered advertiser. A non-DFU row connects (bring up the link, then dismiss); a
+    /// DFU (bootloader) row is disabled with a "use usb for firmware" hint, since firmware over
+    /// BLE is out of scope. The accent dot marks the currently-connected device.
+    private func bleRow(_ d: BLEDevice) -> some View {
+        Button {
+            guard !d.isDFU, model.canChangeDevice else { return }
+            Task { await model.bleConnect(d.id) }
+            dismiss()
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: "dot.radiowaves.left.and.right").font(.system(size: 12))
+                    .foregroundStyle(theme.p.textSecondary).frame(width: 16)
+                Text(d.name).font(l.sans(12)).foregroundStyle(theme.p.textPrimary).lineLimit(1)
+                if d.isDFU { tag("DFU") }
+                Spacer()
+                Text("\(d.rssi) dBm").font(Typeface.mono(10)).foregroundStyle(theme.p.textTertiary)
+                if model.ble.connectedDeviceID == d.id {
+                    Circle().fill(theme.p.accent).frame(width: 6, height: 6)
+                }
+            }
+            .padding(.horizontal, 10).frame(minHeight: 36)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 7).fill(theme.p.tileFill.opacity(d.isDFU ? 0.3 : 0.6)))
+            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(theme.p.tileBorder, lineWidth: 0.5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).disabled(d.isDFU || !model.canChangeDevice)
+        .help(d.isDFU ? l.t("bt_dfu_note") : l.t("manual_connect"))
+    }
+
+    /// A one-line BLE state hint (radio off / unauthorized / unsupported), styled like the
+    /// diagnostics line, so an off or denied radio reads honestly instead of a dead placeholder.
+    private func bluetoothHint(_ text: String) -> some View {
         HStack(spacing: 9) {
             Image(systemName: "dot.radiowaves.left.and.right").font(.system(size: 12))
                 .foregroundStyle(theme.p.textTertiary).frame(width: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(l.t("bluetooth")).font(l.sans(12)).foregroundStyle(theme.p.textTertiary)
-                Text(l.t("bluetooth_later")).font(l.sans(10)).foregroundStyle(theme.p.textTertiary)
-            }
-            Spacer()
+            Text(text).font(l.sans(11)).foregroundStyle(theme.p.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
-        .opacity(0.7)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - shared

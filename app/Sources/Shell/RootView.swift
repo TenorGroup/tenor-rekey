@@ -273,7 +273,9 @@ private struct ActionBar: View {
             // Firmware update (DFU), gated on the device advertising it: the X7 has
             // dfu:false and never shows it. Opening the sheet reads the current + latest
             // firmware. Disabled while any device op owns the reader.
-            if model.capabilities.dfu {
+            // Never over a BLE link: the DFU flasher runs over USB and could flash the
+            // wrong physical device, so the firmware action is hidden while connected over BLE.
+            if model.capabilities.dfu && !model.deviceOverBLE {
                 // Reachable when the reader is online OR the device is stuck in the
                 // bootloader (deviceInDFU) - the latter is exactly when flash-recovery is needed.
                 ActionButton(title: l.t("firmware"), icon: "arrow.up.circle",

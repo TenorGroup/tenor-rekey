@@ -1940,6 +1940,13 @@ class Daemon:
         mid-write abort can brick, so it is never checked past step 5. `dfu_flash` is armed as
         flash-pending at DISPATCH (run()), so an EOF/shutdown while it is in flight always
         joins UNBOUNDED and never abandons a flash."""
+        # Fail closed over BLE: when the active port is the Swift loopback TCP bridge
+        # (CHAMELEON_PORT=tcp:...), the device is on Bluetooth but adafruit-nrfutil flashes
+        # over USB serial - it would enter-bootloader / write a DIFFERENT physical device that
+        # happens to be on USB, using this BLE device's model. Refuse before any download,
+        # model read, reboot, or subprocess (a cross-device brick).
+        if isinstance(self._port, str) and self._port.startswith("tcp:"):
+            raise RuntimeError("firmware update over bluetooth is not supported; connect over usb")
         supplied_model = self._norm_model(p.get("model"))
         dfu_before = self._find_dfu_ports()          # SNAPSHOT before any reboot (identity binding)
         cdc_ports = self._find_cdc_ports()

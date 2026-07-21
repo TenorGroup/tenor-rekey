@@ -5,7 +5,8 @@
      ctypes, so it needs library-validation disabled (those libraries are not all
      signed by this Team) and unsigned-executable-memory allowed (ctypes / the
      embedded interpreter). No App Sandbox: this is a local engineering tool that
-     opens a USB-HID device, which the sandbox would block. -->
+     opens a USB-HID device, which the sandbox would block, and it uses CoreBluetooth
+     to reach a Chameleon over Bluetooth LE (the device.bluetooth entitlement). -->
 <plist version="1.0">
 <dict>
     <key>com.apple.security.cs.disable-library-validation</key>
@@ -13,6 +14,8 @@
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
     <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    <key>com.apple.security.device.bluetooth</key>
     <true/>
 </dict>
 </plist>

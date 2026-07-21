@@ -32,7 +32,7 @@ os.environ.setdefault("X7_LEARNED_PATH",
                       os.path.join(tempfile.gettempdir(), "rekey-test-learned.json"))
 
 import chameleon_d
-from chameleon.chameleon_com import ChameleonCom
+from chameleon.chameleon_com import ChameleonCom, TransportType, THREAD_BLOCKING_TIMEOUT
 from chameleon.chameleon_enum import (Status, SlotNumber, TagSpecificType, TagSenseType, MfcKeyType,
                                       MifareClassicPrngType, MifareClassicDarksideStatus)
 from chameleon.chameleon_utils import UnexpectedResponseError
@@ -3078,6 +3078,66 @@ def test_cham_emulate_load_ntag_gap(check):
           and emu.ntag_emu_counters[0][0] == 7, str(emu.ntag_emu_counters))
 
 
+# --------------------------------------------------------------------------
+# 34. dfu_flash fails closed over the BLE/tcp bridge: when the active port is the Swift
+#     loopback (CHAMELEON_PORT=tcp:...), the device is on Bluetooth but adafruit-nrfutil
+#     flashes over USB - it could enter-bootloader / write a DIFFERENT USB device. The guard
+#     is at the very top of dfu_flash: it raises before any download / port scan / reboot /
+#     subprocess, so none of those seams run.
+# --------------------------------------------------------------------------
+def test_cham_dfu_flash_rejects_ble(check):
+    d = _dfu_daemon(FakeChameleon(model=0))
+    d._port = "tcp:127.0.0.1:5000"                     # active connection is the Swift BLE bridge
+    called = {}
+
+    def _mark(key, ret):
+        def _fn(*a, **k):
+            called[key] = True
+            return ret
+        return _fn
+    d._find_dfu_ports = _mark("scan", [])
+    d._find_cdc_ports = _mark("scan", [])
+    d._download_asset = _mark("download", 0)
+    d._send_enter_dfu = _mark("entered", None)
+    d._run_flash = _mark("flashed", None)
+    raised = None
+    try:
+        d.dfu_flash({})
+    except RuntimeError as e:
+        raised = str(e)
+    check("dfu_flash over the BLE/tcp bridge raises (bluetooth/usb message)",
+          raised is not None and "bluetooth" in raised.lower() and "usb" in raised.lower(),
+          repr(raised))
+    check("dfu_flash over BLE runs no seam (no download / port scan / reboot / flash)",
+          not called, str(called))
+
+
+# --------------------------------------------------------------------------
+# 35. socket transport recognises an orderly peer EOF: recv() returning b'' must end the
+#     receive loop (transport dropped), not hot-spin on empty reads. Driven with a real
+#     socketpair so the loop runs against a genuine socket close.
+# --------------------------------------------------------------------------
+def test_cham_socket_eof_exits(check):
+    import socket as _socket
+    a, b = _socket.socketpair()
+    a.settimeout(THREAD_BLOCKING_TIMEOUT)              # bound recv so it can see the EOF quickly
+    c = ChameleonCom()
+    c.transport = a
+    c.transport_type = TransportType.SOCKET
+    c.event_closing.clear()
+    t = threading.Thread(target=c.thread_data_receive)
+    t.start()
+    b.close()                                          # orderly peer close -> recv() returns b''
+    t.join(2)
+    check("thread_data_receive exits promptly on peer EOF (no hot spin)",
+          not t.is_alive() and c.transport is None,
+          "alive=%s transport=%s" % (t.is_alive(), c.transport))
+    try:
+        a.close()
+    except OSError:
+        pass
+
+
 TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_read_block, test_cham_decode, test_cham_decode_partial,
          test_cham_decode_nocard, test_cham_decode_swap, test_cham_decode_user_key,
@@ -3107,7 +3167,8 @@ TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_dfu_flash_safety, test_cham_dfu_download_checks,
          test_cham_dfu_identity_binding, test_cham_dfu_settle_past_deadline,
          test_cham_dfu_cancel_through_run,
-         test_cham_dfu_eof_waits_for_flash, test_cham_dfu_eof_dispatch_race]
+         test_cham_dfu_eof_waits_for_flash, test_cham_dfu_eof_dispatch_race,
+         test_cham_dfu_flash_rejects_ble, test_cham_socket_eof_exits]
 
 
 if __name__ == "__main__":
