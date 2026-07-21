@@ -249,5 +249,21 @@ final class L10n {
         "import_failed":     ["vi": "không nhận dạng được tệp dump", "en": "unrecognised dump file", "zh": "无法识别的转储文件", "ja": "認識できないダンプファイルです"],
         "delete_card_q":     ["vi": "xóa thẻ đã lưu này?", "en": "delete this saved card?", "zh": "删除这张已保存的卡片？", "ja": "この保存済みカードを削除しますか？"],
         "delete_card_msg":   ["vi": "xóa khỏi thư viện và không lấy lại được. thẻ thật không bị ảnh hưởng.", "en": "removes it from the library and cannot be undone. the physical card is unaffected.", "zh": "将其从卡库中移除，不可撤销。实体卡片不受影响。", "ja": "ライブラリから削除します。元に戻せません。実体カードには影響しません。"],
+        // ---- Connect surface (USB now; Bluetooth is a later pass) ----
+        "connect":            ["vi": "kết nối", "en": "connect", "zh": "连接", "ja": "接続"],
+        "rescan":             ["vi": "quét lại", "en": "rescan", "zh": "重新扫描", "ja": "再スキャン"],
+        "connect_device":     ["vi": "kết nối thiết bị", "en": "connect device", "zh": "连接设备", "ja": "デバイスを接続"],
+        "manual_connect":     ["vi": "kết nối thủ công", "en": "manual connect", "zh": "手动连接", "ja": "手動接続"],
+        "serial_ports":       ["vi": "cổng serial", "en": "serial ports", "zh": "串口", "ja": "シリアルポート"],
+        "no_reader_detected": ["vi": "chưa nhận diện đầu đọc nào", "en": "no recognized reader", "zh": "没有可识别的读卡器", "ja": "認識できる読み取り機なし"],
+        "no_ports":           ["vi": "không thấy cổng serial nào", "en": "no serial ports", "zh": "没有串口", "ja": "シリアルポートなし"],
+        "likely_chameleon":   ["vi": "có thể là chameleon", "en": "likely chameleon", "zh": "可能是 chameleon", "ja": "chameleon の可能性"],
+        "auto_connect_note":  ["vi": "ứng dụng tự kết nối thiết bị nhận diện được", "en": "the app auto-connects a recognized device", "zh": "应用会自动连接已识别的设备", "ja": "認識したデバイスは自動で接続します"],
+        "enter_port":         ["vi": "nhập đường dẫn cổng", "en": "enter a port path", "zh": "输入端口路径", "ja": "ポートのパスを入力"],
+        "connect_action":     ["vi": "kết nối", "en": "connect", "zh": "连接", "ja": "接続"],
+        "no_device_hint":     ["vi": "chưa thấy thiết bị nào. kiểm tra cáp là loại truyền dữ liệu (không phải cáp chỉ sạc) và thử cổng usb khác.", "en": "no device detected - check the cable is a data cable, not charge-only, and try another usb port.", "zh": "未检测到设备 - 请确认使用的是数据线而非仅充电线，并换一个 usb 口试试。", "ja": "デバイスが見つかりません - ケーブルが充電専用ではなくデータ用か確認し、別の usb ポートを試してください。"],
+        "unrecognized_port_hint": ["vi": "tìm thấy cổng serial nhưng không phải đầu đọc nào được nhận diện. nếu đây là chameleon, hãy kết nối thủ công, hoặc kiểm tra bạn đang dùng cáp truyền dữ liệu.", "en": "found serial ports but none is a recognized reader - if this is your chameleon connect it manually, or check you are using a data cable.", "zh": "找到串口但没有可识别的读卡器 - 若这是你的 chameleon，请手动连接，或确认使用的是数据线。", "ja": "シリアルポートは見つかりましたが認識できる読み取り機がありません - これがお使いの chameleon なら手動で接続するか、データ用ケーブルか確認してください。"],
+        "bluetooth":          ["vi": "bluetooth", "en": "bluetooth", "zh": "蓝牙", "ja": "bluetooth"],
+        "bluetooth_later":    ["vi": "sẽ thêm ở bản cập nhật sau", "en": "added in a later update", "zh": "将在后续更新中加入", "ja": "今後のアップデートで追加"],
     ]
 }

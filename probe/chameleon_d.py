@@ -525,6 +525,11 @@ class Daemon:
     def __init__(self, learned=None, port=None, cracker=crack):
         self.com = None
         self.cmd = None                  # the ChameleonCMD command layer (or a fake)
+        # An explicit port= (used by tests) wins; otherwise honor CHAMELEON_PORT from the
+        # environment so the app can pin a user-chosen serial port when it spawns us. A
+        # missing/empty env var leaves _port None (auto-discovery via _find_port()).
+        if port is None:
+            port = os.environ.get("CHAMELEON_PORT") or None
         self._port = port
         self._reader_mode = None         # cached: True once the device is in reader mode
         self.crack = cracker             # host-side crackers (injectable for tests)
@@ -550,14 +555,27 @@ class Daemon:
 
     # ---- connection --------------------------------------------------------
 
+    def _looks_like_chameleon(self, p):
+        """True if a serial port looks like a Chameleon in normal (CDC) mode. Mirrors the
+        official Chameleon GUI's matching so a genuine device is still found when the OS did
+        not surface its vid (or a Lite reports differently): match on vid, on the Proxgrind
+        manufacturer, or on 'chameleon' in the product/description. A port already in the
+        bootloader (DFU vid) is never a normal device, so it is excluded."""
+        if getattr(p, "vid", None) == DFU_VID:
+            return False
+        if getattr(p, "vid", None) == CHAMELEON_VID:
+            return True
+        if getattr(p, "manufacturer", None) == "Proxgrind":
+            return True
+        for text in (getattr(p, "product", None), getattr(p, "description", None)):
+            if text and "chameleon" in text.lower():
+                return True
+        return False
+
     def _find_port(self):
-        """First serial port whose USB vendor id is the Chameleon's, or None."""
-        try:
-            from serial.tools import list_ports
-        except ImportError:
-            return None
-        for p in list_ports.comports():
-            if getattr(p, "vid", None) == CHAMELEON_VID:
+        """First serial port that looks like a Chameleon in normal (CDC) mode, or None."""
+        for p in self._list_ports():
+            if self._looks_like_chameleon(p):
                 return p.device
         return None
 
@@ -569,6 +587,11 @@ class Daemon:
             dev = port or self._port or self._find_port()
             if not dev:
                 raise RuntimeError("no Chameleon device found")
+            # Fail closed on a port in the bootloader: an explicitly-pinned DFU port (the
+            # Swift side should route it to firmware recovery, not here) must never be opened
+            # with the app protocol, regardless of how it was resolved. Defense in depth.
+            if dev in self._find_dfu_ports():
+                raise RuntimeError("refusing to open a port that is in DFU/bootloader mode")
             com = ChameleonCom()
             com.open(dev)
             self.com = com

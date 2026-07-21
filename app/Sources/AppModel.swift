@@ -32,6 +32,14 @@ final class AppModel {
     var lastError: String?
     var inspectorOpen = true
 
+    // ---- Connect surface (USB now; Bluetooth is a later pass) --------------
+    /// The Connect popover (device list + rescan + manual serial connect) is open.
+    var showConnect = false
+    /// Known readers currently present on the USB bus (the detected-devices list).
+    var detectedDevices: [DeviceDescriptor] = []
+    /// Every enumerated USB serial port (the manual-connect list).
+    var serialPorts: [SerialPortInfo] = []
+
     /// The working DOCUMENT: the image produced by a decode or loaded from a file.
     /// It is what the canvas shows, what Save writes out, and what Write clones onto
     /// the card on the reader. It is independent of whichever card is currently on
@@ -159,6 +167,21 @@ final class AppModel {
     /// the firmware flash can still recover it, so the firmware action stays reachable.
     var deviceInDFU: Bool { descriptor.family == "chameleon-dfu" }
 
+    /// The family of the device currently driven, so the Connect surface can mark the
+    /// active row. A manual pin keeps its base family (chameleon-ultra), so matching a
+    /// detected row by family lights the right one in every case.
+    var activeDeviceFamily: String { descriptor.family }
+
+    /// A device swap / (re)connect is in flight, exposed read-only so the Connect
+    /// surface can show a spinner and disable Rescan while it runs.
+    var connecting: Bool { swapping }
+
+    /// The manual Connect controls (Rescan, the serial-port rows, the free-text connect)
+    /// may act only when no swap or device op owns the reader - the same guard `connect`,
+    /// `rescan`, and `connectManual` enforce - so a tap during one is a disabled control,
+    /// never a silent no-op that the user reads as the app ignoring them.
+    var canChangeDevice: Bool { !swapping && !deviceBusy }
+
     /// The user's editable keys (Settings > Dictionaries), tried before the
     /// daemon's large built-in dictionary.
     let keyStore = KeyStore()
@@ -201,6 +224,13 @@ final class AppModel {
     /// the old daemon is torn down (never silently orphaned) under the swap guard.
     func connect() async {
         guard !swapping, !deviceBusy else { return }
+        await detectAndOpen()
+    }
+
+    /// The shared detect-and-open body of `connect()` and `rescan()`: pick the detected
+    /// device (or the X7 fallback), route a change through `swapDevice` so the old daemon
+    /// is torn down, and bring the current one up.
+    private func detectAndOpen() async {
         let found = DeviceRegistry.detect() ?? DeviceRegistry.fallback
         if bridge != nil, found.id != descriptor.id {
             await swapDevice(to: found)
@@ -208,6 +238,62 @@ final class AppModel {
         }
         descriptor = found
         await openCurrentDevice()
+    }
+
+    /// Refresh the Connect surface's lists (known present devices + all USB serial
+    /// ports). Synchronous IORegistry scans, cheap enough to run when the popover opens.
+    func refreshConnectLists() {
+        detectedDevices = DeviceRegistry.detectAll()
+        serialPorts = USBProbe.serialPorts()
+    }
+
+    /// True when a manual serial port is pinned (portOverride) AND that exact /dev path is
+    /// still enumerated on the USB bus; false when nothing is pinned. Lets rescan / the
+    /// monitor tell a still-present pin (leave it) from one whose device was unplugged.
+    private func pinnedPortPresent() -> Bool {
+        guard let pinned = descriptor.portOverride else { return false }
+        return USBProbe.serialPorts().contains { $0.path == pinned }
+    }
+
+    /// The Connect surface's Rescan: refresh the lists and re-run detection without waiting
+    /// for the 1.5s monitor tick. A PRESENT manual pin is preserved - re-open the SAME pinned
+    /// device rather than running auto-detect, which (when it does not recognise the
+    /// Chameleon) would fall to the X7 fallback and tear down the working port the user pinned
+    /// precisely because auto-detect fails. Only with no pin, or a pinned port that has
+    /// disappeared, do we re-detect.
+    func rescan() async {
+        guard !swapping, !deviceBusy else { return }
+        refreshConnectLists()
+        if descriptor.portOverride != nil, pinnedPortPresent() {
+            await openCurrentDevice()
+        } else {
+            await detectAndOpen()
+        }
+        refreshConnectLists()
+    }
+
+    /// Manually connect to a chosen serial port: build a Chameleon-based descriptor with
+    /// a distinct id + the port pinned, and route through `swapDevice` so the old daemon
+    /// is torn down and the new one spawns with CHAMELEON_PORT set to this port.
+    func connectManual(port: String) async {
+        guard !swapping, !deviceBusy else { return }
+        // A port that enumerates as a device in the Nordic bootloader (isDFU) is pinned from
+        // the chameleon-dfu descriptor, not chameleonUltra: then deviceInDFU is true and
+        // openCurrentDevice takes the DFU branch (firmware recovery reachable) instead of
+        // trying the app protocol on a bootloader port. A non-DFU port pins as chameleonUltra.
+        let isDFUPort = USBProbe.serialPorts().contains { $0.path == port && $0.isDFU }
+        let base = isDFUPort ? DeviceRegistry.chameleonDFU : DeviceRegistry.chameleonUltra
+        let manual = DeviceDescriptor(
+            id: "chameleon-manual:\(port)",
+            family: base.family,
+            displayName: base.displayName,
+            daemonScript: base.daemonScript,
+            probeSubdir: base.probeSubdir,
+            usbMatch: base.usbMatch,
+            capabilities: base.capabilities,
+            portOverride: port)
+        await swapDevice(to: manual)
+        refreshConnectLists()
     }
 
     /// Bring up the daemon for the active `descriptor`: read device info + key counts,
@@ -264,7 +350,16 @@ final class AppModel {
             // With only the X7 involved, detect() keeps returning the same descriptor, so
             // this path is inert and the poll below is unchanged.
             if let found = DeviceRegistry.detect() {
-                if found.id != descriptor.id { await swapDevice(to: found); continue }
+                // A manually-pinned device (portOverride) is protected from an auto-swap ONLY
+                // while its pinned port is still present - the user chose this port. Once that
+                // /dev path disappears (unplugged), the pin no longer refers to anything, so a
+                // newly-plugged X7 / auto Chameleon / DFU is allowed to hot-swap in exactly as
+                // an unpinned device would. Auto descriptors (no pin) swap on an id change as
+                // before.
+                if found.id != descriptor.id,
+                   descriptor.portOverride == nil || !pinnedPortPresent() {
+                    await swapDevice(to: found); continue
+                }
             } else if emulating {
                 // The emulating device was unplugged with nothing to swap to: the card
                 // poll is skipped while emulating, so this is the only place that would

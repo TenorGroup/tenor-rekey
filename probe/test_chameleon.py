@@ -1871,6 +1871,19 @@ class FakePort:
         self.device, self.vid, self.pid = device, vid, pid
 
 
+class FakePortInfo:
+    """A richer ListPortInfo stand-in that also carries the manufacturer / product /
+    description fields _find_port() matches on when the OS did not surface a vid."""
+    def __init__(self, device, vid=None, pid=None, manufacturer=None,
+                 product=None, description=None):
+        self.device = device
+        self.vid = vid
+        self.pid = pid
+        self.manufacturer = manufacturer
+        self.product = product
+        self.description = description
+
+
 class FakePopen:
     """Stands in for the adafruit-nrfutil subprocess: yields canned output lines then a
     chosen exit code, so the daemon's progress parse + non-zero handling are exercised.
@@ -2046,6 +2059,107 @@ def test_cham_dfu_port_discovery(check):
     check("_wait_new_dfu_ports ignores a DFU port already in the snapshot (times out to [])",
           d._wait_new_dfu_ports(["/dev/cu.usbmodemDFU"], timeout=0, settle=0.1) == [],
           "returned a pre-existing DFU port")
+
+
+# --------------------------------------------------------------------------
+# 27c. _find_port matching: vid, Proxgrind manufacturer, or 'chameleon' in the
+#      product/description (case-insensitive), and never a DFU (bootloader) port.
+# --------------------------------------------------------------------------
+def test_cham_find_port_matching(check):
+    d = _dfu_daemon(FakeChameleon())
+
+    # (a) vid match (the existing behavior) still works, unrelated ports are skipped.
+    d._list_ports = lambda: [
+        FakePortInfo("/dev/cu.usbserial", vid=0x0403, pid=0x6001),   # an unrelated FTDI
+        FakePortInfo("/dev/cu.usbmodem6868", vid=0x6868, pid=0x8686,
+                     manufacturer="Proxgrind", product="ChameleonUltra"),
+    ]
+    check("_find_port matches a Chameleon by vid",
+          d._find_port() == "/dev/cu.usbmodem6868", str(d._find_port()))
+
+    # (b) vid not surfaced by the OS -> match on the Proxgrind manufacturer.
+    d._list_ports = lambda: [
+        FakePortInfo("/dev/cu.usbserial", vid=0x0403, pid=0x6001),
+        FakePortInfo("/dev/cu.usbmodemX", vid=None, manufacturer="Proxgrind"),
+    ]
+    check("_find_port matches by manufacturer == Proxgrind when vid is None",
+          d._find_port() == "/dev/cu.usbmodemX", str(d._find_port()))
+
+    # (c) no vid, not Proxgrind -> match on 'chameleon' in product or description,
+    #     case-insensitively.
+    d._list_ports = lambda: [
+        FakePortInfo("/dev/cu.byProduct", vid=None, product="ChameleonUltra"),
+    ]
+    check("_find_port matches by 'chameleon' in product (case-insensitive)",
+          d._find_port() == "/dev/cu.byProduct", str(d._find_port()))
+    d._list_ports = lambda: [
+        FakePortInfo("/dev/cu.byDesc", vid=None, description="Some CHAMELEON Lite device"),
+    ]
+    check("_find_port matches by 'chameleon' in description (case-insensitive)",
+          d._find_port() == "/dev/cu.byDesc", str(d._find_port()))
+
+    # (d) a DFU (bootloader) port is never mis-picked: it is skipped even if only it
+    #     is present (-> None), and a real CDC port is preferred when both are present.
+    d._list_ports = lambda: [
+        FakePortInfo("/dev/cu.usbmodemDFU", vid=0x1915, pid=0x521f,
+                     product="ChameleonUltra"),
+    ]
+    check("_find_port skips a DFU port and returns None when only DFU is present",
+          d._find_port() is None, str(d._find_port()))
+    d._list_ports = lambda: [
+        FakePortInfo("/dev/cu.usbmodemDFU", vid=0x1915, pid=0x521f),
+        FakePortInfo("/dev/cu.usbmodem6868", vid=0x6868, pid=0x8686),
+    ]
+    check("_find_port skips a DFU port and returns the real CDC port",
+          d._find_port() == "/dev/cu.usbmodem6868", str(d._find_port()))
+
+
+# --------------------------------------------------------------------------
+# 27d. CHAMELEON_PORT env pins the port at construction; an explicit port= wins.
+# --------------------------------------------------------------------------
+def test_cham_env_port_pin(check):
+    saved = os.environ.get("CHAMELEON_PORT")
+    try:
+        os.environ["CHAMELEON_PORT"] = "/dev/cu.usbmodemPINNED"
+        check("__init__ honors CHAMELEON_PORT when no port arg is given",
+              chameleon_d.Daemon()._port == "/dev/cu.usbmodemPINNED",
+              str(chameleon_d.Daemon()._port))
+        check("an explicit port= overrides the CHAMELEON_PORT env",
+              chameleon_d.Daemon(port="/dev/cu.explicit")._port == "/dev/cu.explicit",
+              str(chameleon_d.Daemon(port="/dev/cu.explicit")._port))
+        os.environ["CHAMELEON_PORT"] = ""
+        check("an empty CHAMELEON_PORT leaves _port None (auto-discovery)",
+              chameleon_d.Daemon()._port is None, str(chameleon_d.Daemon()._port))
+        del os.environ["CHAMELEON_PORT"]
+        check("a missing CHAMELEON_PORT leaves _port None (auto-discovery)",
+              chameleon_d.Daemon()._port is None, str(chameleon_d.Daemon()._port))
+    finally:
+        if saved is None:
+            os.environ.pop("CHAMELEON_PORT", None)
+        else:
+            os.environ["CHAMELEON_PORT"] = saved
+
+
+# --------------------------------------------------------------------------
+# 27e. _connect fails closed on a pinned DFU port: an explicitly-pinned bootloader
+#      port is never opened with the app protocol (defense in depth behind the Swift
+#      side routing a DFU port to firmware recovery instead of a normal connect).
+# --------------------------------------------------------------------------
+def test_cham_connect_refuses_dfu_port(check):
+    d = chameleon_d.Daemon(learned=None)
+    d._list_ports = lambda: [
+        FakePort("/dev/cu.usbmodemDFU", 0x1915, 0x521f),
+        FakePort("/dev/cu.usbmodem6868", 0x6868, 0x8686),
+    ]
+    raised = None
+    try:
+        d._connect(port="/dev/cu.usbmodemDFU")
+    except RuntimeError as e:
+        raised = e
+    check("_connect refuses to open a pinned DFU/bootloader port",
+          raised is not None and "DFU" in str(raised), repr(raised))
+    check("_connect leaves the handle unopened when it refuses a DFU port",
+          d.cmd is None and d.com is None, "cmd/com set despite the DFU guard")
 
 
 # --------------------------------------------------------------------------
@@ -2985,6 +3099,8 @@ TESTS = [test_cham_info, test_cham_slots, test_cham_slot_select, test_cham_poll,
          test_cham_magic_write_midswap, test_cham_magic_write_trailer_keys,
          test_cham_magic_write_gen1a, test_cham_write_mfd, test_cham_write_mfd_guards,
          test_cham_dfu_asset, test_cham_dfu_norm_model, test_cham_dfu_port_discovery,
+         test_cham_find_port_matching, test_cham_env_port_pin,
+         test_cham_connect_refuses_dfu_port,
          test_cham_dfu_enter_bootloader, test_cham_dfu_validate,
          test_cham_dfu_check, test_cham_dfu_flash_runner, test_cham_dfu_flasher_resolve,
          test_cham_dfu_flash_e2e,

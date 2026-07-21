@@ -107,6 +107,16 @@ actor DeviceBridge {
         // the spawn under the GUI session.
         p.arguments = ["-B", script.path]
         p.currentDirectoryURL = workDir
+        // Pin the user-chosen serial port when this descriptor carries one (a manual
+        // Connect): the daemon honours CHAMELEON_PORT. We COPY the inherited launchd
+        // environment and add only that one key - never replace the child environment
+        // (a bare replacement broke the spawn under the GUI session), so libhidapi /
+        // PATH and the rest are preserved. Auto-detect descriptors leave it untouched.
+        if let port = descriptor.portOverride {
+            var env = ProcessInfo.processInfo.environment
+            env["CHAMELEON_PORT"] = port
+            p.environment = env
+        }
         let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe

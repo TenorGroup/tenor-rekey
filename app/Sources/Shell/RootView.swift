@@ -165,10 +165,21 @@ private struct ReaderStatusInline: View {
     @Environment(Theme.self) private var theme
     @Environment(L10n.self) private var l
     var body: some View {
-        HStack(spacing: 6) {
-            Circle().fill(model.card != nil ? theme.p.accent : theme.p.textTertiary).frame(width: 6, height: 6)
-            Text(text).font(model.card?.uid != nil ? Typeface.mono(11) : l.sans(11))
-                .foregroundStyle(theme.p.textSecondary)
+        @Bindable var model = model
+        // The status pill is the Connect affordance: tapping it opens the device list /
+        // rescan / manual-connect popover. A chevron marks it as tappable.
+        Button { model.showConnect.toggle() } label: {
+            HStack(spacing: 6) {
+                Circle().fill(model.card != nil ? theme.p.accent : theme.p.textTertiary).frame(width: 6, height: 6)
+                Text(text).font(model.card?.uid != nil ? Typeface.mono(11) : l.sans(11))
+                    .foregroundStyle(theme.p.textSecondary)
+                Image(systemName: "chevron.down").font(.system(size: 8)).foregroundStyle(theme.p.textTertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).help(l.t("connect"))
+        .popover(isPresented: $model.showConnect, arrowEdge: .bottom) {
+            ConnectView().environment(model).environment(theme).environment(l)
         }
     }
     private var text: String {
@@ -621,13 +632,23 @@ private struct EmptyState: View {
             }
             // A seated card can miss the snappy status poll (see AppModel.decode): give
             // an explicit "read anyway" that runs the op's own patient coupling, so a
-            // card physically on the reader is never a silent dead-end.
+            // card physically on the reader is never a silent dead-end. When the reader
+            // is offline, offer Connect (open the device list / rescan / manual-connect)
+            // plus an honest hint, so a plugged-in-but-undetected device has a way in.
             if model.readerOnline {
                 Button { Task { await model.decode() } } label: {
                     Text(l.t("read_anyway")).font(l.sans(11))
                 }
                 .buttonStyle(.plain).foregroundStyle(theme.p.accent)
                 .disabled(model.decoding)
+            } else {
+                Button { model.showConnect = true } label: {
+                    Text(l.t("connect_device")).font(l.sans(11))
+                }
+                .buttonStyle(.plain).foregroundStyle(theme.p.accent)
+                Text(l.t("no_device_hint")).font(l.sans(10)).foregroundStyle(theme.p.textTertiary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 320)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
         }
