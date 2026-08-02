@@ -44,3 +44,9 @@ app/Resources/AppIcon.icns
 # packaging output (relocatable python, dmg, signed app)
 app/dist/
 ROADMAP_CHAMELEON.md
+
+# native build output (compiled from probe/native/chameleon/src)
+probe/native/darkside/*.o
+probe/native/darkside/darkside
+probe/native/darkside/simleak
+probe/native/**/*.o
